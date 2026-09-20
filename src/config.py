@@ -71,8 +71,20 @@ UA = (
 )
 
 # ── 输出 ────────────────────────────────────────────────────────────────
+# 两类产物**分开放**（2026-09-20 起）：
+#
+#   exports/  运行产物 —— 台账（含全部尝试，含失败的）、日志、诊断残留
+#   result/   **成功数据** —— 拿到 key 的账号 + 验收结果。这是**交付物**目录。
+#
+# 分开的理由：台账要留全部历史（失败的也留，便于复盘），
+# 而交付物只该有成功的。以前两者混在 exports/ 里，取交付物时得自己筛。
 EXPORT_DIR = ROOT / "exports"
 LEDGER_PATH = EXPORT_DIR / "ledger.jsonl"
+
+RESULT_DIR = ROOT / "result"
+SUCCESS_LEDGER_PATH = RESULT_DIR / "success.jsonl"     # 成功账号（append-only，按 key 去重）
+KEYS_TXT_PATH = RESULT_DIR / "keys.txt"                # email----api_key----api_key_id
+KEYS_JSON_PATH = RESULT_DIR / "keys_verified.json"     # 机器可读的验收结果
 
 
 def validate(*, need_tempmail: bool = True) -> list[str]:

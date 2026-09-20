@@ -16,7 +16,14 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
-_LOCK = threading.Lock()
+#: **可重入**锁。两点原因：
+#:
+#: 1. `upsert_many` 的"读-改-写"必须**整体原子** —— 它的 `_rewrite` 是整文件替换，
+#:    如果不持锁贯穿全程，并发 `append` 刚写进去的行会被整文件替换覆盖掉（静默丢数据）。
+#:    而 `_rewrite` 自己也取锁 ⇒ 必须是 RLock，否则自死锁。
+#: 2. 并发跑批时"边跑边验收"是常规操作（跑批在 append，验收在读+回填）。
+#:    同样的原因，`load()` 也要持锁 —— 否则可能读到写了一半的行。
+_LOCK = threading.RLock()
 
 #: 记录状态优先级：只用于"升级 / 降级"判断，不用来决定"是否写入"。
 #:
@@ -116,33 +123,38 @@ class Ledger:
         """把一批记录并入台账（按 `key` 字段去重合并）。
 
         返回 {"added": n, "updated": n, "kept": n} —— 增量写回必须能自证"真的写进去了"。
+
+        🔴 整个"读-改-写"在 `_LOCK` 内完成（不是只锁最后那次 `_rewrite`）：
+        `_rewrite` 是**整文件替换**，若在它之前有并发 `append`，
+        那些行会被这次替换**静默吞掉**。
         """
-        incoming = [r for r in records if r.get("key")]
-        current = self.load()
-        by_key: dict[str, dict[str, Any]] = {r["key"]: r for r in current}
+        with _LOCK:
+            incoming = [r for r in records if r.get("key")]
+            current = self.load()
+            by_key: dict[str, dict[str, Any]] = {r["key"]: r for r in current}
 
-        added = updated = kept = 0
-        for rec in incoming:
-            k = rec["key"]
-            if k not in by_key:
-                by_key[k] = rec
-                added += 1
-            else:
-                merged = merge(by_key[k], rec)
-                if merged != by_key[k]:
-                    by_key[k] = merged
-                    updated += 1
+            added = updated = kept = 0
+            for rec in incoming:
+                k = rec["key"]
+                if k not in by_key:
+                    by_key[k] = rec
+                    added += 1
                 else:
-                    kept += 1
+                    merged = merge(by_key[k], rec)
+                    if merged != by_key[k]:
+                        by_key[k] = merged
+                        updated += 1
+                    else:
+                        kept += 1
 
-        order = [r["key"] for r in current]
-        for r in incoming:
-            if r["key"] not in order:
-                order.append(r["key"])
+            order = [r["key"] for r in current]
+            for r in incoming:
+                if r["key"] not in order:
+                    order.append(r["key"])
 
-        out = [by_key[k] for k in order if k in by_key]
-        self._rewrite(out)
-        return {"added": added, "updated": updated, "kept": kept}
+            out = [by_key[k] for k in order if k in by_key]
+            self._rewrite(out)
+            return {"added": added, "updated": updated, "kept": kept}
 
     def _rewrite(self, records: list[dict[str, Any]]) -> None:
         with _LOCK:
@@ -160,24 +172,28 @@ class Ledger:
             self._extra_sources.append(p)
 
     def load(self) -> list[dict[str, Any]]:
-        """读台账。同键后写覆盖前写（与 append 语义一致），并按等级升级 / 降级保护。"""
-        by_key: dict[str, dict[str, Any]] = {}
-        for path in [*self._extra_sources, self.path]:
-            if not path.is_file():
-                continue
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                raw = raw.strip()
-                if not raw:
+        """读台账。同键后写覆盖前写（与 append 语义一致），并按等级升级 / 降级保护。
+
+        持锁读 —— 否则可能与 `append` 的半行写入撞上（读到截断的 JSON）。
+        """
+        with _LOCK:
+            by_key: dict[str, dict[str, Any]] = {}
+            for path in [*self._extra_sources, self.path]:
+                if not path.is_file():
                     continue
-                try:
-                    rec = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                k = rec.get("key")
-                if not k:
-                    continue
-                by_key[k] = merge(by_key[k], rec) if k in by_key else rec
-        return list(by_key.values())
+                for raw in path.read_text(encoding="utf-8").splitlines():
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    k = rec.get("key")
+                    if not k:
+                        continue
+                    by_key[k] = merge(by_key[k], rec) if k in by_key else rec
+            return list(by_key.values())
 
     def keys(self) -> set[str]:
         return {r["key"] for r in self.load() if r.get("key")}

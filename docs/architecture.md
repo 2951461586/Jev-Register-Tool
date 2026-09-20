@@ -29,7 +29,7 @@ Jev-Register-Tool/
 ├── tools/                     入口脚本（含命令行逻辑）
 │   ├── _bootstrap.py          按标记文件定位仓库根，统一 sys.path
 │   ├── run_e2e.py             ★ 主入口：apply / watch / resume / claim / scan
-│   ├── selftest.py            自测 96 项，含负对照，**全程离线**
+│   ├── selftest.py            自测 102 项，含负对照，**全程离线**
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── probe_confirm.py          单看"确认邮件"那一步的每跳原始响应
@@ -45,11 +45,15 @@ Jev-Register-Tool/
 │   ├── *.har / *.eml          抓包与邮件原文
 │   └── scraped/               抓来的第三方 bundle（framer/ js/）——
 │                              性质是**录制证据**，不是导出产物
-└── exports/                   运行产物（已 gitignore）
-    ├── ledger.jsonl           台账
-    ├── keys.txt / keys_verified.json   验收结果与可用凭据
-    ├── run_*.json / *.log     各次运行的记录
-    └── _diag/                 一次性诊断残留（探针输出、抓下的页面快照）
+├── exports/                   运行台账与记录（已 gitignore）
+│   ├── ledger.jsonl           台账（**全部**尝试，含失败的）
+│   ├── run_*.json / *.log     各次运行的记录
+│   └── _diag/                 一次性诊断残留（探针输出、抓下的页面快照）
+│
+└── result/                    ★ 交付物（已 gitignore，**只放成功的**）
+    ├── success.jsonl          成功账号（append-only，按 key 并集去重）
+    ├── keys.txt               email----api_key----api_key_id（明文，人可读）
+    └── keys_verified.json     机器可读的验收结果
 ```
 
 **分层原则**：`src/` 只放可复用的库代码，`tools/` 只放入口与一次性探针。
@@ -59,20 +63,27 @@ Jev-Register-Tool/
 `evidence/` 只放"抓下来 / 录下来的原始材料"。抓来的第三方 JS bundle 属于后者 ——
 2026-09-20 之前它们混在 `exports/js`、`exports/framer` 里。
 
+**`exports/` 与 `result/` 的边界**：台账要留**全部**尝试（含失败的，便于复盘），
+交付物只该有成功的。写入口刻意选在 `stage_create_key()` —— 那是**唯一**产出 key
+的地方，挂在那里就自动覆盖全部四条路径（`run_batch` / `resume` / `watch` / `claim`），
+不需要在四个调用点各写一遍（那种写法迟早漏一处）。
+🔴 `result/` 必须**显式**写进 `.gitignore`：`*.txt` 没有任何通配规则覆盖，
+`*.json` / `*.jsonl` 挡不住 `result/keys.txt` 里的明文 Key。
+
 ## 2. 模块规模与职责
 
 | 模块 | 行数 | 职责 | 内部依赖 |
 |---|---:|---|---|
-| `config.py` | 86 | 常量集中地 + `.env` 加载 + `validate()` 启动校验 | 无 |
+| `config.py` | 98 | 常量集中地 + `.env` 加载 + `validate()` 启动校验 | 无 |
 | `mailrules.py` | 269 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
-| `ledger.py` | 183 | 台账读写、并集合并、等级语义 | 无 |
+| `ledger.py` | 199 | 台账读写、并集合并、等级语义 | 无 |
 | `tempemail.py` | 186 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `framer_waitlist.py` | 98 | 申请表单 + PoW | `config` |
 | `typesafe.py` | 388 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` |
-| `pipeline.py` | 521 | 阶段编排（含并发扇出） | `config` + 上面 5 个叶子 |
+| `pipeline.py` | 540 | 阶段编排（含并发扇出） | `config` + 上面 5 个叶子 |
 | `run_e2e.py` | 260 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `pipeline` `tempemail` `mailrules` |
-| `selftest.py` | 622 | 自测 96 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
-| `verify_keys.py` | 117 | 验收 + 导出 | `config` `ledger` |
+| `selftest.py` | 658 | 自测 102 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
+| `verify_keys.py` | 137 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
 ## 3. 依赖分层（AST 实测）
@@ -141,11 +152,13 @@ Jev-Register-Tool/
                           POST /api/api-keys ──▶ apikey_xxx              │
                                         │                                │
                                   ledger.append()  ──▶ exports/ledger.jsonl
+                                        │            （全部尝试，含失败的）
+                                        └── success_ledger.append() ──▶ result/success.jsonl
                 └────────────────────────────────────────────────────────┘
                                         │
                 ┌─ 验收（独立于链路）────────────────────────────────────┐
                 │  verify_keys.py ──▶ POST api.typesafe.ai/v1/systemone  │
-                │                    真打一次推理，导出 exports/keys.txt  │
+                │                    真打一次推理，导出 result/keys.txt    │
                 └────────────────────────────────────────────────────────┘
 ```
 
@@ -187,7 +200,7 @@ Jev-Register-Tool/
 | ~~`pipeline.py` 零测试~~ | **已补** 96 项自测，其中编排层 41 项 | 继续加边界用例 |
 | `pipeline.py` 521 行 | 阶段方法 + 并发脚手架挤在一个类里 | 若再加阶段，按"申请段 / 注册段"拆两个模块 |
 | `typesafe.py` 388 行 | 混了 HTTP 客户端 + HTML/JS 解析 | 解析函数已独立成模块级 `_parse_js_object` 等，可整体挪到 `parsing.py` |
-| `selftest.py` 622 行 | 单文件承载全部测试 | 超过 ~800 行时按 `tests/` 拆目录（保留一个聚合入口） |
+| `selftest.py` 658 行 | 单文件承载全部测试 | 超过 ~800 行时按 `tests/` 拆目录（保留一个聚合入口） |
 | `--mode watch` 与 `resume` 有重复 | 都做"跑 4→7" | 已抽 `stage_login` + `stage_create_key`，重复的只是循环壳 |
 
 ## 附录：复算依赖图

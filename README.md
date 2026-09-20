@@ -10,8 +10,11 @@ TypeSafe（Jev / System One）**申请 → 确认邮件 → 获批 → 注册 �
 （真打 `api.typesafe.ai` 推理接口）。单账号关键路径 `login 6.4s + create_key 3.7s ≈ 10s`。
 
 > **本仓库会含凭据。** 凭据只进 `.env`（代码里一律 `os.getenv()` 且默认空），
-> `.env` / `*.har` / `*.eml` / `exports/` / `.workbuddy-ai/` 全部 gitignore（用通配，不逐条列举）。
-> `exports/keys.txt` 里是**明文 API Key**，别提交。
+> `.env` / `*.har` / `*.eml` / `exports/` / `result/` / `.workbuddy-ai/` 全部 gitignore
+> （用通配，不逐条列举）。
+> `result/keys.txt` 里是**明文 API Key**，别提交。
+> 🔴 `result/` 必须**显式**列目录：`*.txt` 没有任何通配规则覆盖，
+> 光靠 `*.json` / `*.jsonl` 挡不住 `result/keys.txt`。
 
 ## 快速开始
 
@@ -20,7 +23,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
 $PY tools/run_e2e.py --doctor          # 环境体检
-$PY tools/selftest.py                  # 自测 96 项，离线可跑
+$PY tools/selftest.py                  # 自测 102 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
 $PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
@@ -66,7 +69,7 @@ src/                       库代码
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
   run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
-  selftest.py              自测 96 项（含负对照，**全程离线**）
+  selftest.py              自测 102 项（含负对照，**全程离线**）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应
@@ -79,8 +82,15 @@ docs/
   audit-2026-09-20.md      架构/耦合/目录/文档审计（含一个 P0 与全部证据）
 
 evidence/                  录制的证据（har / eml / 抓来的第三方 bundle）
-exports/                   运行产物：ledger.jsonl / keys.txt / run_*.json / _diag/
+exports/                   运行台账与记录：ledger.jsonl / run_*.json / *.log / _diag/
+result/                    ★ 交付物（**只放成功的**）：success.jsonl / keys.txt / keys_verified.json
 ```
+
+> **`exports/` 与 `result/` 的分工**（2026-09-20 起）：台账要留**全部**尝试
+> （含失败的，便于复盘），交付物只该有成功的。以前两者混在 `exports/` 里，
+> 取交付物时得自己筛一遍。成功数据由 `stage_create_key()` 直接落 `result/success.jsonl`
+> —— 那是**唯一**产出 key 的地方，写在这里就自动覆盖全部四条路径
+> （`run_batch` / `resume` / `watch` / `claim`），不需要在四个调用点各写一遍。
 
 **依赖方向单向**：`tools → pipeline → 叶子 → config`，无循环。
 第三方依赖**只有 `requests`**（刻意不用 `bs4` / `lxml`）。

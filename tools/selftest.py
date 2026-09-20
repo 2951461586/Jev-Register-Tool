@@ -570,6 +570,41 @@ def test_key_survives_rerun_failure() -> None:
           len(withkey) == 1, str(len(withkey)))
 
 
+def test_success_ledger() -> None:
+    """成功数据单独落 `result/`（交付物），且**只**在真的拿到 key 时写。
+
+    这条守的是"交付物目录"的语义：`exports/ledger.jsonl` 留全部历史（含失败），
+    `result/success.jsonl` 只该有成功的。判据不是"文件存在"，是
+    **失败那次一条都不许写进去** —— 否则交付物又变成需要自己筛的东西了。
+    """
+    print("\n[编排：成功台账只收成功]")
+    led = _tmp_ledger()
+    succ = _tmp_ledger()
+
+    with offline(mails=[_otp_mail("ok@example-mail.test")]) as P:
+        pipe = P.Pipeline(mail=P.TempMailClient(), ledger=led,
+                          success_ledger=succ, verbose=False)
+        rec = pipe.resume(["ok@example-mail.test"])[0]
+
+    check("拿到 key", rec.status == "keyed" and bool(rec.api_key), rec.status)
+    rows = succ.load()
+    check("★ 成功记录写进了成功台账", len(rows) == 1, str(len(rows)))
+    check("写进去的是完整记录（含 api_key / email）",
+          rows and rows[0].get("api_key") == rec.api_key
+          and rows[0].get("email") == "ok@example-mail.test",
+          repr(rows[:1]))
+    check("_clone() 共享同一个成功台账",
+          pipe._clone().success_ledger is pipe.success_ledger)
+
+    # 失败路径：建 key 抛错 ⇒ 成功台账**一条都不许增加**
+    with offline(mails=[_otp_mail("bad@example-mail.test")], fail_key=True) as P:
+        bad = P.Pipeline(mail=P.TempMailClient(), ledger=_tmp_ledger(),
+                         success_ledger=succ, verbose=False).resume(["bad@example-mail.test"])[0]
+    check("第二次（建 key 失败）确实失败了", bad.status == "partial", bad.status)
+    check("★ [负对照] 失败那次没有写进成功台账",
+          len(succ.load()) == 1, str(len(succ.load())))
+
+
 def test_concurrency_no_crosstalk() -> None:
     """并发：不串号、不丢数、顺序稳定。"""
     print("\n[编排：并发不串号]")
@@ -613,6 +648,7 @@ def main() -> int:
     test_apply_and_approval()
     test_claim()
     test_key_survives_rerun_failure()
+    test_success_ledger()
     test_concurrency_no_crosstalk()
     print(f"\n{'=' * 50}\n通过 {PASS} / 失败 {FAIL}\n{'=' * 50}")
     return 1 if FAIL else 0

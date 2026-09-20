@@ -10,6 +10,11 @@
 *.log
 exports/
 
+# 🔴 成功数据（交付物）：含明文 API Key。
+# 必须显式列目录 —— `*.txt` 没有任何通配规则覆盖，
+# 光靠上面的 *.json / *.jsonl 挡不住 result/keys.txt。
+result/
+
 # HAR / EML：含会话与令牌（通配已覆盖，这里显式列目录是为了可读）
 *.har
 *.eml

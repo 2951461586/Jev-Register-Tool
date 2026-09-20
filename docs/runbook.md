@@ -105,10 +105,16 @@ $PY tools/verify_keys.py
 ```
 
 拿台账里每个 key **真打一次** `POST https://api.typesafe.ai/v1/systemone`，
-输出可用/不可用统计，并导出：
+输出可用/不可用统计，并把**成功数据**导出到 `result/`（交付物目录）：
 
-- `exports/keys.txt` —— `email----api_key----api_key_id`（可复制）
-- `exports/keys_verified.json` —— 机器可读
+- `result/success.jsonl` —— 成功账号（从台账补录，幂等；每次跑批也会自动追加）
+- `result/keys.txt` —— `email----api_key----api_key_id`（可复制）
+- `result/keys_verified.json` —— 机器可读的验收结果
+
+> 为什么分开：`exports/ledger.jsonl` 要留**全部**尝试（含失败的，便于复盘），
+> 而交付物只该有成功的。以前两者混在 `exports/` 里，取交付物时得自己筛。
+> `result/` 已在 `.gitignore` 里**显式**列出（`*.txt` 没有通配规则覆盖，
+> 只靠 `*.json`/`*.jsonl` 挡不住里面的明文 Key）。
 
 > **`apikey_...` 字符串不是终点。** 拿到它只证明创建接口返回了它，
 > 不证明它在推理网关上有效。而且 **Jev 不是 OpenAI 兼容的 chat completions**，
@@ -118,7 +124,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 96 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 102 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖：
@@ -136,7 +142,11 @@ $PY tools/selftest.py      # 96 项，含负对照，**全程离线**（不碰�
 | 编排：申请段 / 邀请制 | 7 | 未获批**不算执行失败** |
 | 编排：claim 两段式 | 7 | `code_sent` 不是 `failed` |
 | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
+| 编排：成功台账只收成功 | 6 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
+
+> 合计 **102 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
+> `docs/mail-filters.md` 里写的数字。
 
 > 改了 `ledger.RANK` 却没同步管线状态 ⇒ `状态词汇覆盖` 立刻失败。
 > 这是 2026-09-20 那个 P0（重跑失败清空 `api_key`）的结构性修复。

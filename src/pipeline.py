@@ -28,6 +28,14 @@
 `self.client` 上（串行看不出问题，并发会**串号** —— A 账号的 api_key 建在 B 的会话上）。
 现在 `stage_login()` 改为**返回** client，`run_batch`/`resume` 每个 worker 用独立的
 `Pipeline` 实例，唯一共享的是带锁的 `Ledger`。
+
+两份台账（2026-09-20 起）
+──────────────────────
+    exports/ledger.jsonl    运行台账：**全部尝试**（含失败的），用于复盘
+    result/success.jsonl    成功数据：**只记拿到 key 的**，是交付物
+
+成功那份在 `stage_create_key()` 里写 —— 那是**唯一**产出 key 的地方，
+挂在那里就自动覆盖了全部四条路径（`run_batch` / `resume` / `watch` / `claim`）。
 """
 
 from __future__ import annotations
@@ -98,10 +106,16 @@ class AccountRecord:
 
 class Pipeline:
     def __init__(self, *, mail: TempMailClient | None = None,
-                 ledger: Ledger | None = None, domain: str | None = None,
+                 ledger: Ledger | None = None,
+                 success_ledger: Ledger | None = None,
+                 domain: str | None = None,
                  login_mode: str = MODE_CODE, verbose: bool = True):
         self.mail = mail or TempMailClient()
         self.ledger = ledger or Ledger(config.LEDGER_PATH)
+        # 成功数据单独落一份到 `result/`（**交付物**），与 `exports/` 的运行台账分开：
+        # 台账要留全部历史（含失败的，便于复盘），交付物只该有成功的。
+        self.success_ledger = success_ledger if success_ledger is not None \
+            else Ledger(config.SUCCESS_LEDGER_PATH)
         self.domain = domain or config.TEMPMAIL_DOMAIN
         self.login_mode = login_mode
         self.verbose = verbose
@@ -332,6 +346,10 @@ class Pipeline:
         rec.stages["api_key"] = "ok"
         rec.status = "keyed"
         rec.error = ""
+        # 🔴 这里是**唯一**产出 key 的地方 ⇒ 成功数据挂在这里写，
+        # 就自动覆盖了全部四条路径（run_batch / resume / watch / claim），
+        # 不需要在四个调用点各写一遍（那种写法迟早漏一处）。
+        self.success_ledger.append(rec.to_dict())
         self.log(f"  [api_key] {rec.api_key[:24]}…  ({rec.timings['create_key']:.1f}s)")
         return True
 
@@ -341,10 +359,11 @@ class Pipeline:
 
         独立是硬要求，不是优化：`TempMailClient` 持有 `requests.Session`
         （不保证线程安全），且 `stats` 计数器会被多线程搅乱。
-        唯一共享的是 `Ledger` —— 它的 `append` 有锁。
+        唯一共享的是 `Ledger`（运行台账与成功台账）—— 它的读写都有锁。
         """
-        return Pipeline(ledger=self.ledger, domain=self.domain,
-                        login_mode=self.login_mode, verbose=self.verbose)
+        return Pipeline(ledger=self.ledger, success_ledger=self.success_ledger,
+                        domain=self.domain, login_mode=self.login_mode,
+                        verbose=self.verbose)
 
     def _fan_out(self, jobs: list[tuple[Any, Callable[["Pipeline", Any], AccountRecord]]],
                  *, concurrency: int) -> list[AccountRecord]:

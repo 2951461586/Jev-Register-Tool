@@ -1,12 +1,19 @@
 #!/usr/bin/env python
-"""验证台账里的 API Key 是否**真的能调通**，并导出可用凭据。
+"""验证台账里的 API Key 是否**真的能调通**，并导出可用凭据到 `result/`。
 
 为什么必须做这一步：拿到 `apikey_...` 只证明"创建接口返回了字符串"，
 不证明这个 key 在推理网关上有效（可能被风控、配额、组织未激活挡掉）。
 
+产物（全部落在 **`result/`**，即交付物目录）：
+
+    result/success.jsonl        成功账号（从台账补录，幂等）
+    result/keys.txt             email----api_key----api_key_id（人可读，直接复制）
+    result/keys_verified.json   机器可读的验收结果
+
 用法：
-    python tools/verify_keys.py                 # 验证台账里全部有 key 的记录
-    python tools/verify_keys.py --out exports/keys.txt
+    python tools/verify_keys.py                      # 验证全部有 key 的记录
+    python tools/verify_keys.py --limit 3            # 只验前 3 个
+    python tools/verify_keys.py --ledger other.jsonl  # 换源台账
 """
 
 from __future__ import annotations
@@ -62,13 +69,26 @@ def verify(key: str, *, timeout: float = 90.0) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="exports/keys.txt")
-    ap.add_argument("--json", default="exports/keys_verified.json")
+    ap.add_argument("--out", default=str(config.KEYS_TXT_PATH),
+                    help=f"人可读凭据清单（默认 {config.KEYS_TXT_PATH}）")
+    ap.add_argument("--json", default=str(config.KEYS_JSON_PATH),
+                    help=f"机器可读验收结果（默认 {config.KEYS_JSON_PATH}）")
+    ap.add_argument("--ledger", default=str(config.LEDGER_PATH),
+                    help=f"源台账（默认 {config.LEDGER_PATH}）")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
-    led = Ledger(config.LEDGER_PATH)
+    led = Ledger(Path(args.ledger))
     recs = [r for r in led.load() if r.get("api_key")]
+
+    # 补录：把成功记录同步进 result/success.jsonl（**交付物**目录）。
+    # 幂等（按 key 并集去重，且 EARNED_FIELDS 保证空值不覆盖已有凭据），可反复跑。
+    # 这样"改目录约定之前"拿到的成功数据也会被补齐，不必手工搬。
+    succ = Ledger(config.SUCCESS_LEDGER_PATH)
+    st = succ.upsert_many(recs)
+    print(f"成功台账 {config.SUCCESS_LEDGER_PATH}："
+          f"新增 {st['added']} / 更新 {st['updated']} / 未变 {st['kept']}")
+
     # 同一邮箱可能有多条（重跑过），按 key 去重
     seen: dict[str, dict] = {}
     for r in recs:
@@ -76,7 +96,7 @@ def main() -> int:
     items = list(seen.items())
     if args.limit:
         items = items[:args.limit]
-    print(f"台账 {config.LEDGER_PATH}：{len(recs)} 条有 key 的记录，去重后 {len(items)} 个唯一 key\n")
+    print(f"台账 {args.ledger}：{len(recs)} 条有 key 的记录，去重后 {len(items)} 个唯一 key\n")
 
     results = []
     for i, (key, rec) in enumerate(items, 1):

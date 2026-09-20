@@ -6,8 +6,11 @@ TypeSafe（Jev / System One）**申请 → 确认邮件 → 获批 → 注册 �
 结合 CF Temp Email Worker 收信，配合 `--mode watch` 常驻监听实现**边到边取**，
 可直接批量出号。
 
-**实测战果**：15 个账号全部拿到 API Key，`verify_keys.py` 验收 **可用 15 / 不可用 0**
-（真打 `api.typesafe.ai` 推理接口）。单账号关键路径 `login 6.4s + create_key 3.7s ≈ 10s`。
+**实测战果**：15 个账号全部拿到 API Key，`verify_keys.py` 验收 **可用 16 / 不可用 0**
+（真打 `api.typesafe.ai` 推理接口）。16 > 15 是因为其中一个账号被重跑过、
+服务端给了**两把** key，两把都有效 —— 台账按邮箱去重会吃掉一把，
+所以 `verify_keys.py` 的候选集是「合并视图 ∪ 原始行」。单账号关键路径
+`login 6.4s + create_key 3.7s ≈ 10s`。
 
 > **本仓库会含凭据。** 凭据只进 `.env`（代码里一律 `os.getenv()` 且默认空），
 > `.env` / `*.har` / `*.eml` / `exports/` / `result/` / `.workbuddy-ai/` 全部 gitignore
@@ -23,7 +26,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
 $PY tools/run_e2e.py --doctor          # 环境体检
-$PY tools/selftest.py                  # 自测 102 项，离线可跑
+$PY tools/selftest.py                  # 自测 105 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
 $PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
@@ -69,7 +72,7 @@ src/                       库代码
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
   run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
-  selftest.py              自测 102 项（含负对照，**全程离线**）
+  selftest.py              自测 105 项（含负对照，**全程离线**）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应

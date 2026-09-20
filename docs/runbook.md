@@ -124,7 +124,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 102 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 105 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖：
@@ -134,7 +134,7 @@ $PY tools/selftest.py      # 102 项，含负对照，**全程离线**（不碰�
 | PoW | 5 | `sha256(salt+secret)` 前缀 + Form-Fields 逐字一致 |
 | Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
 | Stytch JS 字面量 | 4 | 裸键名不是 JSON |
-| 台账并集合并（真实词汇） | 12 | **`keyed` 之后重跑失败不许清空 `api_key`** |
+| 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
 | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
 | 收件规则 | 18 | 发件人同域必须叠加 subject；弯引号 |
 | OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码** |
@@ -145,7 +145,7 @@ $PY tools/selftest.py      # 102 项，含负对照，**全程离线**（不碰�
 | 编排：成功台账只收成功 | 6 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 
-> 合计 **102 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
+> 合计 **105 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
 > `docs/mail-filters.md` 里写的数字。
 
 > 改了 `ledger.RANK` 却没同步管线状态 ⇒ `状态词汇覆盖` 立刻失败。

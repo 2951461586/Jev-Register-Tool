@@ -195,5 +195,28 @@ class Ledger:
                     by_key[k] = merge(by_key[k], rec) if k in by_key else rec
             return list(by_key.values())
 
+    def raw_rows(self) -> list[dict[str, Any]]:
+        """**不做合并**，按文件顺序返回每一行。
+
+        为什么需要：`load()` 是按 `key`（邮箱）去重的合并视图，**同一账号的第二把
+        api_key 会被吃掉**。那把 key 在服务端仍然有效 —— 对"交付凭据"这类用途，
+        静默少一行和 `verify_keys` 少一行是同一类错误。
+        所以需要合并视图（拿权威元数据）**加**原始行（拿全部 key）两个视角。
+        """
+        out: list[dict[str, Any]] = []
+        with _LOCK:
+            for path in [*self._extra_sources, self.path]:
+                if not path.is_file():
+                    continue
+                for raw in path.read_text(encoding="utf-8").splitlines():
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        out.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        continue
+        return out
+
     def keys(self) -> set[str]:
         return {r["key"] for r in self.load() if r.get("key")}

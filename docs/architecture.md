@@ -29,7 +29,7 @@ Jev-Register-Tool/
 ├── tools/                     入口脚本（含命令行逻辑）
 │   ├── _bootstrap.py          按标记文件定位仓库根，统一 sys.path
 │   ├── run_e2e.py             ★ 主入口：apply / watch / resume / claim / scan
-│   ├── selftest.py            自测 102 项，含负对照，**全程离线**
+│   ├── selftest.py            自测 105 项，含负对照，**全程离线**
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── probe_confirm.py          单看"确认邮件"那一步的每跳原始响应
@@ -76,14 +76,14 @@ Jev-Register-Tool/
 |---|---:|---|---|
 | `config.py` | 98 | 常量集中地 + `.env` 加载 + `validate()` 启动校验 | 无 |
 | `mailrules.py` | 269 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
-| `ledger.py` | 199 | 台账读写、并集合并、等级语义 | 无 |
+| `ledger.py` | 222 | 台账读写、并集合并、等级语义 | 无 |
 | `tempemail.py` | 186 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `framer_waitlist.py` | 98 | 申请表单 + PoW | `config` |
 | `typesafe.py` | 388 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` |
 | `pipeline.py` | 540 | 阶段编排（含并发扇出） | `config` + 上面 5 个叶子 |
 | `run_e2e.py` | 260 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `pipeline` `tempemail` `mailrules` |
-| `selftest.py` | 658 | 自测 102 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
-| `verify_keys.py` | 137 | 验收 + 导出 | `config` `ledger` |
+| `selftest.py` | 674 | 自测 105 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
+| `verify_keys.py` | 154 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
 ## 3. 依赖分层（AST 实测）
@@ -197,10 +197,10 @@ Jev-Register-Tool/
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
 | ~~无并发~~ | **已加** `--concurrency`（申请段/注册段） | `watch` 刻意保持串行 |
-| ~~`pipeline.py` 零测试~~ | **已补** 96 项自测，其中编排层 41 项 | 继续加边界用例 |
+| ~~`pipeline.py` 零测试~~ | **已补** 105 项自测（审计当时 96 项） | 继续加边界用例 |
 | `pipeline.py` 521 行 | 阶段方法 + 并发脚手架挤在一个类里 | 若再加阶段，按"申请段 / 注册段"拆两个模块 |
 | `typesafe.py` 388 行 | 混了 HTTP 客户端 + HTML/JS 解析 | 解析函数已独立成模块级 `_parse_js_object` 等，可整体挪到 `parsing.py` |
-| `selftest.py` 658 行 | 单文件承载全部测试 | 超过 ~800 行时按 `tests/` 拆目录（保留一个聚合入口） |
+| `selftest.py` 674 行 | 单文件承载全部测试 | 超过 ~800 行时按 `tests/` 拆目录（保留一个聚合入口） |
 | `--mode watch` 与 `resume` 有重复 | 都做"跑 4→7" | 已抽 `stage_login` + `stage_create_key`，重复的只是循环壳 |
 
 ## 附录：复算依赖图

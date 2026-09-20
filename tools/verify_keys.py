@@ -4,6 +4,9 @@
 为什么必须做这一步：拿到 `apikey_...` 只证明"创建接口返回了字符串"，
 不证明这个 key 在推理网关上有效（可能被风控、配额、组织未激活挡掉）。
 
+候选集 = 台账**合并视图** ∪ **原始行**：合并视图按邮箱去重（同一账号重跑
+拿到第二把 key 时第一把会被吃掉），而两把在服务端都有效 ⇒ 交付不能少行。
+
 产物（全部落在 **`result/`**，即交付物目录）：
 
     result/success.jsonl        成功账号（从台账补录，幂等）
@@ -80,6 +83,20 @@ def main() -> int:
 
     led = Ledger(Path(args.ledger))
     recs = [r for r in led.load() if r.get("api_key")]
+
+    # 🔴 再补一遍**原始行**里的 key。
+    # `load()` 是按 key（邮箱）去重的合并视图 ⇒ 同一账号被重跑拿到**第二把**
+    # key 时，第一把会被吃掉 —— 而它在服务端仍然有效。
+    # 对"交付凭据"来说，静默少一行与上一轮审计里 P0 的后果是同一类错误。
+    # 所以候选集 = 合并视图（权威元数据）∪ 原始行（全部 key），按 api_key 去重。
+    have = {r["api_key"] for r in recs}
+    extra = [r for r in led.raw_rows() if r.get("api_key") and r["api_key"] not in have]
+    if extra:
+        for r in extra:
+            have.add(r["api_key"])
+        recs += extra
+        print(f"另有 {len(extra)} 把 key 只存在于原始行里"
+              f"（同账号的第二次建 key，合并视图按邮箱去重时会被吃掉）—— 一并验收")
 
     # 补录：把成功记录同步进 result/success.jsonl（**交付物**目录）。
     # 幂等（按 key 并集去重，且 EARNED_FIELDS 保证空值不覆盖已有凭据），可反复跑。

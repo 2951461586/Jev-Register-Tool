@@ -286,6 +286,22 @@ def test_ledger_union() -> None:
     led.upsert_many([{"key": "b@x.com", "status": "keyed"}])
     check("重复写入幂等", len(led.load()) == 4)
 
+    # ★ 合并视图按邮箱去重 ⇒ 同账号的第二把 key 会挤掉第一把。
+    # `verify_keys.py` 的候选集必须是"合并视图 ∪ 原始行"，否则会静默少交付一行。
+    led.append({"key": "a@x.com", "status": "keyed", "email": "a@x.com",
+                "api_key": "apikey_K1_SECOND"})
+    merged_keys = {r["api_key"] for r in led.load() if r.get("api_key")}
+    raw_keys = {r["api_key"] for r in led.raw_rows() if r.get("api_key")}
+    # 末行胜出 ⇒ 被吃掉的是**第一把**（不是第二把）。这个方向别写反：
+    # 真实台账里被吃掉的那把同样是先建的那把。
+    check("★ [负对照] 合并视图确实吃掉了第一把 key",
+          "apikey_K1" not in merged_keys, str(sorted(merged_keys)))
+    check("★ 原始行里两把 key 都在",
+          {"apikey_K1", "apikey_K1_SECOND"} <= raw_keys, str(sorted(raw_keys)))
+    check("原始行不合并 ⇒ 行数多于合并视图",
+          len(led.raw_rows()) > len(led.load()),
+          f"{len(led.raw_rows())} vs {len(led.load())}")
+
 
 def _status_literals(source: str) -> set[str]:
     """从源码里抽出"状态字面量"：

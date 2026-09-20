@@ -33,7 +33,11 @@ Jev-Register-Tool/
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── probe_confirm.py          单看"确认邮件"那一步的每跳原始响应
-│       └── probe_confirm_flow.py     干净实验：先确认再回调，用状态码判假设
+│       ├── probe_confirm_flow.py     干净实验：先确认再回调，用状态码判假设
+│       ├── probe_onboarding.py       探 /setup/* 的 Server Action 形态（--post 才发请求）
+│       ├── probe_worker_health.py    Worker /health + D1 连通性（只读）
+│       ├── probe_email_routing.py    查各域名在 Worker 上的收信路由（只读）
+│       └── verify_bodycandidates.mjs Node 回归台：把 Worker bundle 驱动到落库那一步
 │
 ├── docs/                      说明文档
 │   ├── architecture.md        本文件
@@ -74,7 +78,7 @@ Jev-Register-Tool/
 
 | 模块 | 行数 | 职责 | 内部依赖 |
 |---|---:|---|---|
-| `config.py` | 98 | 常量集中地 + `.env` 加载 + `validate()` 启动校验 | 无 |
+| `config.py` | 121 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` 启动校验 | 无 |
 | `mailrules.py` | 269 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
 | `ledger.py` | 222 | 台账读写、并集合并、等级语义 | 无 |
 | `tempemail.py` | 186 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
@@ -106,17 +110,19 @@ Jev-Register-Tool/
 
 | 模块 | 被依赖 | 说明 |
 |---|---:|---|
-| `config` | 8 | 常量集中地。改它要跑全量自测 |
+| `config` | 11 | 常量集中地。改它要跑全量自测 |
+| `typesafe` | 7 | 登录链路 |
 | `mailrules` | 5 | 规则表 + OTP 抽取；**纯叶子**，可离线测 |
 | `tempemail` | 5 | 收信唯一入口 |
-| `typesafe` | 5 | 登录链路 |
 | `ledger` | 4 | 台账唯一写入口 |
+| `pipeline` | 4 | CLI + 自测 + 两个只读探针 |
 | `framer_waitlist` | 3 | 申请 |
-| `pipeline` | 2 | 只有 CLI 与自测依赖它 |
 
 > 上表是**修正后**的数字。旧版表格（config=4 / typesafe=3 / framer=2 / mailrules=2）
 > 是错的：附录脚本用 `startswith('src.')` 判断，而 `from src import config` 的
 > `module` 恰好是 `"src"`（**不带点**），所以 `tools/*` 的顶层导入**全被漏计**。
+> 2026-09-20 晚新增 3 个探针后再次复算：config 8→11、typesafe 5→7、pipeline 2→4。
+> ⇒ **加/删文件后必须重跑附录脚本**，否则这张表立刻过期。
 
 **依赖方向是单向的**：`tools → pipeline → 叶子 → config`。
 没有任何叶子反向依赖 `pipeline`，也没有循环。`mailrules.py` 是唯一

@@ -26,7 +26,7 @@
    按 `you're`（直引号 U+0027）匹配**永远不中**。所以规则只用无标点的片段
    （`on the waitlist`），并在匹配前做一次 Unicode 归一化兜底。
 2. 信封发件人里**内嵌了收件人地址**（VERP 回弹编码）：
-   `bounces+<acct>-[<shard>-]oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai`
+   `bounces+<acct>-<shard>-oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai`
    这可以当一条免费的收件人一致性校验用，但**不要**把它当收件人字段的替代
    （`to` 才是权威字段）。
 

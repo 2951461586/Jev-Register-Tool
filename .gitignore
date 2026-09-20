@@ -15,6 +15,12 @@ exports/
 # 光靠上面的 *.json / *.jsonl 挡不住 result/keys.txt。
 result/
 
+# 备份 / 回滚点（回填、清污、改配置时都会留一份）
+*.bak
+*.bak-*
+*.orig
+*.rej
+
 # HAR / EML：含会话与令牌（通配已覆盖，这里显式列目录是为了可读）
 *.har
 *.eml

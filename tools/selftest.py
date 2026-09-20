@@ -490,7 +490,7 @@ def test_mailrules() -> None:
     check("无标点片段 on the waitlist 能中", mr.subject_ok(wait, "on the waitlist"))
 
     # ③ 确认邮件不能被误判成申请确认（两者都含 'TypeSafe'）
-    welcome = M(f"bounces+<acct>-[<shard>-]oai-x=example-mail.test@em5082.typesafe.ai",
+    welcome = M(f"bounces+<acct>-<shard>-oai-x=example-mail.test@em5082.typesafe.ai",
                 "Welcome to TypeSafe \u2014 confirm your email")
     check("确认邮件命中 welcome_confirm", mr.classify(welcome) == "welcome_confirm",
           mr.classify(welcome))

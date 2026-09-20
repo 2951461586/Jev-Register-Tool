@@ -27,12 +27,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _bootstrap import ROOT  # noqa: E402,F401
 
-ACCOUNT_ID = "REPLACED-CF-ACCOUNT-ID"
-SCRIPT = "temp-email-worker"
-D1_ID = "REPLACED-CF-D1-ID"
+from src import config  # noqa: E402
 
-# 与共享 Worker 项目的 deploy.py 同一来源；环境变量优先，便于换 token 时不改代码
-TOKEN = os.environ.get("CF_API_TOKEN", "REVOKED-CF-API-TOKEN")
+# 🔴 凭据与基础设施标识**一律走 .env**，代码里不留默认值。
+# 2026-09-20 之前这里是 `os.environ.get("CF_API_TOKEN", "cfat_…真实令牌…")` ——
+# 等于把一个有 Workers/D1 读权限的活令牌提交进了仓库。
+# `config` 会在 import 时加载 `.env`，所以下面直接读它即可。
+TOKEN = config.CF_API_TOKEN
+ACCOUNT_ID = config.CF_ACCOUNT_ID
+D1_ID = config.CF_D1_ID
+
+# Worker 名字不是凭据，留在代码里没问题。
+SCRIPT = "temp-email-worker"
 
 BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}"
 
@@ -56,6 +62,13 @@ def d1_query(sql: str) -> dict:
 
 
 def main() -> int:
+    missing = config.validate_cf()
+    if missing:
+        print("✗ 缺少 Cloudflare 配置：" + ", ".join(missing))
+        print("  这三个只在 .env 里配，代码里刻意不留默认值（见 src/config.py 的说明）。")
+        print("  .env 模板见 .env.example。")
+        return 1
+
     print("=" * 74)
     print("1) Worker 服务与版本详情")
     print("=" * 74)

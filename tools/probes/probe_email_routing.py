@@ -29,13 +29,36 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _bootstrap import ROOT  # noqa: E402,F401
 
-ACCOUNT_ID = "REPLACED-CF-ACCOUNT-ID"
-SCRIPT = "temp-email-worker"
-TOKEN = os.environ.get("CF_API_TOKEN", "REVOKED-CF-API-TOKEN")
+from src import config  # noqa: E402
+
+# 🔴 凭据与基础设施标识一律走 .env（理由见 src/config.py）。
+# 这里以前把账号 id 与一个**活令牌**当默认值写死在代码里。
+ACCOUNT_ID = config.CF_ACCOUNT_ID
+TOKEN = config.CF_API_TOKEN
 BASE = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}"
 
-DOMAINS = ["example-mail.test", "edu.example-mail.test", "example-mail-a.test", "example-mail-b.test",
-           "example-b-mail.test", "example-d-mail.test", "example-c-mail.test"]
+SCRIPT = "temp-email-worker"
+
+
+def domains() -> list[str]:
+    """要查的域名列表。
+
+    优先 `TEMPMAIL_DOMAINS`（逗号分隔）；没配就问 Worker 自己的 `/health`
+    —— 它返回的 `domains` 就是权威列表。这样仓库里不必出现自有域名。
+    """
+    env = [d.strip() for d in os.getenv("TEMPMAIL_DOMAINS", "").split(",") if d.strip()]
+    if env:
+        return env
+    if not config.TEMPMAIL_BASE:
+        return []
+    try:
+        req = urllib.request.Request(f"{config.TEMPMAIL_BASE.rstrip('/')}/health")
+        req.add_header("User-Agent", config.UA)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode()).get("domains") or []
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ⚠ 取域名列表失败（{exc}）—— 请在 .env 里设 TEMPMAIL_DOMAINS")
+        return []
 
 
 def api(path: str) -> dict:
@@ -68,10 +91,22 @@ def show(label: str, path: str, keys: list[str] | None = None) -> dict:
 
 
 def main() -> int:
+    missing = config.validate_cf()
+    if missing:
+        print("✗ 缺少 Cloudflare 配置：" + ", ".join(missing))
+        print("  这三个只在 .env 里配，代码里刻意不留默认值（见 src/config.py 的说明）。")
+        return 1
+
+    doms = domains()
+    if not doms:
+        print("✗ 拿不到域名列表：请在 .env 里设 TEMPMAIL_DOMAINS（逗号分隔），"
+              "或配好 TEMPMAIL_BASE 让 Worker 的 /health 自报。")
+        return 1
+
     print("=" * 74)
     print("A) Email Routing：域名的收信开关（这一层关了 ⇒ 邮件压根进不来）")
     print("=" * 74)
-    for d in DOMAINS:
+    for d in doms:
         out = api(f"/zones?name={d}")
         if not out.get("success") or not out["result"]:
             print(f"  {d:<22} ✗ 拿不到 zone（不在本账号？）")
@@ -85,7 +120,7 @@ def main() -> int:
     print("\n" + "=" * 74)
     print("B) catch-all 规则是否仍指向 Worker")
     print("=" * 74)
-    for d in DOMAINS:
+    for d in doms:
         out = api(f"/zones?name={d}")
         if not out.get("success") or not out["result"]:
             continue

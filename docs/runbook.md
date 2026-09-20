@@ -12,9 +12,19 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 ## 0. 首次准备
 
 ```bash
-cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
+cp .env.example .env      # 按注释填：3 个必填项见下
 $PY tools/run_e2e.py --doctor
 ```
+
+必填三项：`TEMPMAIL_ADMIN_KEY`（建邮箱 / `/admin/*`）、`TEMPMAIL_BASE`（Worker 根地址）、
+`TEMPMAIL_DOMAIN`（建邮箱用哪个域名）。
+选填：`CF_API_TOKEN` / `CF_ACCOUNT_ID` / `CF_D1_ID`（只有 `tools/probes/*` 诊断脚本用）、
+`TEMPMAIL_DOMAINS`（`probe_email_routing.py` 要查的域名，留空则问 Worker 的 `/health`）。
+
+> 🔴 **代码里没有任何真实默认值** —— 以前 `config.py` 的 `TEMPMAIL_BASE` / `TEMPMAIL_DOMAIN`
+> 带着真实值当默认，探针里还写着活的 `cfat_` 令牌。`os.getenv(k, "真值")` 就是泄漏点：
+> 它让"忘了配"和"配好了"在代码里长得一样，而且会被 git 一路带上去。
+> 现在缺哪项由 `validate()` / `validate_cf()` **显式报出来**，`--doctor` 直接列缺项。
 
 `--doctor` 会验：配置齐全 → 邮箱服务健康 → 能建邮箱 → 台账可读。
 

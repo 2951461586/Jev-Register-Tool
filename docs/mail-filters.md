@@ -42,7 +42,7 @@
 里面**内嵌了收件人**：
 
 ```
-bounces+<acct>-[<shard>-]oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai
+bounces+<acct>-<shard>-oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai
                             └────────── 收件人 ──────────┘
 ```
 

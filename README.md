@@ -12,20 +12,33 @@ TypeSafe（Jev / System One）**申请 → 确认邮件 → 获批 → 注册 �
 所以 `verify_keys.py` 的候选集是「合并视图 ∪ 原始行」。单账号关键路径
 `login 6.4s + create_key 3.7s ≈ 10s`。
 
-> **本仓库会含凭据。** 凭据只进 `.env`（代码里一律 `os.getenv()` 且默认空），
-> `.env` / `*.har` / `*.eml` / `exports/` / `result/` / `.workbuddy-ai/` 全部 gitignore
-> （用通配，不逐条列举）。
+> **凭据与基础设施标识一律不进仓库。** 代码里没有任何真实默认值 ——
+> 全部走 `.env`（`.env.example` 是唯一真源说明），缺哪项由 `--doctor` 显式报出来。
+> 被 gitignore 的（用通配，不逐条列举）：
+> `.env*` / `*.har` / `*.eml` / `*.json` / `*.jsonl` / `*.csv` / `*.log` /
+> `*.bak*` / `exports/` / `result/` / `evidence/` / `.workbuddy-ai/`。
 > `result/keys.txt` 里是**明文 API Key**，别提交。
 > 🔴 `result/` 必须**显式**列目录：`*.txt` 没有任何通配规则覆盖，
 > 光靠 `*.json` / `*.jsonl` 挡不住 `result/keys.txt`。
+
+## 配置
+
+| 变量 | 必填 | 用途 |
+|---|---|---|
+| `TEMPMAIL_ADMIN_KEY` | ✅ | 建邮箱 / `/admin/*` |
+| `TEMPMAIL_BASE` | ✅ | Worker 根地址（`https://<子域>.workers.dev`） |
+| `TEMPMAIL_DOMAIN` | ✅ | 建邮箱用哪个域名 |
+| `CF_API_TOKEN` | ⬜ | 只有 `tools/probes/*` 诊断脚本用；主流程不需要 |
+| `CF_ACCOUNT_ID` / `CF_D1_ID` | ⬜ | 同上 |
+| `TEMPMAIL_DOMAINS` | ⬜ | `probe_email_routing.py` 要查的域名；留空则问 Worker 的 `/health` |
 
 ## 快速开始
 
 ```bash
 PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe"
 
-cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
-$PY tools/run_e2e.py --doctor          # 环境体检
+cp .env.example .env                   # 按注释填（必填项见上表）
+$PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
 $PY tools/selftest.py                  # 自测 125 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
@@ -74,9 +87,13 @@ tools/                     入口脚本
   run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
   selftest.py              自测 125 项（含负对照，**全程离线**）
   verify_keys.py           ★ 验收 + 导出可用凭据
-  probes/                  一次性诊断探针
+  probes/                  一次性诊断探针（只读，除注明外都不写台账）
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应
     probe_confirm_flow.py        干净实验：先确认再回调，用状态码判假设
+    probe_onboarding.py          探 `/setup/*` 的 Server Action 形态（`--post` 才发请求）
+    probe_worker_health.py       Worker /health + D1 连通性（需 CF_API_TOKEN，只读）
+    probe_email_routing.py       查各域名在 Worker 上的收信路由（需 CF_API_TOKEN，只读）
+    verify_bodycandidates.mjs    Node 回归台：把 Worker bundle 打到落库那一步（见下）
 
 docs/
   architecture.md          目录 / 模块 / 耦合 / 数据流（依赖图由 AST 算出）

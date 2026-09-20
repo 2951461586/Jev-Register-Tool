@@ -29,9 +29,21 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(ROOT / ".env")
 
 # ── CF Temp Email Worker ────────────────────────────────────────────────
-TEMPMAIL_BASE = os.getenv("TEMPMAIL_BASE", "https://temp-email-worker.example.workers.dev")
+# 🔴 三个都**不留真实默认值**。以前 `TEMPMAIL_BASE` 的默认值是真实的
+#    `https://temp-email-worker.<子域>.workers.dev`、`TEMPMAIL_DOMAIN` 是真实域名，
+#    于是"基础设施标识"被写进了仓库（Worker 子域 + 自有邮箱域名）。
+#    这类东西单独看不是凭据，但合起来足以被针对性打击，且一旦公开就永久公开。
+#    现在一律走 .env，缺失由 `validate()` 显式报出来（不是静默用默认值连上去）。
+TEMPMAIL_BASE = os.getenv("TEMPMAIL_BASE", "")
 TEMPMAIL_ADMIN_KEY = os.getenv("TEMPMAIL_ADMIN_KEY", "")
-TEMPMAIL_DOMAIN = os.getenv("TEMPMAIL_DOMAIN", "example-mail.test")
+TEMPMAIL_DOMAIN = os.getenv("TEMPMAIL_DOMAIN", "")
+
+# ── Cloudflare API（只有 tools/probes/* 诊断脚本用得到）──────────────────
+# 同理：账号 id / D1 库 id / API Token 一个都不进仓库。
+# `tools/probes/probe_worker_health.py` 与 `probe_email_routing.py` 会读这三个。
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+CF_D1_ID = os.getenv("CF_D1_ID", "")
 
 # ── TypeSafe 站点 ───────────────────────────────────────────────────────
 SITE_ORIGIN = "https://console.typesafe.ai"
@@ -93,6 +105,17 @@ def validate(*, need_tempmail: bool = True) -> list[str]:
     刻意不在 import 时抛错 —— 那样连 --help 都跑不起来。
     """
     missing: list[str] = []
-    if need_tempmail and not TEMPMAIL_ADMIN_KEY:
-        missing.append("TEMPMAIL_ADMIN_KEY")
+    if need_tempmail:
+        for key, val in (("TEMPMAIL_BASE", TEMPMAIL_BASE),
+                         ("TEMPMAIL_ADMIN_KEY", TEMPMAIL_ADMIN_KEY),
+                         ("TEMPMAIL_DOMAIN", TEMPMAIL_DOMAIN)):
+            if not val:
+                missing.append(key)
     return missing
+
+
+def validate_cf() -> list[str]:
+    """Cloudflare API 三项。只有诊断探针需要，主流程不需要 —— 所以单独一个函数。"""
+    return [k for k, v in (("CF_API_TOKEN", CF_API_TOKEN),
+                           ("CF_ACCOUNT_ID", CF_ACCOUNT_ID),
+                           ("CF_D1_ID", CF_D1_ID)) if not v]

@@ -67,6 +67,14 @@ MATCH_ACCOUNT_READY = get_rule("account_ready")
 MATCH_CODE = any_of("signin_code", "verify_code")
 MATCH_LINK = any_of("welcome_confirm", "signin_link")
 
+#: 码模式等不到 6 位码后，回捞魔法链接的**额外**等待秒数。
+#:
+#: 这个回捞不是"再等等看"，而是应对站点对同一次发码请求回了链接形态的凭据
+#: （2026-09-20 实测：同一账号 4 次发码里 1 次回的是 "Sign in to TypeSafe"）。
+#: 链接和码是同一次 SMTP 投递，通常已经在窗口里，所以给 30s 足够；
+#: 给太长只会让未获批的账号在每一次重跑里多白等几十秒。
+LINK_FALLBACK_TIMEOUT = 30.0
+
 #: 等 "You're on the waitlist" 确认邮件的秒数。
 #:
 #: 🔴 **不要调回 180s。** 2026-09-20 实测：连跑 10 批次时确认邮件的到达延迟单调爬升
@@ -323,21 +331,50 @@ class Pipeline:
         else:
             m = self.mail.wait_for_mail(rec.email, MATCH_CODE, timeout=mail_timeout,
                                         interval=2.0, since_ms=since)
+            link_fallback = False
             if m is None:
-                self._fail(rec, "login", "未收到验证码邮件")
-                return None
-            token, how = extract_otp(m.body)
-            if not token:
-                self._fail(rec, "login", "验证码邮件里没找到 6 位码")
-                return None
-            if how != "anchored":
-                # 走了降级 = 回到了"可能抽到报文头里的 MTA 标识"那个老坑
-                # （服务端曾抽到 `MTA74-AB1`）。必须能从日志里看出来，
-                # 否则"站点改了邮件模板"会伪装成"验证码过期"，把人引向重新发码。
-                self.log(f"  [login] ⚠ 取码走了**降级**路径（模板锚定失配）"
-                         f"主题={m.subject!r} —— 站点可能改了邮件模板，"
-                         f"建议跑 --mode scan 看漏网主题")
-            res = cl.auth_callback(token, "otp", rec.email)
+                # 🔴 2026-09-20 实测：站点对**同一次**发码请求可能回魔法链接
+                # （主题 "Sign in to TypeSafe"）而不是 6 位码——同一账号 4 次发码里
+                # 就有 1 次是链接。此时继续等码必然超时；若直接判
+                # "未收到验证码邮件"，排查会被引向"D1 窗口被挤爆 / 邮箱坏了"，
+                # 而真相只是凭据形态换了一种。先回捞一次链接再判死。
+                m = self.mail.wait_for_mail(rec.email, MATCH_LINK,
+                                            timeout=LINK_FALLBACK_TIMEOUT,
+                                            interval=2.0, since_ms=since)
+                if m is None:
+                    self._fail(rec, "login", "未收到验证码邮件")
+                    return None
+                link_fallback = True
+                self.log(f"  [login] ⚠ 码模式未收到 6 位码，但收到魔法链接"
+                         f"（主题={m.subject!r}）—— 改走链接交换回捞")
+
+            if link_fallback:
+                link = re.search(
+                    r"https://login\.typesafe\.ai/v1/magic_links/redirect\?[^\s\"<>\)\]]+",
+                    m.body)
+                if not link:
+                    self._fail(rec, "login", "魔法链接邮件里没找到链接")
+                    return None
+                try:
+                    red = cl.exchange_magic_link(link.group(0))
+                    token = cl.token_from_redirect_url(red)
+                except TypeSafeError as exc:
+                    self._fail(rec, "login", f"魔法链接交换失败: {exc}")
+                    return None
+                res = cl.auth_callback(token, "magic_links", rec.email)
+            else:
+                token, how = extract_otp(m.body)
+                if not token:
+                    self._fail(rec, "login", "验证码邮件里没找到 6 位码")
+                    return None
+                if how != "anchored":
+                    # 走了降级 = 回到了"可能抽到报文头里的 MTA 标识"那个老坑
+                    # （服务端曾抽到 `MTA74-AB1`）。必须能从日志里看出来，
+                    # 否则"站点改了邮件模板"会伪装成"验证码过期"，把人引向重新发码。
+                    self.log(f"  [login] ⚠ 取码走了**降级**路径（模板锚定失配）"
+                             f"主题={m.subject!r} —— 站点可能改了邮件模板，"
+                             f"建议跑 --mode scan 看漏网主题")
+                res = cl.auth_callback(token, "otp", rec.email)
 
         rec.timings["login"] = time.time() - t0
         if not res.ok:

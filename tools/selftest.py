@@ -116,15 +116,26 @@ class _FakeTypeSafe:
     def __init__(self, *a, **kw):
         self.email = ""
 
+    #: 最近一次 `auth_callback` 用的凭据类型（"otp" / "magic_links"）。
+    #: 用于断言"码模式回捞链接"时确实走的是链接分支。
+    last_token_type = ""
+
     def send_login_email(self, email, mode="code"):
         self.email = email
         return Result(ok=True, status=200, stage="send_login_email",
                       data={"page_text": "Check your email"})
 
+    def exchange_magic_link(self, url):
+        return "https://console.typesafe.ai/?stytch_token_type=magic_links&token=FAKETOKEN"
+
+    def token_from_redirect_url(self, url):
+        return "FAKETOKEN"
+
     def auth_callback(self, token, token_type, email):
         # 先睡再写 email：放大竞态窗口，让"共享会话"的 bug 有机会暴露
         time.sleep(0.005)
         self.email = email
+        type(self).last_token_type = token_type
         ok = type(self).callback_status == 200
         return Result(ok=ok, status=type(self).callback_status,
                       stage="auth_callback", data=dict(type(self).callback_body))
@@ -184,6 +195,15 @@ def _otp_mail(to: str, code: str = "123456") -> Mail:
     return Mail(id="m-otp", to=to, sender="bounces+x-a@em5082.typesafe.ai",
                 subject="Your TypeSafe sign-in code",
                 body=f"{code} is your one-time code", received_at=1)
+
+
+def _link_mail(to: str) -> Mail:
+    """站点对**同一次**发码请求回了魔法链接形态（2026-09-20 实测存在）。"""
+    return Mail(id="m-link", to=to, sender="bounces+x-b@em5082.typesafe.ai",
+                subject="Sign in to TypeSafe",
+                body='<a href="https://login.typesafe.ai/v1/magic_links/redirect?'
+                     'stytch_token_type=magic_links&token=FAKETOKEN">Sign in</a>',
+                received_at=1)
 
 
 def _waitlist_mail(to: str) -> Mail:
@@ -636,6 +656,124 @@ def test_apply_and_approval() -> None:
           str(rec.stages))
 
 
+class _FakeResp:
+    def __init__(self, text: str, status: int = 200):
+        self.text = text
+        self.status_code = status
+
+
+class _FakeSession:
+    """按序吐出预置页面，并记录 GET 次数（用来断言重试次数）。"""
+
+    def __init__(self, pages: list[str]):
+        self.pages = list(pages)
+        self.headers: dict = {}
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        i = min(self.calls, len(self.pages) - 1)
+        self.calls += 1
+        return _FakeResp(self.pages[i])
+
+
+def _login_html(nums) -> str:
+    """造一个带 `$ACTION_<n>` 隐藏域的 /login 页。
+
+    值里的引号必须写成 `&quot;`：解析正则是 `value="([^"]*)"`，
+    直接写 `"` 会截断匹配（页面里本来也就是转义过的）。
+    """
+    parts = []
+    for n in nums:
+        ref = json.dumps({"id": f"act{n}", "bound": "$@1"}).replace('"', "&quot;")
+        parts.append(f'<input type="hidden" name="$ACTION_{n}:0" value="{ref}">')
+        parts.append(f'<input type="hidden" name="$ACTION_{n}:1" value="v{n}">')
+    return "<form>" + "".join(parts) + "</form>"
+
+
+def test_login_action_index_drift_retries() -> None:
+    """🔴 `/login` 的 Server Action **编号会漂移**，缺索引时必须先重试再判死。
+
+    2026-09-20 实测：正常渲染 `('2','3','4')`，某次拿到 `('2','4','5')`
+    —— 中间被插入了一个新表单，`ACTION_CODE='3'` 直接消失。
+    15 分钟后复测 15/15 又全回到 `('2','3','4')`。
+    ⇒ 写死索引的**前提**（编号稳定）会被部署/边缘缓存短暂破坏，
+    判死之前必须原样重试一次；不做语义识别是因为 LINK/CODE 只能靠编号区分。
+    """
+    print("\n[登录：Server Action 编号漂移 → 重试]")
+
+    ok = ts.TypeSafeClient(session=_FakeSession([_login_html("234")]))
+    acts = ok.fetch_actions("a@x.com")
+    check("正常页一次就拿到 action", sorted(acts) == ["2", "3", "4"], str(sorted(acts)))
+    check("正常页不浪费重试", ok.s.calls == 1, f"GET 次数={ok.s.calls}")
+
+    flaky = ts.TypeSafeClient(session=_FakeSession([_login_html("245"),
+                                                    _login_html("234")]))
+    acts = flaky.fetch_actions("a@x.com")
+    check("★ 编号漂移时重试后能拿到（不再直接判死）",
+          sorted(acts) == ["2", "3", "4"], str(sorted(acts)))
+    check("★ 确实只重试了一次（GET 2 次）", flaky.s.calls == 2, f"GET 次数={flaky.s.calls}")
+
+    dead = ts.TypeSafeClient(session=_FakeSession([_login_html("245")] * 5))
+    try:
+        dead.fetch_actions("a@x.com")
+        raised = ""
+    except ts.TypeSafeError as exc:
+        raised = str(exc)
+    check("[负对照] 一直漂移 → 最终仍判死", "未渲染出预期的 Server Action" in raised, raised)
+    check("[负对照] 判死前已经重试过（GET 2 次，不是 1 次就放弃）",
+          dead.s.calls == 2, f"GET 次数={dead.s.calls}")
+
+    check("★ 重试次数 >= 2（至少给漂移一次机会）",
+          ts.TypeSafeClient.ACTION_FETCH_ATTEMPTS >= 2,
+          str(ts.TypeSafeClient.ACTION_FETCH_ATTEMPTS))
+
+
+def test_code_mode_falls_back_to_magic_link() -> None:
+    """🔴 码模式等不到 6 位码时，站点可能回的是**魔法链接**，必须回捞。
+
+    反直觉点：`未收到验证码邮件` **不等于** 邮箱坏了 / D1 窗口被挤爆。
+    2026-09-20 实测：同一账号 4 次发码里 1 次回的是 "Sign in to TypeSafe"
+    （魔法链接），4 次是 "Your TypeSafe sign-in code"。等码的那次必然超时，
+    于是该账号被重试 10 次、每次都记 `未收到验证码邮件`，排查被一路引向
+    "共享 D1 窗口被刷爆"，而真相只是**凭据形态换了**。
+    改用 link 模式一跑就进去了（随后 403 —— 那才是它真正的状态）。
+    """
+    print("\n[登录：码模式 → 魔法链接回捞]")
+
+    # 只有链接邮件、没有码邮件 ⇒ 旧实现会在这里判死
+    with offline(mails=[_link_mail("a@x.com")]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = pl.AccountRecord(key="a@x.com", email="a@x.com")
+        cl = pipe.stage_login(rec, mail_timeout=1.0)
+    check("★ 只有魔法链接时也能建立会话（不再报『未收到验证码邮件』）",
+          cl is not None, f"status={rec.status} err={rec.error}")
+    check("★ 走的是 magic_links 分支（不是 otp）",
+          _FakeTypeSafe.last_token_type == "magic_links",
+          _FakeTypeSafe.last_token_type or "(未调用 auth_callback)")
+
+    # 负对照：有码邮件时必须照旧走 otp，不能被回捞逻辑抢走
+    with offline(mails=[_otp_mail("b@x.com", "123456")]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = pl.AccountRecord(key="b@x.com", email="b@x.com")
+        cl = pipe.stage_login(rec, mail_timeout=1.0)
+    check("[负对照] 有 6 位码时仍走 otp 分支", cl is not None
+          and _FakeTypeSafe.last_token_type == "otp",
+          _FakeTypeSafe.last_token_type or "(未调用 auth_callback)")
+
+    # 负对照：两种邮件都没有 ⇒ 才允许判"未收到验证码邮件"
+    with offline(mails=[]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = pl.AccountRecord(key="c@x.com", email="c@x.com")
+        cl = pipe.stage_login(rec, mail_timeout=0.1)
+    check("[负对照] 两种凭据都没有 → 才判『未收到验证码邮件』",
+          cl is None and "未收到验证码邮件" in (rec.error or ""),
+          f"cl={cl} err={rec.error}")
+
+    # 护栏：回捞窗口不能设太大，否则未获批账号每次重跑都要多白等
+    check("★ 回捞窗口 <= 60s（不给未获批账号拖长重跑）",
+          0 < P.LINK_FALLBACK_TIMEOUT <= 60.0, str(P.LINK_FALLBACK_TIMEOUT))
+
+
 def test_confirm_timeout_headroom() -> None:
     """🔴 回归护栏：等确认邮件的阈值不能退回 180s。
 
@@ -919,6 +1057,8 @@ def main() -> int:
     test_otp_extraction()
     test_auth_error_triage()
     test_apply_and_approval()
+    test_login_action_index_drift_retries()
+    test_code_mode_falls_back_to_magic_link()
     test_confirm_timeout_headroom()
     test_watch_skips_keyed()
     test_claim()

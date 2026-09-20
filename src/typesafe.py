@@ -174,17 +174,34 @@ class TypeSafeClient:
         }
 
     # ── 1. 抓 Server Action ───────────────────────────────────────────
+    #: `/login` 页抓 Server Action 的尝试次数。
+    #:
+    #: 🔴 2026-09-20 实测：action **编号会整体位移**。正常渲染是 `('2','3','4')`，
+    #: 某次拿到 `('2','4','5')` —— 中间被插入了一个新表单，`ACTION_CODE='3'` 就不见了，
+    #: 15 分钟后复测 15/15 又全是 `('2','3','4')`。
+    #: 也就是说"编号稳定"是**写死索引的前提，而这个前提会被部署/边缘缓存短暂破坏**。
+    #: 所以缺索引时先**原样重试一次**再判死（与"整批 HTTP 404 先重试"同类处置），
+    #: 不做语义识别是因为 LINK/CODE 只能靠编号区分，硬猜会发错凭据类型。
+    ACTION_FETCH_ATTEMPTS = 2
+
     def fetch_actions(self, email: str) -> dict[str, dict[str, str]]:
-        r = self.s.get(config.SITE_LOGIN, params={"waitlist": email}, timeout=30)
-        if r.status_code != 200:
-            raise TypeSafeError(f"GET /login -> HTTP {r.status_code}", status=r.status_code)
-        acts = _actions_from_html(r.text)
-        if ACTION_LINK not in acts or ACTION_CODE not in acts:
-            raise TypeSafeError(
-                f"/login 页未渲染出预期的 Server Action（拿到 {sorted(acts)}）"
-                " —— 页面结构可能变了，或该 URL 被改成了无表单版本"
-            )
-        return acts
+        last: tuple[str, ...] = ()
+        for i in range(self.ACTION_FETCH_ATTEMPTS):
+            r = self.s.get(config.SITE_LOGIN, params={"waitlist": email}, timeout=30)
+            if r.status_code != 200:
+                raise TypeSafeError(f"GET /login -> HTTP {r.status_code}",
+                                    status=r.status_code)
+            acts = _actions_from_html(r.text)
+            if ACTION_LINK in acts and ACTION_CODE in acts:
+                return acts
+            last = tuple(sorted(acts))
+            if i + 1 < self.ACTION_FETCH_ATTEMPTS:
+                time.sleep(1.0)
+        raise TypeSafeError(
+            f"/login 页未渲染出预期的 Server Action（拿到 {sorted(last)}，"
+            f"已重试 {self.ACTION_FETCH_ATTEMPTS} 次）"
+            " —— 页面结构可能变了，或该 URL 被改成了无表单版本"
+        )
 
     # ── 2. 触发发信 ───────────────────────────────────────────────────
     def send_login_email(self, email: str, mode: str = MODE_CODE) -> Result:

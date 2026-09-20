@@ -168,8 +168,16 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
         _FakeTempMailClient.pending = []
 
 
-def _make_pipe(P, ledger: Ledger):
-    return P.Pipeline(mail=P.TempMailClient(), ledger=ledger, verbose=False)
+def _make_pipe(P, ledger: Ledger, success: Ledger | None = None):
+    """造一个**全离线**的 Pipeline。
+
+    🔴 `success_ledger` 必须显式传临时台账。它的默认值是
+    `config.SUCCESS_LEDGER_PATH` —— 那是**交付物**（`result/success.jsonl`）。
+    不传就等于让自测往交付物里写 `apikey_FAKE_*`：实测灌进去 9 条假记录，
+    而 `verify_keys` 读的是**主台账**，所以一路没人发现。
+    """
+    return P.Pipeline(mail=P.TempMailClient(), ledger=ledger,
+                      success_ledger=success or _tmp_ledger(), verbose=False)
 
 
 def _otp_mail(to: str, code: str = "123456") -> Mail:
@@ -740,6 +748,20 @@ def test_success_ledger() -> None:
           repr(rows[:1]))
     check("_clone() 共享同一个成功台账",
           pipe._clone().success_ledger is pipe.success_ledger)
+
+    # 🔴 护栏：自测**绝不能**写到交付物 `result/success.jsonl`。
+    # 这条是被真事逼出来的 —— 实测自测往交付物里灌了 9 条 `apikey_FAKE_*`，
+    # 而 verify_keys 读的是主台账，所以一路没人发现。
+    with offline(mails=[]) as P:
+        guard = _make_pipe(P, _tmp_ledger())
+    check("★ [护栏] 自测的 Pipeline 不指向交付物 result/success.jsonl",
+          Path(guard.success_ledger.path).resolve()
+          != Path(pl.config.SUCCESS_LEDGER_PATH).resolve(),
+          str(guard.success_ledger.path))
+    check("★ [护栏] 自测的成功台账落在临时目录",
+          "tmp" in str(guard.success_ledger.path).lower()
+          or tempfile.gettempdir().lower() in str(guard.success_ledger.path).lower(),
+          str(guard.success_ledger.path))
 
     # 失败路径：建 key 抛错 ⇒ 成功台账**一条都不许增加**
     with offline(mails=[_otp_mail("bad@example-mail.test")], fail_key=True) as P:

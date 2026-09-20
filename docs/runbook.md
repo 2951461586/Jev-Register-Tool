@@ -155,7 +155,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 123 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 125 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖：
@@ -175,10 +175,10 @@ $PY tools/selftest.py      # 123 项，含负对照，**全程离线**（不碰�
 | 编排：确认邮件等待阈值 | 4 | **迟到 ≠ 未发**；阈值不许退回 180s |
 | 编排：claim 两段式 | 7 | `code_sent` 不是 `failed` |
 | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
-| 编排：成功台账只收成功 | 6 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
+| 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 
-> 合计 **123 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
+> 合计 **125 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
 > `docs/mail-filters.md` 里写的数字。
 
 > 改了 `ledger.RANK` 却没同步管线状态 ⇒ `状态词汇覆盖` 立刻失败。

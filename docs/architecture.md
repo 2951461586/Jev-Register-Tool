@@ -29,7 +29,7 @@ Jev-Register-Tool/
 ├── tools/                     入口脚本（含命令行逻辑）
 │   ├── _bootstrap.py          按标记文件定位仓库根，统一 sys.path
 │   ├── run_e2e.py             ★ 主入口：apply / watch / resume / claim / scan
-│   ├── selftest.py            自测 105 项，含负对照，**全程离线**
+│   ├── selftest.py            自测 123 项，含负对照，**全程离线**
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── probe_confirm.py          单看"确认邮件"那一步的每跳原始响应
@@ -79,10 +79,10 @@ Jev-Register-Tool/
 | `ledger.py` | 222 | 台账读写、并集合并、等级语义 | 无 |
 | `tempemail.py` | 186 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `framer_waitlist.py` | 98 | 申请表单 + PoW | `config` |
-| `typesafe.py` | 388 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` |
-| `pipeline.py` | 540 | 阶段编排（含并发扇出） | `config` + 上面 5 个叶子 |
-| `run_e2e.py` | 260 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `pipeline` `tempemail` `mailrules` |
-| `selftest.py` | 674 | 自测 105 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
+| `typesafe.py` | 413 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` |
+| `pipeline.py` | 566 | 阶段编排（含并发扇出） | `config` + 上面 5 个叶子 |
+| `run_e2e.py` | 266 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `pipeline` `tempemail` `mailrules` |
+| `selftest.py` | 805 | 自测 123 项（含编排层离线测试） | `ledger` `framer_waitlist` `typesafe` `mailrules` `pipeline` `tempemail` |
 | `verify_keys.py` | 154 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
@@ -172,10 +172,11 @@ Jev-Register-Tool/
 | **邮件文案** | `mailrules.RULES` | 站点改文案 ⇒ 规则不中。`--mode scan` 的漏网主题是唯一信号 |
 | **发件人域** | `mailrules.SENDER_*` | 站点换 ESP ⇒ 全部规则失效（症状同上） |
 | **OTP 模板句** | `mailrules.OTP_ANCHORED_RE` | 站点改模板 ⇒ 锚定失配 ⇒ 走降级路径（**日志会明确写出来**） |
-| **Server Action 渲染形态** | `typesafe._actions_from_html` | 页面结构变 ⇒ `fetch_actions` 抛错（有明确报错，不是静默失败） |
+| **Server Action 渲染形态** | `typesafe._actions_from_html` | 🔴 页面结构变 ⇒ **`/setup/*` 会静默退化到陈旧 fallback ⇒ 404**（2026-09-20 实翻车，见下）。`/login` 有 `fetch_actions` 显式校验索引 2/3，所以它抛错 |
+| **`$ACTION_<n>` 的索引集合** | 同上 | 🔴 **不许写死**。`/login` 用 2/3/4，`/setup/*` 用 1。写死枚举 + 要求 `:2` 同时存在 ⇒ 新形态一条都抓不到 |
 | **`$ACTION_<n>:0` 必须紧凑 JSON** | `typesafe._compact_ref` | 加空格 ⇒ Next.js 直接 500。自测有负对照钉住 |
 | **Framer PoW 常量** | `config.POW_*` | 站点调难度 ⇒ 申请被拒。常量取自 JS，不是试出来的 |
-| **`/setup/*` action id** | `typesafe.FALLBACK_SETUP_ACTIONS` | 仅降级用；首选是运行时抓隐藏域 |
+| **`/setup/*` action id** | `typesafe.FALLBACK_SETUP_ACTIONS` | 🔴 仅降级用，**会随部署失效**。2026-09-20 实测该表里的 id 已全部作废（POST 回 `404 Server action not found.`）。首选永远是运行时抓隐藏域 |
 | **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 pipeline 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住 |
 | **台账身份字段** | `ledger.EARNED_FIELDS` | 决定"哪些字段不许被空值覆盖"（`api_key` 等） |
 | **推理端点** | `verify_keys.API_URL` | 站点换端点 ⇒ 验收误判为"key 不可用" |
@@ -197,10 +198,10 @@ Jev-Register-Tool/
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
 | ~~无并发~~ | **已加** `--concurrency`（申请段/注册段） | `watch` 刻意保持串行 |
-| ~~`pipeline.py` 零测试~~ | **已补** 105 项自测（审计当时 96 项） | 继续加边界用例 |
-| `pipeline.py` 521 行 | 阶段方法 + 并发脚手架挤在一个类里 | 若再加阶段，按"申请段 / 注册段"拆两个模块 |
-| `typesafe.py` 388 行 | 混了 HTTP 客户端 + HTML/JS 解析 | 解析函数已独立成模块级 `_parse_js_object` 等，可整体挪到 `parsing.py` |
-| `selftest.py` 674 行 | 单文件承载全部测试 | 超过 ~800 行时按 `tests/` 拆目录（保留一个聚合入口） |
+| ~~`pipeline.py` 零测试~~ | **已补** 123 项自测（审计当时 96 项） | 继续加边界用例 |
+| `pipeline.py` 566 行 | 阶段方法 + 并发脚手架挤在一个类里 | 若再加阶段，按"申请段 / 注册段"拆两个模块 |
+| `typesafe.py` 413 行 | 混了 HTTP 客户端 + HTML/JS 解析 | 解析函数已独立成模块级 `_parse_js_object` 等，可整体挪到 `parsing.py` |
+| `selftest.py` 805 行 | 单文件承载全部测试 | 已超 ~800 行的线 ⇒ 下次改动时按 `tests/` 拆目录（保留一个聚合入口） |
 | `--mode watch` 与 `resume` 有重复 | 都做"跑 4→7" | 已抽 `stage_login` + `stage_create_key`，重复的只是循环壳 |
 
 ## 附录：复算依赖图

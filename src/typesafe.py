@@ -68,22 +68,57 @@ class Result:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-def _actions_from_html(page: str) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
-    for n in ("2", "3", "4"):
-        m0 = re.search(r'name="\$ACTION_%s:0"\s+value="([^"]*)"' % n, page)
-        m2 = re.search(r'name="\$ACTION_%s:2"\s+value="([^"]*)"' % n, page)
-        m1 = re.search(r'name="\$ACTION_%s:1"\s+value="([^"]*)"' % n, page)
-        if not (m0 and m2):
-            continue
-        ref = json.loads(html_mod.unescape(m0.group(1)))
-        out[n] = {
-            "id": ref["id"],
-            "bound": ref.get("bound", "$@1"),
-            "a1": html_mod.unescape(m1.group(1)) if m1 else '["$@2"]',
-            "a2": html_mod.unescape(m2.group(1)),
-        }
+#: 页面里渲染的 Server Action 隐藏域：`name="$ACTION_<n>:<idx>" value="…"`。
+#:
+#: 🔴 **不要把 `<n>` 的集合写死。** 以前是 `for n in ("2", "3", "4")`，并且要求
+#: `:0` 与 `:2` **同时存在**。2026-09-20 站点改版后 `/setup/*` 渲染的是索引 **1**、
+#: 且**只有 `:0` 和 `:1`**（另加一个 `$ACTION_KEY`）—— 两个条件都不满足，
+#: 于是 `acts` 恒为空 ⇒ 退化到 `FALLBACK_SETUP_ACTIONS` 里陈旧的 action id
+#: ⇒ POST 404 ⇒ 最终只看到 `onboarding 失败: HTTP 404`，
+#: 跟"索引集合被写死了"毫无字面关联。
+_ACTION_FIELD_RE = re.compile(r'name="\$ACTION_(\d+):(\d+)"\s+value="([^"]*)"')
+_ACTION_KEY_RE = re.compile(r'name="\$ACTION_KEY"\s+value="([^"]*)"')
+
+
+def _actions_from_html(page: str) -> dict[str, dict[str, Any]]:
+    """抓出页面渲染的 Server Action 隐藏域，**原样**留着待回填。
+
+    返回 `{n: {"id": …, "bound": …, "fields": {"0": …, "1": …}, "key": …}}`。
+
+    只要求 `:0` 存在（它带 action id）；`:1` / `:2` 有就收、没有就不发 ——
+    浏览器提交表单时也只回填页面上真实存在的隐藏域。
+    """
+    fields: dict[str, dict[str, str]] = {}
+    for n, idx, val in _ACTION_FIELD_RE.findall(page):
+        fields.setdefault(n, {})[idx] = html_mod.unescape(val)
+
+    km = _ACTION_KEY_RE.search(page)
+    key = html_mod.unescape(km.group(1)) if km else ""
+
+    out: dict[str, dict[str, Any]] = {}
+    for n, vals in fields.items():
+        if "0" not in vals:
+            continue                      # 没有 :0 就没有 action id，这条用不了
+        try:
+            ref = json.loads(vals["0"])
+        except ValueError:
+            continue                      # 不是 JSON ⇒ 不是 Server Action 引用
+        out[n] = {"id": ref.get("id", ""), "bound": ref.get("bound", "$@1"),
+                  "fields": vals, "key": key}
     return out
+
+
+def _action_form_fields(n: str, a: dict[str, Any]) -> dict[str, tuple]:
+    """把 `_actions_from_html` 的产物还原成"要提交的隐藏域"（multipart 元组形式）。
+
+    `:0` 走 `_compact_ref()` 重新序列化 —— 保证紧凑 JSON（带空格会被 Next.js 判 500）。
+    """
+    parts: dict[str, tuple] = {f"$ACTION_REF_{n}": (None, "")}
+    for idx, val in sorted(a["fields"].items()):
+        parts[f"$ACTION_{n}:{idx}"] = (None, _compact_ref(a) if idx == "0" else val)
+    if a.get("key"):
+        parts["$ACTION_KEY"] = (None, a["key"])
+    return parts
 
 
 def _compact_ref(a: dict[str, str]) -> str:
@@ -157,13 +192,8 @@ class TypeSafeClient:
         n = ACTION_LINK if mode == MODE_LINK else ACTION_CODE
         acts = self.fetch_actions(email)
         a = acts[n]
-        files = {
-            f"$ACTION_REF_{n}": (None, ""),
-            f"$ACTION_{n}:0": (None, _compact_ref(a)),
-            f"$ACTION_{n}:1": (None, a["a1"]),
-            f"$ACTION_{n}:2": (None, a["a2"]),
-            "email": (None, email),
-        }
+        files = _action_form_fields(n, a)
+        files["email"] = (None, email)
         r = self.s.post(config.SITE_LOGIN, params={"waitlist": email}, files=files,
                         headers=self._login_headers(email), timeout=40)
         txt = _visible_text(r.text)
@@ -281,12 +311,7 @@ class TypeSafeClient:
         if acts:
             n = action_n or next(iter(acts))
             a = acts[n]
-            files = {
-                f"$ACTION_REF_{n}": (None, ""),
-                f"$ACTION_{n}:0": (None, _compact_ref(a)),
-                f"$ACTION_{n}:1": (None, a["a1"]),
-                f"$ACTION_{n}:2": (None, a["a2"]),
-            }
+            files = _action_form_fields(n, a)
             for k, v in fields.items():
                 files[k] = (None, v)
             headers = {"Origin": config.SITE_ORIGIN,

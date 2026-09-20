@@ -203,6 +203,9 @@ def main() -> int:
                     help="code=6 位验证码；link=魔法链接")
     ap.add_argument("--approval-timeout", type=float, default=0.0,
                     help="等审批的秒数，0=只做一次快照检查")
+    ap.add_argument("--confirm-timeout", type=float, default=None,
+                    help="等 waitlist 确认邮件的秒数（默认取 pipeline.CONFIRM_TIMEOUT=300；"
+                         "调小会漏掉迟到的邮件并把成功申请记成 failed）")
     ap.add_argument("--watch-timeout", type=float, default=900.0,
                     help="mode=watch 的监听时长（秒）")
     ap.add_argument("--watch-interval", type=float, default=15.0,
@@ -249,9 +252,12 @@ def main() -> int:
         recs = pipe.resume(args.email, name=args.key_name,
                            concurrency=args.concurrency)
     else:
+        kw = {}
+        if args.confirm_timeout is not None:
+            kw["confirm_timeout"] = args.confirm_timeout
         recs = pipe.run_batch(count=args.count, mode=args.mode,
                               approval_timeout=args.approval_timeout,
-                              name=args.key_name, concurrency=args.concurrency)
+                              name=args.key_name, concurrency=args.concurrency, **kw)
 
     return report(recs, mode=args.mode, json_path=args.json)
 

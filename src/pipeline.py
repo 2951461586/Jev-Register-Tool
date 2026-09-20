@@ -67,6 +67,21 @@ MATCH_ACCOUNT_READY = get_rule("account_ready")
 MATCH_CODE = any_of("signin_code", "verify_code")
 MATCH_LINK = any_of("welcome_confirm", "signin_link")
 
+#: 等 "You're on the waitlist" 确认邮件的秒数。
+#:
+#: 🔴 **不要调回 180s。** 2026-09-20 实测：连跑 10 批次时确认邮件的到达延迟单调爬升
+#: （41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 s），阈值 180s 会把
+#: 后两条**误判成 `failed`** —— 而它们其实在超时后 12s / 18s 就落了库。
+#: 误判的代价不是多等一会儿，是台账里多两条"失败"记录、运营者据此重投申请。
+#: 300s ≈ 健康期实测最大延迟的 1.5 倍。
+#:
+#: ⚠️ 但**阈值只是"本次不等了"，不是"这封邮件不会来了"**。另有两例（09:01 / 09:04
+#: 提交）的确认邮件到 09:21:28 才入库（延迟 ~20 分钟）——那段时间正好横跨共享 Worker
+#: 的故障恢复窗口（09:19:29 才恢复落库），所以这 20 分钟**更可能是故障期积压/重投**，
+#: 不是常态。两例后来都正常获批了，说明**确认邮件没收到不影响审批**。
+#: ⇒ 见到 confirm 超时，先回查收件箱再决定要不要重投，别直接当失败。
+CONFIRM_TIMEOUT = 300.0
+
 # 本模块写入的 `status` 字面量（applied / confirmed / approved / registered /
 # keyed / partial / code_sent / failed）必须在 `ledger.RANK` 里有登记 ——
 # 台账的升级/降级判断依赖它。以前这里有个 `STATUS_ORDER` 列表，但全项目零引用
@@ -175,7 +190,8 @@ class Pipeline:
         return self._fail(rec, "login", f"认证回调 HTTP {res.status}: {code}{suffix}")
 
     # ── 阶段 1+2：申请 + 确认邮件 ─────────────────────────────────────
-    def stage_apply(self, rec: AccountRecord, *, confirm_timeout: float = 180.0) -> bool:
+    def stage_apply(self, rec: AccountRecord, *,
+                    confirm_timeout: float = CONFIRM_TIMEOUT) -> bool:
         t0 = time.time()
         if not rec.email:
             rec.email = self.mail.create_mailbox(self.domain)
@@ -189,20 +205,26 @@ class Pipeline:
             return self._fail(rec, "apply",
                               f"framer submit HTTP {sub['status']}: {sub['body'][:160]}")
         rec.stages["apply"] = "ok"
+        # `apply` 只算**提交表单**这一段。以前它把下面等邮件的时间也吞进去，
+        # 于是报告里出现 "阶段分解: apply 181.13s" —— 读起来像表单提交花了 3 分钟，
+        # 实际那 181s 全是等邮件。两个计时器不重叠，`sum(timings.values())` 才有意义。
+        rec.timings["apply"] = time.time() - t0
 
+        t1 = time.time()
         mail = self.mail.wait_for_mail(rec.email, MATCH_WAITLIST_CONFIRM,
                                        timeout=confirm_timeout, interval=2.0, since_ms=since)
-        rec.timings["apply"] = time.time() - t0
+        rec.timings["confirm_wait"] = time.time() - t1
         if mail is None:
             return self._fail(
                 rec, "confirm",
                 f"未在 {confirm_timeout:.0f}s 内收到 waitlist 确认邮件"
-                f"（邮箱接口轮询 {self.mail.stats.polls} 次，5xx {self.mail.stats.http_5xx} 次）")
+                f"（邮箱接口轮询 {self.mail.stats.polls} 次，5xx {self.mail.stats.http_5xx} 次）"
+                f" —— 若确认邮件是迟到而非未发，这里会误判，收尾时请回查一次收件箱")
         rec.stages["confirm"] = "ok"
         rec.waitlist["confirm_subject"] = mail.subject
         rec.waitlist["confirm_at"] = mail.received_at
         rec.status = "confirmed"
-        self.log(f"  [confirm] {mail.subject}  ({rec.timings['apply']:.1f}s)")
+        self.log(f"  [confirm] {mail.subject}  ({rec.timings['confirm_wait']:.1f}s)")
         return True
 
     # ── 阶段 3：等审批 ────────────────────────────────────────────────
@@ -392,11 +414,12 @@ class Pipeline:
     # ── 全链路 ────────────────────────────────────────────────────────
     def run_one(self, *, email: str = "", mode: str = "full",
                 approval_timeout: float = 0.0,
+                confirm_timeout: float = CONFIRM_TIMEOUT,
                 name: str = "1") -> AccountRecord:
         rec = AccountRecord(key=email, email=email)
         try:
             if mode in ("full", "apply"):
-                if not self.stage_apply(rec):
+                if not self.stage_apply(rec, confirm_timeout=confirm_timeout):
                     return rec
                 if mode == "apply":
                     return rec
@@ -415,11 +438,14 @@ class Pipeline:
         return rec
 
     def run_batch(self, *, count: int = 1, mode: str = "full",
-                  approval_timeout: float = 0.0, name: str = "1",
+                  approval_timeout: float = 0.0,
+                  confirm_timeout: float = CONFIRM_TIMEOUT,
+                  name: str = "1",
                   concurrency: int = 1) -> list[AccountRecord]:
         def job(pipe: "Pipeline", i: int) -> AccountRecord:
             pipe.log(f"[{i + 1}/{count}] 开始")
-            rec = pipe.run_one(mode=mode, approval_timeout=approval_timeout, name=name)
+            rec = pipe.run_one(mode=mode, approval_timeout=approval_timeout,
+                               confirm_timeout=confirm_timeout, name=name)
             pipe.ledger.append(rec.to_dict())
             pipe.log(f"[{i + 1}/{count}] status={rec.status} {rec.error}")
             return rec

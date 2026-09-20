@@ -18,6 +18,7 @@
   - 收件规则
   - OTP 抽取（锚定 / 降级）
   - 编排层：错误码分流、申请段、claim、并发不串号
+  - 确认邮件等待阈值（防"迟到被误判成失败"回归）
 
 **全程离线**，不碰网络。
 """
@@ -27,8 +28,11 @@ from __future__ import annotations
 import ast
 import contextlib
 import hashlib
+import html
+import inspect
 import itertools
 import json
+import re
 import sys
 import tempfile
 import time
@@ -39,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))          # tools/
 from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加进 sys.path）
 
 from src import framer_waitlist as fw  # noqa: E402
+from src import pipeline as pl  # noqa: E402
 from src import typesafe as ts  # noqa: E402
 from src.ledger import RANK, Ledger  # noqa: E402
 from src.tempemail import Mail  # noqa: E402
@@ -210,6 +215,91 @@ def test_compact_ref() -> None:
     check("紧凑、无空格", s == '{"id":"60e492c6afe6018dbb5fb596f90cddf1a3e0b3db7d","bound":"$@1"}', s)
     check("[负对照] 默认 json.dumps 会带空格（这就是 500 的根因）",
           json.dumps(a) != s and '"id": ' in json.dumps(a))
+
+
+#: 站点 2026-09-20 起的 `/setup/*` 真实渲染形态：索引是 **1**、只有 `:0`/`:1`，
+#: 另加一个 `$ACTION_KEY`。旧实现枚举 ("2","3","4") 且要求 `:2` 存在 ⇒ 一条都抓不到。
+_SETUP_HTML_NEW = (
+    '<form action="" method="POST" encType="multipart/form-data">'
+    '<input type="hidden" name="$ACTION_REF_1"/>'
+    '<input type="hidden" name="$ACTION_1:0" value="{&quot;id&quot;:'
+    '&quot;60cda63fb0752ab5b5cd77aa976e845c5feef9ae16&quot;,&quot;bound&quot;:&quot;$@1&quot;}"/>'
+    '<input type="hidden" name="$ACTION_1:1" value="[{}]"/>'
+    '<input type="hidden" name="$ACTION_KEY" value="kd64c2077489fba7459c31df809cd11b9"/>'
+    "</form>"
+)
+
+#: `/login` 页至今仍是旧形态：索引 2/3/4，各带 `:0`/`:1`/`:2`。
+_LOGIN_HTML_OLD = (
+    '<input type="hidden" name="$ACTION_REF_2"/>'
+    '<input type="hidden" name="$ACTION_2:0" value="{&quot;id&quot;:&quot;aaa&quot;,&quot;bound&quot;:&quot;$@1&quot;}"/>'
+    '<input type="hidden" name="$ACTION_2:1" value="[{}]"/>'
+    '<input type="hidden" name="$ACTION_2:2" value="[&quot;x&quot;]"/>'
+    '<input type="hidden" name="$ACTION_REF_3"/>'
+    '<input type="hidden" name="$ACTION_3:0" value="{&quot;id&quot;:&quot;bbb&quot;,&quot;bound&quot;:&quot;$@1&quot;}"/>'
+    '<input type="hidden" name="$ACTION_3:1" value="[{}]"/>'
+    '<input type="hidden" name="$ACTION_3:2" value="[&quot;y&quot;]"/>'
+)
+
+
+def _legacy_actions_from_html(page: str) -> dict:
+    """**复刻旧实现**，只用于负对照：证明 fixture 真的能暴露那个 bug。"""
+    out = {}
+    for n in ("2", "3", "4"):
+        m0 = re.search(r'name="\$ACTION_%s:0"\s+value="([^"]*)"' % n, page)
+        m2 = re.search(r'name="\$ACTION_%s:2"\s+value="([^"]*)"' % n, page)
+        if not (m0 and m2):
+            continue
+        out[n] = json.loads(html.unescape(m0.group(1)))["id"]
+    return out
+
+
+def test_setup_action_forms() -> None:
+    """🔴 回归：`$ACTION_<n>` 的索引集合**不许写死**。
+
+    2026-09-20 站点改版，`/setup/*` 把隐藏域换成索引 `1` + 只有 `:0`/`:1` + `$ACTION_KEY`。
+    旧实现（枚举 2/3/4 且要求 `:2`）一条都抓不到 ⇒ `acts` 恒空 ⇒ 退化到录制 HAR 里
+    陈旧的 action id ⇒ POST 返回 `404 Server action not found.` ⇒
+    对外只看到 `onboarding 失败: HTTP 404`。
+    """
+    print("\n[Server Action 渲染形态]")
+
+    acts = ts._actions_from_html(_SETUP_HTML_NEW)
+    check("★ 新形态能抓到索引 1（旧实现抓不到）", "1" in acts, str(sorted(acts)))
+    check("★ 只要求 `:0`，`:2` 缺失不再直接 skip",
+          sorted(acts.get("1", {}).get("fields", {})) == ["0", "1"],
+          str(acts.get("1", {}).get("fields")))
+    check("★ `$ACTION_KEY` 被带出来（浏览器也会回填它）",
+          acts.get("1", {}).get("key") == "kd64c2077489fba7459c31df809cd11b9",
+          str(acts.get("1", {}).get("key")))
+    check("action id 解析正确",
+          acts.get("1", {}).get("id") == "60cda63fb0752ab5b5cd77aa976e845c5feef9ae16",
+          str(acts.get("1", {}).get("id")))
+
+    # 负对照 1：旧实现在同一份 fixture 上必须**什么都抓不到**
+    check("★ [负对照] 旧实现在新形态上返回空（证明 fixture 能暴露该 bug）",
+          _legacy_actions_from_html(_SETUP_HTML_NEW) == {},
+          str(_legacy_actions_from_html(_SETUP_HTML_NEW)))
+
+    # 负对照 2：新实现不能把 /login 的旧形态弄坏
+    old = ts._actions_from_html(_LOGIN_HTML_OLD)
+    check("[负对照] /login 旧形态仍能抓到 2 和 3",
+          sorted(old) == ["2", "3"], str(sorted(old)))
+    check("[负对照] 旧形态的 `:2` 仍然被保留",
+          sorted(old.get("2", {}).get("fields", {})) == ["0", "1", "2"],
+          str(old.get("2", {}).get("fields")))
+    check("[负对照] 旧形态没有 `$ACTION_KEY` 就不该凭空造一个",
+          old.get("2", {}).get("key") == "", str(old.get("2", {}).get("key")))
+
+    # 回填：只发页面上真实存在的隐藏域
+    files = ts._action_form_fields("1", acts["1"])
+    check("回填含 $ACTION_REF_1", "$ACTION_REF_1" in files, str(sorted(files)))
+    check("★ `:0` 被重新序列化成紧凑 JSON",
+          files["$ACTION_1:0"][1] == '{"id":"60cda63fb0752ab5b5cd77aa976e845c5feef9ae16","bound":"$@1"}',
+          files["$ACTION_1:0"][1])
+    check("★ 页面没有 `:2` ⇒ 回填里也不许出现 `$ACTION_1:2`（别凭空造字段）",
+          "$ACTION_1:2" not in files, str(sorted(files)))
+    check("$ACTION_KEY 被回填", files.get("$ACTION_KEY", (None, ""))[1] == acts["1"]["key"])
 
 
 def test_js_object() -> None:
@@ -512,6 +602,14 @@ def test_apply_and_approval() -> None:
     check("apply / confirm 两阶段都记 ok",
           rec.stages.get("apply") == "ok" and rec.stages.get("confirm") == "ok",
           str(rec.stages))
+    # 计时器必须**不重叠**：`apply` 只算提交表单，等邮件单独记 `confirm_wait`。
+    # 以前两者合一，报告里会印出 "阶段分解: apply 181.13s"，读起来像表单提交卡了 3 分钟。
+    check("★ timings 里 apply 与 confirm_wait 分开记（不重叠，可求和）",
+          "apply" in rec.timings and "confirm_wait" in rec.timings,
+          str(sorted(rec.timings)))
+    check("★ apply 计时只覆盖提交表单（远小于等邮件的耗时）",
+          rec.timings.get("apply", 9e9) < 5.0,
+          f"apply={rec.timings.get('apply')}")
 
     # 负对照：framer 提交失败必须落到 apply 阶段
     with offline(framer_ok=False) as P:
@@ -528,6 +626,37 @@ def test_apply_and_approval() -> None:
           rec.status != "failed", rec.status)
     check("未获批 → stages.approved=pending", rec.stages.get("approved") == "pending",
           str(rec.stages))
+
+
+def test_confirm_timeout_headroom() -> None:
+    """🔴 回归护栏：等确认邮件的阈值不能退回 180s。
+
+    2026-09-20 连跑 10 批次的实测延迟（秒）：
+        41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 / ∞
+    后两条在阈值 180s 处被判 `failed`，但收件箱复核显示它们分别**在超时后
+    12s / 18s 就落了库** —— 是假阴性。台账里多两条"失败"，运营者会据此重投申请。
+
+    阈值必须留出实测最大延迟的余量；这条断言把"不许调回 180s"钉在测试里。
+    """
+    print("\n[编排：确认邮件等待阈值]")
+
+    d = inspect.signature(pl.Pipeline.stage_apply).parameters["confirm_timeout"].default
+    check("★ 默认阈值 ≥ 240s（实测最大延迟 198s，180s 会误判成失败）",
+          isinstance(d, (int, float)) and d >= 240, f"default={d}")
+    check("★ 默认阈值取自常量 CONFIRM_TIMEOUT（单一真源，别写字面量）",
+          d == pl.CONFIRM_TIMEOUT, f"{d} vs {pl.CONFIRM_TIMEOUT}")
+
+    # 超时文案要能提示"迟到 vs 未发"这个歧义 —— 否则运维只会看到一句"没收到"，
+    # 而 runbook 对它的处置（重投申请）在假阴性场景下是错的。
+    # 注意：这里必须显式传一个极小的阈值，否则会真等满默认的 300s。
+    with offline(mails=[]) as P:
+        rec = _make_pipe(P, _tmp_ledger()).run_batch(
+            count=1, mode="apply", confirm_timeout=0.2)[0]
+    check("超时 → status=failed 且记在 confirm 阶段",
+          rec.status == "failed" and rec.stages.get("confirm") == "failed",
+          f"{rec.status} {rec.stages}")
+    check("★ 超时文案点明'迟到可能被误判'（假阴性要靠回查收件箱排除）",
+          "误判" in rec.error and "回查" in rec.error, rec.error)
 
 
 def test_claim() -> None:
@@ -655,6 +784,7 @@ def test_concurrency_no_crosstalk() -> None:
 def main() -> int:
     test_pow()
     test_compact_ref()
+    test_setup_action_forms()
     test_js_object()
     test_ledger_union()
     test_status_vocabulary()
@@ -662,6 +792,7 @@ def main() -> int:
     test_otp_extraction()
     test_auth_error_triage()
     test_apply_and_approval()
+    test_confirm_timeout_headroom()
     test_claim()
     test_key_survives_rerun_failure()
     test_success_ledger()

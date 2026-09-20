@@ -26,7 +26,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
 $PY tools/run_e2e.py --doctor          # 环境体检
-$PY tools/selftest.py                  # 自测 105 项，离线可跑
+$PY tools/selftest.py                  # 自测 123 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
 $PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
@@ -72,7 +72,7 @@ src/                       库代码
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
   run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
-  selftest.py              自测 105 项（含负对照，**全程离线**）
+  selftest.py              自测 123 项（含负对照，**全程离线**）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应

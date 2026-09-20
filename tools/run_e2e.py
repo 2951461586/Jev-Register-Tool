@@ -152,9 +152,11 @@ def report(recs: list[AccountRecord], *, mode: str, json_path: str = "") -> int:
     print("=" * 74)
     keyed = sum(1 for r in recs if r.status == "keyed")
     blocked = sum(1 for r in recs if "invite_only" in (r.error or ""))
-    # mode=apply 跑到 confirmed 就是正常终点，不能算失败
+    # mode=apply 的正常终点有**两个**：confirmed（回执已到）与
+    # applied（表单已 201 接受、申请已注册，只是回执没在阈值内到达）。
+    # 后者不是失败 —— 2026-09-20 实证：确认邮件超时的账号后来全部获批。
     stopped = sum(1 for r in recs
-                  if r.status == "confirmed" and not r.error and mode == "apply")
+                  if mode == "apply" and r.status in ("confirmed", "applied"))
     other = len(recs) - keyed - blocked - stopped
     print(f"  拿到 key {keyed} / 受邀请制阻断 {blocked} / 申请段正常结束 {stopped}"
           f" / 其它失败 {other} / 合计 {len(recs)}")

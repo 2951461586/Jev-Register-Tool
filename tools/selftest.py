@@ -660,11 +660,52 @@ def test_confirm_timeout_headroom() -> None:
     with offline(mails=[]) as P:
         rec = _make_pipe(P, _tmp_ledger()).run_batch(
             count=1, mode="apply", confirm_timeout=0.2)[0]
-    check("超时 → status=failed 且记在 confirm 阶段",
-          rec.status == "failed" and rec.stages.get("confirm") == "failed",
+    check("★ 回执超时 → status=applied（**不是 failed**）且记在 confirm 阶段",
+          rec.status == "applied" and rec.stages.get("confirm") == "failed",
           f"{rec.status} {rec.stages}")
-    check("★ 超时文案点明'迟到可能被误判'（假阴性要靠回查收件箱排除）",
-          "误判" in rec.error and "回查" in rec.error, rec.error)
+    check("  [负对照] 回执超时**不许**被记成 failed"
+          "（记成 failed 会让账号从待复查清单里消失）",
+          rec.status != "failed", rec.status)
+    check("★ 超时文案点明'申请已注册 / 勿重投'（假阴性靠 watch + 回查排除）",
+          "回执未到" in rec.error and "误判" in rec.error and "回查" in rec.error,
+          rec.error)
+    # `applied` 必须在 RANK 里，且**低于** confirmed —— 否则要么静默落 0 分，
+    # 要么反过来把 confirmed 覆盖掉。
+    check("★ applied 在 RANK 中且低于 confirmed（保证后续能被升级）",
+          0 < RANK.get("applied", -1) < RANK["confirmed"],
+          f"applied={RANK.get('applied')} confirmed={RANK['confirmed']}")
+
+
+def _ready_mail(to: str) -> Mail:
+    return Mail(id="m-ready", to=to,
+                sender="010001a0bb95b4b5-722f1aae@envelope.updates.typesafe.ai",
+                subject="TypeSafe AI: Your account is ready",
+                body="Your account is ready.", received_at=2)
+
+
+def test_watch_skips_keyed() -> None:
+    """🔴 `watch` 读的是**全表窗口**，旧批次的获批邮件会在窗口里停留很久。
+
+    没有跳过逻辑时，同一账号会被再跑一次 4→7 ⇒ **造出第二把 key**。
+    两把在服务端都有效，但 `Ledger.load()` 按邮箱去重、**末行胜出** ⇒
+    交付物里少一把。这与 P0 / 阈值误判同一类：**不报错，只是行数不对**。
+    """
+    print("\n[监听：不重复建 key]")
+    dup, fresh = "dup@example-mail.test", "fresh@example-mail.test"
+    led = _tmp_ledger()
+    led.append({"email": dup, "key": dup, "status": "keyed",
+                "api_key": "apikey_ORIGINAL", "api_key_id": "kid_orig"})
+
+    with offline(mails=[_ready_mail(dup), _ready_mail(fresh), _otp_mail(fresh)]) as P:
+        recs = _make_pipe(P, led).watch(timeout=0.5, interval=0.05)
+
+    got = {r.email for r in recs}
+    check("★ 已有 api_key 的地址被跳过（不重复建 key）", dup not in got, str(got))
+    check("  [正对照] 没有 key 的地址照常被处理（证明跳过是**有选择性**的）",
+          fresh in got, str(got))
+    after = {r["email"]: r for r in led.load()}[dup]
+    check("★ 原 key 未被覆盖（交付物不会少一把）",
+          after.get("api_key") == "apikey_ORIGINAL", str(after.get("api_key")))
 
 
 def test_claim() -> None:
@@ -803,6 +844,69 @@ def test_concurrency_no_crosstalk() -> None:
           f"serial={sorted(r.api_key for r in serial)}")
 
 
+def test_identity_whitespace_normalization() -> None:
+    """🔴 身份字段（`key`/`email`）的首尾空白必须在**写入边界**削掉；落盘只写 LF。
+
+    2026-09-20 实测事故（**全程不报错**，属于典型的静默数据损坏）：
+    邮箱清单是 CRLF（Windows 上 `io.open(...,'w')` 会把 `\\n` 翻成 `\\r\\n`），
+    而 shell 的 `mapfile -t` / `read` **只剥 `\\n` 不剥 `\\r`** ⇒ 每个地址尾部带 CR。
+    站点侧会 trim 掉它、照常发码建 key，所以没有任何报错；但台账里多出一类
+    `"x@y.com\\r"` 的键，与干净键**互不相同** ⇒ 唯一账号数虚高（实测 127 → 166），
+    "按邮箱去重"静默失效，交付数字跟着虚高。
+
+    同源的第二条：JSONL / 凭据清单若按默认文本模式写，Windows 会给**每行**加 CR，
+    Linux/WSL 下 `while read` 读出来的 api_key 会变成 `apikey_xxx\\r` ⇒ 直接 401，
+    而肉眼完全看不出区别。所以这里把"只写 LF"也钉住。
+    """
+    print("\n[身份字段空白归一化 / 只写 LF]")
+
+    # 1) AccountRecord 是写入真源，必须自己削
+    rec = pl.AccountRecord(key="a@x.com\r\n", email=" a@x.com\r\n")
+    check("AccountRecord.key 被 strip", rec.key == "a@x.com", repr(rec.key))
+    check("AccountRecord.email 被 strip", rec.email == "a@x.com", repr(rec.email))
+
+    led = _tmp_ledger()
+    # 2) 裸 dict 走 append 也要削（补录 / 修正脚本走这条通路）
+    led.append({"key": "b@x.com\r", "email": "b@x.com\r",
+                "status": "keyed", "api_key": "apikey_B"})
+    # 3) ★ 核心回归：CR 变体不能变成**第二个账号**
+    led.append({"key": "c@x.com", "email": "c@x.com",
+                "status": "keyed", "api_key": "apikey_C1"})
+    led.append({"key": "c@x.com\r", "email": "c@x.com\r",
+                "status": "keyed", "api_key": "apikey_C2"})
+    by = {r["email"]: r for r in led.load()}
+    check("append 的脏 key 被削成干净 key", "b@x.com" in by, str(sorted(by)))
+    check("★ 同账号的 CR 变体不会分裂成两个账号",
+          sorted(by) == ["b@x.com", "c@x.com"], str(sorted(by)))
+
+    # 4) 落盘：既不能有 CRLF 行尾，也不能有 `\\r` 转义值
+    #    （注意 json.dumps 会把值里的 CR 转义成两个字符 `\\` + `r`，
+    #      所以"值有没有被削干净"靠上面第 2/3 条断言，这里只管行尾与残留）
+    raw = led.path.read_bytes()
+    check("★ 台账写入只用 LF（无 CRLF 行尾、无 \\r 转义）",
+          b"\r" not in raw and b"\\r" not in raw, repr(raw[:160]))
+
+    # 5) upsert_many 走 `_rewrite`（整文件替换）—— 同样要削、同样只写 LF
+    led.upsert_many([{"key": "d@x.com\r\n", "email": "d@x.com\r\n",
+                      "status": "keyed", "api_key": "apikey_D"}])
+    by = {r["email"]: r for r in led.load()}
+    check("upsert_many（_rewrite 通路）也削空白", "d@x.com" in by, str(sorted(by)))
+    raw = led.path.read_bytes()
+    check("★ upsert_many 重写后仍只用 LF",
+          b"\r" not in raw and b"\\r" not in raw, repr(raw[:160]))
+
+    # 6) 交付物侧：`verify_keys.py` 必须走 `_write_lf`。
+    #    它是凭据清单的唯一写出口，写坏了就是"复制出去的 key 带 CR"。
+    #    这里做源码级护栏（与 `test_status_vocabulary` 的 AST 扫源码同一思路），
+    #    因为该写盘逻辑在 `main()` 内，无法直接 import 调用。
+    vsrc = (ROOT / "tools" / "verify_keys.py").read_text(encoding="utf-8")
+    check("★ verify_keys 落盘走 _write_lf（只写 LF）",
+          "def _write_lf(" in vsrc and vsrc.count("_write_lf(") >= 3,
+          f"_write_lf 出现 {vsrc.count('_write_lf(')} 次")
+    check("verify_keys 不再用会翻译换行的 Path.write_text",
+          "write_text(" not in vsrc, "还有 write_text 调用")
+
+
 def main() -> int:
     test_pow()
     test_compact_ref()
@@ -810,11 +914,13 @@ def main() -> int:
     test_js_object()
     test_ledger_union()
     test_status_vocabulary()
+    test_identity_whitespace_normalization()
     test_mailrules()
     test_otp_extraction()
     test_auth_error_triage()
     test_apply_and_approval()
     test_confirm_timeout_headroom()
+    test_watch_skips_keyed()
     test_claim()
     test_key_survives_rerun_failure()
     test_success_ledger()

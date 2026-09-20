@@ -106,6 +106,22 @@ class AccountRecord:
     waitlist: dict[str, Any] = field(default_factory=dict)
     user: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        """把 `key` / `email` 的**首尾空白**去掉 —— 这是唯一真源，台账的键就是它。
+
+        🔴 为什么必须在这里做（2026-09-20 实测事故）：邮箱是从 CLI 批量传进来的
+        （`--email a@b.com --email ...`），而候选清单文件在 Windows 上很容易是
+        **CRLF**（`io.open(..., "w")` 默认会把 `\\n` 翻成 `\\r\\n`）。
+        `mapfile -t` 只吃掉 `\\n`，于是每个邮箱尾部带着 `\\r`。
+
+        站点侧会 trim 掉它、照常发码建 key（所以**不报错**），但台账的 `key`
+        是原始字符串 ⇒ 同一账号被写成 `x@y.com` 和 `x@y.com\\r` **两条**：
+        交付数字虚高、`load()` 的"按邮箱去重"也失效。属于典型的
+        "不报错的静默数据损坏"，只能在写入边界堵死。
+        """
+        self.key = str(self.key or "").strip()
+        self.email = str(self.email or "").strip()
+
     def to_dict(self) -> dict[str, Any]:
         # 注意：这里**不输出** `last_error` —— 那个字段是台账合并时按需加的
         # （只在"降级"时写入）。如果这里输出一个空的 `last_error`，
@@ -215,11 +231,20 @@ class Pipeline:
                                        timeout=confirm_timeout, interval=2.0, since_ms=since)
         rec.timings["confirm_wait"] = time.time() - t1
         if mail is None:
+            # 🔴 status 是 `applied`（申请已投递）而**不是** `failed`。
+            # 表单已经 201 接受，申请已经注册到站点侧；没收到回执 ≠ 申请没成功。
+            # 2026-09-20 实证：5 个"确认邮件超时"的账号**后来全部获批**，
+            # 其中一个的确认邮件至今从未到达 ⇒ 回执与申请注册是**两件独立的事**。
+            # 记成 `failed` 会让这些账号从"待复查"清单里消失（与 P0 同一类错误：
+            # 不报错，只是少几行）。`applied` 在 ledger.RANK 里是 1 分，
+            # 低于 confirmed(2) / approved(3) / keyed(5)，所以后续仍会被正确升级。
             return self._fail(
                 rec, "confirm",
                 f"未在 {confirm_timeout:.0f}s 内收到 waitlist 确认邮件"
                 f"（邮箱接口轮询 {self.mail.stats.polls} 次，5xx {self.mail.stats.http_5xx} 次）"
-                f" —— 若确认邮件是迟到而非未发，这里会误判，收尾时请回查一次收件箱")
+                f" —— 表单已 201 接受，申请已注册；这只是**回执未到**，不是申请失败"
+                f"（把回执超时当成申请失败就是误判；回查收件箱可确认迟到，勿重投）",
+                status="applied")
         rec.stages["confirm"] = "ok"
         rec.waitlist["confirm_subject"] = mail.subject
         rec.waitlist["confirm_at"] = mail.received_at
@@ -521,8 +546,14 @@ class Pipeline:
         还会放大 D1 读配额消耗。要提速就缩短 `interval`，不是加线程。
         """
         deadline = time.time() + timeout
+        known_recs = self.ledger.load()
         watched = set(known or [])
-        watched |= {r["email"] for r in self.ledger.load() if r.get("email")}
+        watched |= {r["email"] for r in known_recs if r.get("email")}
+        # 🔴 已经有 key 的地址直接跳过。`watch` 读的是**全表窗口**，旧批次的
+        # 获批邮件会在窗口里停留很久（窗口只受 100 行条数限制），重复处理
+        # 会给同一账号**造出第二把 key** —— 两把在服务端都有效，但
+        # `Ledger.load()` 按邮箱去重、末行胜出，交付物里就会少一把。
+        have_key = {r["email"] for r in known_recs if r.get("api_key")}
         done: set[str] = set()
         results: list[AccountRecord] = []
         self.log(f"[watch] 监听 {timeout:.0f}s，间隔 {interval:.0f}s，"
@@ -544,6 +575,10 @@ class Pipeline:
             for m in ready:
                 addr = m.recipient
                 if addr in done:
+                    continue
+                if addr in have_key:
+                    self.log(f"[watch] 跳过 {addr}（台账里已有 api_key，不重复建）")
+                    done.add(addr)
                     continue
                 done.add(addr)
                 self.log(f"[watch] ★ 获批：{addr} —— 立刻续跑 4→7")

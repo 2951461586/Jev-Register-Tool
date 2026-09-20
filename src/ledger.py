@@ -114,9 +114,20 @@ class Ledger:
 
     # ── 写 ────────────────────────────────────────────────────────────
     def append(self, rec: dict[str, Any]) -> None:
+        # 写入边界再削一次首尾空白（`AccountRecord.__post_init__` 已经削过，
+        # 但这里也常被直接 append 裸 dict —— 例如补录、修正脚本）。
+        # 不做的话 `x@y.com\r` 会与 `x@y.com` 并列为两个键，
+        # 台账"按邮箱去重"静默失效，交付数字虚高（2026-09-20 实测踩过）。
+        rec = dict(rec)
+        for f in ("key", "email"):
+            if isinstance(rec.get(f), str):
+                rec[f] = rec[f].strip()
         line = json.dumps(rec, ensure_ascii=False)
         with _LOCK:
-            with self.path.open("a", encoding="utf-8") as fh:
+            # `newline=""` —— JSONL 只写 LF。Windows 默认会把 `\n` 翻成 `\r\n`，
+            # 于是每行尾部带 CR：Linux/WSL 下 `while read` 读出来的字段带 `\r`，
+            # 严格 JSONL 解析器也会报错。这与"邮箱清单被 CR 污染"同一根因。
+            with self.path.open("a", encoding="utf-8", newline="") as fh:
                 fh.write(line + "\n")
 
     def upsert_many(self, records: Iterable[dict[str, Any]]) -> dict[str, int]:
@@ -159,8 +170,16 @@ class Ledger:
     def _rewrite(self, records: list[dict[str, Any]]) -> None:
         with _LOCK:
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
+            # 同 `append`：只写 LF（见那里的说明）。
+            with tmp.open("w", encoding="utf-8", newline="") as fh:
                 for r in records:
+                    # 同 `append`：整文件替换这条通路也必须削空白，
+                    # 否则 `upsert_many`（verify_keys 用它写 result/success.jsonl）
+                    # 会把 `x@y.com\r` 原样带进交付物。
+                    r = dict(r)
+                    for f in ("key", "email"):
+                        if isinstance(r.get(f), str):
+                            r[f] = r[f].strip()
                     fh.write(json.dumps(r, ensure_ascii=False) + "\n")
             tmp.replace(self.path)
 

@@ -118,7 +118,9 @@ def main() -> int:
     results = []
     for i, (key, rec) in enumerate(items, 1):
         v = verify(key)
-        v["email"] = rec.get("email", "")
+        # 削首尾空白：候选清单若是 CRLF，邮箱尾部会带 `\r`，
+        # 直接写进 keys.txt 会把交付物的一行拆坏（`\r` 是行分隔符）。
+        v["email"] = str(rec.get("email", "") or "").strip()
         v["api_key"] = key
         v["api_key_id"] = rec.get("api_key_id", "")
         results.append(v)
@@ -133,9 +135,19 @@ def main() -> int:
     print(f"\n可用 {ok} / 不可用 {len(results) - ok} / 合计 {len(results)}")
 
     # 落盘：一份机器可读，一份人可读（复制粘贴用）
-    Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.json).write_text(json.dumps(results, ensure_ascii=False, indent=2),
-                               encoding="utf-8")
+    #
+    # 🔴 必须显式 `newline=""`（= 只写 LF）。
+    # 默认的文本模式在 Windows 上会把 `\n` 翻成 `\r\n`，于是**每一行尾部都带 CR**：
+    #   · `keys.txt` 是凭据清单，在 Linux/WSL 下 `while read line` 读出来
+    #     api_key 会变成 `apikey_xxx\r` ⇒ 直接 401，而肉眼完全看不出区别；
+    #   · `success.jsonl` 是 JSONL，CR 会让某些严格解析器报错。
+    # 这和"邮箱清单被 CR 污染"是同一个根因，别只修输入不修输出。
+    def _write_lf(path: str, text: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with Path(path).open("w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+
+    _write_lf(args.json, json.dumps(results, ensure_ascii=False, indent=2))
     lines = ["# TypeSafe / Jev API Keys（已实测可用）",
              f"# 验证时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
              f"# 端点：POST {API_URL}",
@@ -144,8 +156,7 @@ def main() -> int:
     for v in results:
         if v["ok"]:
             lines.append(f"{v['email']}----{v['api_key']}----{v['api_key_id']}")
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_lf(args.out, "\n".join(lines) + "\n")
     print(f"已写入 {args.out} 和 {args.json}")
     return 0 if ok == len(results) else 1
 

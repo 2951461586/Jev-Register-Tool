@@ -32,14 +32,17 @@
 
 引用方式
 ────────
-    from .mailrules import RULES, get, sender_ok, subject_ok
+    from .mailrules import RULES, get, sender_ok, subject_ok, extract_otp
 
     rule = get("account_ready")
     if rule.matches(mail): ...
+
+    code, how = extract_otp(mail.body)     # how ∈ {"anchored","loose","none"}
 """
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -156,6 +159,64 @@ CODE_RULES: tuple[MailRule, ...] = (_BY_NAME["signin_code"], _BY_NAME["verify_co
 
 #: 走魔法链接时两条规则都要接受（触发源不同，形态一样）
 LINK_RULES: tuple[MailRule, ...] = (_BY_NAME["welcome_confirm"], _BY_NAME["signin_link"])
+
+
+# ── OTP 抽取：锚定优先，宽松降级 ──────────────────────────────────────
+#
+# 🔴 为什么不能只写 `\b\d{6}\b`（这是踩过的坑，客户端版本）：
+#
+#   服务端（Worker 的 D1 `rules` id=20）最初也是取"第一个 6 位数字"，
+#   结果 3 封 Postmark 投递的邮件抽出来是 `MTA74-AB1` —— 一个 **MTA 标识**，
+#   而不是真验证码。根因是抽取器把**未入库的原始报文头**也当来源，
+#   而"短横线码"分支的优先级高于"纯 6 位数字"分支。
+#
+#   修法不是调优先级，而是**用模板固定句做前瞻锚定**：
+#
+#       (?<![A-Za-z0-9])(\d{6})(?=\s+is\s+your\s+one-time\s+code)
+#
+#   好处：自校验（必须紧跟模板句），且不会误命中正文里散落的数字。
+#
+#   客户端此前仍是 `re.findall(r"\b\d{6}\b", body)` 取 `codes[0]` ——
+#   **同一个坑的孪生版本**，而且失败表现是 `401 Code expired`，
+#   runbook 对它的处置是"重新发码"，会把排查引向完全错误的方向。
+#   2026-09-20 审计后改为与服务端同构。
+
+#: 锚定式：6 位数字必须紧跟在模板固定句前。
+#: 先用 `_norm` 归一化（NFKC 顺带把全角数字折成半角），所以这里不用 IGNORECASE。
+#: 连字符收 `-` / U+2010 / U+2011 —— NFKC 不保证把各种破折号都折成 ASCII。
+OTP_ANCHORED_RE = re.compile(
+    r"(?<![A-Za-z0-9])(\d{6})(?=\s+is\s+your\s+one[\-\u2010\u2011]time\s+code)"
+)
+
+#: 降级式：任意 6 位数字（两侧不能再贴数字）。
+#: **只在锚定式失配时使用**，且调用方必须显式记录自己走了降级路径 ——
+#: 走了降级就等于回到了"可能抽到 MTA 标识"的老坑，必须能从日志里看出来。
+OTP_LOOSE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+def extract_otp(text: str) -> tuple[str, str]:
+    """从邮件正文里抽 6 位验证码。返回 `(code, how)`。
+
+    `how` 取值：
+
+    | 值 | 含义 | 可信度 |
+    |---|---|---|
+    | `"anchored"` | 命中模板固定句锚定 | 高，与服务端同构 |
+    | `"loose"` | 锚定失配，退回"第一个 6 位数字" | **低** —— 可能抽到报文头里的标识 |
+    | `"none"` | 一个都没找到 | — |
+
+    调用方（`pipeline.stage_login`）必须在 `how == "loose"` 时**把这件事写进日志**，
+    否则"站点改了邮件模板"会伪装成"验证码过期"。
+    """
+    if not text:
+        return "", "none"
+    m = OTP_ANCHORED_RE.search(_norm(text))
+    if m:
+        return m.group(1), "anchored"
+    m = OTP_LOOSE_RE.search(text)
+    if m:
+        return m.group(1), "loose"
+    return "", "none"
 
 
 def get(name: str) -> MailRule:

@@ -28,6 +28,25 @@ $PY tools/run_e2e.py --doctor
 | `--mode resume` | 对指定已获批邮箱跑 4→7 | 会（注册段） |
 | `--mode claim` | 人工接力：发码 / 提交外部凭据 | 会（注册段） |
 
+### 并发（`--concurrency`）
+
+`apply` / `full` / `resume` 支持 `--concurrency N`（默认 1 = 串行，行为与加并发前一致）：
+
+```bash
+$PY tools/run_e2e.py --mode resume --email a@example-mail.test --email b@example-mail.test \
+  --email c@example-mail.test --concurrency 3
+```
+
+- 并发安全的**前提**是每个账号只读**自己的**收件箱索引端点（`/api/inbox?email=`）。
+  申请段与注册段都满足。
+- 每个 worker 用**独立的 `Pipeline` 实例**（各自的 `requests.Session` 与 `stats`），
+  唯一共享的是带锁的 `Ledger`。会话 client **不再是实例字段** ——
+  挂实例字段在串行时看不出问题，并发会**串号**（A 的 key 建在 B 的会话上）。
+- 🔴 **`--mode watch` 不支持并发**，传了会被直接拒绝。
+  它读的是**全表共享窗口**（`/admin/all`，retention 只有 100 行），
+  并发读不会更快，只会互相抢同一批行 + 放大 D1 读配额。
+  要提速就缩短 `--watch-interval`。
+
 ### 1.1 投递申请
 
 ```bash
@@ -99,11 +118,28 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 37 项，含负对照，离线可跑
+$PY tools/selftest.py      # 96 项，含负对照，**全程离线**（不碰网络）
 ```
 
-覆盖：Framer PoW、`$ACTION:0` 紧凑 JSON、Stytch JS 字面量解析、
-台账并集合并、**收件规则**。
+覆盖：
+
+| 段 | 项数 | 钉住什么 |
+|---|---:|---|
+| PoW | 5 | `sha256(salt+secret)` 前缀 + Form-Fields 逐字一致 |
+| Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
+| Stytch JS 字面量 | 4 | 裸键名不是 JSON |
+| 台账并集合并（真实词汇） | 12 | **`keyed` 之后重跑失败不许清空 `api_key`** |
+| 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
+| 收件规则 | 18 | 发件人同域必须叠加 subject；弯引号 |
+| OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码** |
+| 编排：认证错误码分流 | 12 | 401/401/403 三条路不能混 |
+| 编排：申请段 / 邀请制 | 7 | 未获批**不算执行失败** |
+| 编排：claim 两段式 | 7 | `code_sent` 不是 `failed` |
+| 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
+| 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
+
+> 改了 `ledger.RANK` 却没同步管线状态 ⇒ `状态词汇覆盖` 立刻失败。
+> 这是 2026-09-20 那个 P0（重跑失败清空 `api_key`）的结构性修复。
 
 ## 4. 故障处置
 
@@ -138,9 +174,27 @@ $PY tools/selftest.py      # 37 项，含负对照，离线可跑
 | `signin_code` / `verify_code` 计数涨了，但流程说没收到 | 收信时序 / 匹配问题 | 看 `mailrules` 是否有漏网主题 |
 | 计数没涨 | 发信没成功或窗口被冲刷 | 重试；确认窗口下界时间戳 |
 | `--mode scan` 报"漏网主题" | **站点改了文案** | 更新 `src/mailrules.py` 的规则表 |
+| 日志里出现 `⚠ 取码走了**降级**路径` | **站点改了邮件模板**，锚定失配 | 去查模板/规则，**不要**去重新发码 |
+| 明明收到了码却报 `401 Code expired` | 抽到了**报文头里的数字**而非真码 | 查有没有那行降级警告（见 §4.3.1） |
 
 实测 `oai-d3b08883633d4bc2` 出现过一次 `未收到验证码邮件`，**重试即成功**
 （瞬时问题）。所以**单次失败先重试，不要直接判死**。
+
+### 4.3.1 取码走了降级路径（新增）
+
+`pipeline.stage_login` 用 `mailrules.extract_otp()` 取码：**模板固定句锚定优先，
+宽松正则降级**。走降级时会打：
+
+```
+  [login] ⚠ 取码走了**降级**路径（模板锚定失配）主题='Your TypeSafe sign-in code'
+          —— 站点可能改了邮件模板，建议跑 --mode scan 看漏网主题
+```
+
+**这条警告的含义是"我们可能抽到了错的数字"**（服务端曾抽到 `MTA74-AB1` 这个
+MTA 标识）。正确动作是查模板变更 / 跑 `--mode scan`，
+**不是**重新发码 —— 重新发码会拿到一模一样的邮件，再走一次降级。
+
+详见 `docs/mail-filters.md` §6。
 
 ### 4.4 邮箱服务 5xx
 
@@ -184,3 +238,7 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H 'content-type: application/js
 - ❌ 别为了省事重装/重建环境；优先改配置与代码
 - ❌ 别在凭据有效性没被验证之前，把 `403` 当结论
 - ❌ 别把"此刻没查到"讲成"不存在"——批量审批有时间差
+- ❌ 别在 `pipeline` 里就地写取码正则（走 `mailrules.extract_otp`）
+- ❌ 别看到降级警告就去重新发码（模板没变的话，重发只会再降级一次）
+- ❌ 别把会话 client 挂成 `Pipeline` 的实例字段（并发会串号）
+- ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）

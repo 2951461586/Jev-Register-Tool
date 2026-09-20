@@ -55,11 +55,14 @@ HONEYPOT_FIELD_COUNT = 11   # VE 列表长度
 HONEYPOT_VERSION = "3"
 
 # ── 邮箱匹配规则 ────────────────────────────────────────────────────────
-MAIL_FROM_WAITLIST = "updates.typesafe.ai"     # 申请确认 / 账号就绪
-MAIL_FROM_STYTCH = "typesafe.ai"               # Stytch 登录邮件（login@typesafe.ai）
-SUBJ_WAITLIST_CONFIRM = "on the waitlist"
-SUBJ_ACCOUNT_READY = "account is ready"
-SUBJ_LOGIN = "confirm your email"
+# 🔴 收件规则**不在本文件**，唯一真源是 `src/mailrules.py` 的 `RULES` 表。
+#
+# 这里曾经有一份副本（MAIL_FROM_WAITLIST / MAIL_FROM_STYTCH / SUBJ_*），
+# 全项目零引用，但恰好是 README、mailrules docstring、docs/mail-filters.md
+# 三处都在禁止的"散落 subject 子串"。留着它的实际危害是：
+# 下一个人改文案时看到 `SUBJ_ACCOUNT_READY = "account is ready"` 会去改它，
+# 而真正生效的是规则表 ⇒ 改了不生效，且查不出原因。
+# 2026-09-20 审计后删除。要加规则请改 `src/mailrules.py`。
 
 # ── 网络 ────────────────────────────────────────────────────────────────
 UA = (
@@ -70,7 +73,6 @@ UA = (
 # ── 输出 ────────────────────────────────────────────────────────────────
 EXPORT_DIR = ROOT / "exports"
 LEDGER_PATH = EXPORT_DIR / "ledger.jsonl"
-QUOTA_PATH = EXPORT_DIR / "quota.jsonl"
 
 
 def validate(*, need_tempmail: bool = True) -> list[str]:

@@ -9,8 +9,11 @@
     # 全链路（会停在邀请制门槛，如实报告）
     python tools/run_e2e.py --count 1
 
-    # 对已获批的邮箱跑 4→7（零注册请求，可反复跑）
+    # 对已获批的邮箱跑 4→7（零申请请求，可反复跑）
     python tools/run_e2e.py --mode resume --email a@b.com --email c@d.com
+
+    # 并发跑（每个 worker 用独立会话；watch 不支持并发）
+    python tools/run_e2e.py --mode resume --email a@b.com --email c@d.com --concurrency 4
 
     # 获批邮箱是真人邮箱（Worker 读不到）时的人工接力：
     #   a) 先让站点发码到你邮箱
@@ -26,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -35,7 +37,7 @@ from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加�
 
 from src import config  # noqa: E402
 from src.ledger import Ledger  # noqa: E402
-from src.pipeline import Pipeline  # noqa: E402
+from src.pipeline import AccountRecord, Pipeline  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
 
 
@@ -82,7 +84,7 @@ def cmd_scan() -> int:
     hi = max(m.received_at for m in msgs)
     print(f"窗口 {len(msgs)} 封，时间跨度 {(hi - lo) / 60000:.1f} 分钟"
           f"（服务端保留最近 100 行，超出即删）")
-    print(f"发件人过滤：sender 含 {RULES[0].sender_contains!r} 或 typesafe.ai\n")
+    print("发件人过滤：sender 含 typesafe.ai（规则表逐条见 src/mailrules.py）\n")
 
     d = diagnose(msgs)
     for rule in RULES:
@@ -102,6 +104,82 @@ def cmd_scan() -> int:
             print(f"      {s[:76]}")
     else:
         print("\n  ✓ 没有漏网主题：窗口内所有 TypeSafe 邮件都被规则覆盖")
+    return 0
+
+
+def cmd_claim(pipe: Pipeline, args: argparse.Namespace) -> int:
+    """人工接力：先发码 / 再提交外部凭据。
+
+    独立成函数，而不是嵌在 `main` 的 if/else 链里。
+
+    🔴 以前它是**两段拼起来的**：上面 `if args.mode == "claim":` 里算出 `recs`
+    并在 `code_sent` 时提前 `return`，下面再靠 `elif args.mode == "claim": pass`
+    接住 —— `recs` 的"算"与"用"隔着 30 行和两个 return 点。
+    这种形态下，任何人改动上面的 return 条件或新增模式，
+    都可能让 `recs` 未定义、或串到 `run_batch` 上去。
+    """
+    if not args.email:
+        print("✗ mode=claim 需要一个 --email", file=sys.stderr)
+        return 1
+    if len(args.email) > 1:
+        print("✗ mode=claim 一次只处理一个邮箱（验证码 10 分钟且一次性）",
+              file=sys.stderr)
+        return 1
+
+    rec = pipe.claim(args.email[0], args.token, kind=args.token_kind,
+                     name=args.key_name, send_first=args.send)
+    if rec.status == "code_sent":
+        print("\n已发码。请到该邮箱取 6 位验证码，然后在 10 分钟内执行：")
+        print(f"  python tools/run_e2e.py --mode claim --email {args.email[0]} "
+              f"--token <验证码>")
+        return 0
+    return report([rec], mode="claim", json_path=args.json)
+
+
+def cmd_watch(pipe: Pipeline, args: argparse.Namespace) -> int:
+    recs = pipe.watch(timeout=args.watch_timeout, interval=args.watch_interval,
+                      name=args.key_name)
+    print(f"\n监听结束：共处理 {len(recs)} 个获批账号")
+    for r in recs:
+        print(f"  - {r.email:<42} {r.status:<10} api_key={(r.api_key or '')[:28]}")
+    return 0
+
+
+def report(recs: list[AccountRecord], *, mode: str, json_path: str = "") -> int:
+    """结果汇总。分类口径与台账状态一一对应，不要在这里另造一套词。"""
+    print("\n" + "=" * 74)
+    print("结果汇总")
+    print("=" * 74)
+    keyed = sum(1 for r in recs if r.status == "keyed")
+    blocked = sum(1 for r in recs if "invite_only" in (r.error or ""))
+    # mode=apply 跑到 confirmed 就是正常终点，不能算失败
+    stopped = sum(1 for r in recs
+                  if r.status == "confirmed" and not r.error and mode == "apply")
+    other = len(recs) - keyed - blocked - stopped
+    print(f"  拿到 key {keyed} / 受邀请制阻断 {blocked} / 申请段正常结束 {stopped}"
+          f" / 其它失败 {other} / 合计 {len(recs)}")
+    for r in recs:
+        print(f"  - {r.email:<42} {r.status:<10} {r.stages}")
+        if r.error:
+            print(f"      ↳ {r.error}")
+
+    # 最慢那条的阶段分解（关键路径永远是最慢那条，不是第一个）
+    timed = [r for r in recs if r.timings]
+    if timed:
+        slow = max(timed, key=lambda r: sum(r.timings.values()))
+        print(f"\n  最慢账号 {slow.email} 阶段分解：")
+        for k, v in slow.timings.items():
+            print(f"    {k:<12} {v:6.2f}s")
+
+    led = Ledger(config.LEDGER_PATH)
+    print(f"\n  台账 {config.LEDGER_PATH} 现有 {len(led.load())} 条")
+
+    if json_path:
+        Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(json_path).write_text(
+            json.dumps([r.to_dict() for r in recs], ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        print(f"  结果已写入 {json_path}")
     return 0
 
 
@@ -129,6 +207,10 @@ def main() -> int:
                     help="mode=watch 的监听时长（秒）")
     ap.add_argument("--watch-interval", type=float, default=15.0,
                     help="mode=watch 的轮询间隔（秒）")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="并发账号数（mode=full/apply/resume）。默认 1=串行；"
+                         ">1 时每个 worker 用独立的会话与邮箱客户端，只共享台账。"
+                         "mode=watch 不支持——它读的是全表共享窗口，并发只会互相挤")
     ap.add_argument("--key-name", default="1", help="API Key 名称")
     ap.add_argument("--json", default="", help="把结果写到这个文件")
     ap.add_argument("--doctor", action="store_true", help="只做环境体检")
@@ -143,83 +225,35 @@ def main() -> int:
         print("  修法：cp .env.example .env 并填入真实值", file=sys.stderr)
         return 1
 
-    pipe = Pipeline(domain=args.domain or None, login_mode=args.login_mode)
-
+    # scan 是纯只读诊断，自己建 client，不需要 Pipeline
     if args.mode == "scan":
         return cmd_scan()
 
-    if args.mode == "claim":
-        if not args.email:
-            print("✗ mode=claim 需要一个 --email", file=sys.stderr)
-            return 1
-        if len(args.email) > 1:
-            print("✗ mode=claim 一次只处理一个邮箱（验证码 10 分钟且一次性）",
-                  file=sys.stderr)
-            return 1
-        recs = [pipe.claim(args.email[0], args.token,
-                           kind=args.token_kind, name=args.key_name,
-                           send_first=args.send)]
-        if recs[0].status == "code_sent":
-            print("\n已发码。请到该邮箱取 6 位验证码，然后在 10 分钟内执行：")
-            print(f"  python tools/run_e2e.py --mode claim --email {args.email[0]} "
-                  f"--token <验证码>")
-            return 0
+    if args.concurrency > 1 and args.mode == "watch":
+        print("✗ mode=watch 不支持 --concurrency（见 --concurrency 的说明）",
+              file=sys.stderr)
+        return 1
 
+    pipe = Pipeline(domain=args.domain or None, login_mode=args.login_mode)
+
+    # 每个模式一个函数，主流程只做分派 —— 不再共享局部变量 recs
+    if args.mode == "claim":
+        return cmd_claim(pipe, args)
     if args.mode == "watch":
-        recs = pipe.watch(timeout=args.watch_timeout, interval=args.watch_interval,
-                          name=args.key_name)
-        print(f"\n监听结束：共处理 {len(recs)} 个获批账号")
-        for r in recs:
-            print(f"  - {r.email:<42} {r.status:<10} api_key={(r.api_key or '')[:28]}")
-        return 0
+        return cmd_watch(pipe, args)
 
     if args.mode == "resume":
         if not args.email:
             print("✗ mode=resume 需要至少一个 --email", file=sys.stderr)
             return 1
-        recs = pipe.resume(args.email, name=args.key_name)
-    elif args.mode == "claim":
-        pass  # recs 已在上面的 claim 分支里算好
+        recs = pipe.resume(args.email, name=args.key_name,
+                           concurrency=args.concurrency)
     else:
         recs = pipe.run_batch(count=args.count, mode=args.mode,
                               approval_timeout=args.approval_timeout,
-                              name=args.key_name)
+                              name=args.key_name, concurrency=args.concurrency)
 
-    # ── 报告 ──────────────────────────────────────────────────────────
-    print("\n" + "=" * 74)
-    print("结果汇总")
-    print("=" * 74)
-    keyed = sum(1 for r in recs if r.status == "keyed")
-    blocked = sum(1 for r in recs if "invite_only" in (r.error or ""))
-    # mode=apply 跑到 confirmed 就是正常终点，不能算失败
-    stopped = sum(1 for r in recs
-                  if r.status == "confirmed" and not r.error and args.mode == "apply")
-    other = len(recs) - keyed - blocked - stopped
-    print(f"  拿到 key {keyed} / 受邀请制阻断 {blocked} / 申请段正常结束 {stopped}"
-          f" / 其它失败 {other} / 合计 {len(recs)}")
-    for r in recs:
-        print(f"  - {r.email:<42} {r.status:<10} {r.stages}")
-        if r.error:
-            print(f"      ↳ {r.error}")
-
-    # 最慢那条的阶段分解（关键路径永远是最慢那条，不是第一个）
-    timed = [r for r in recs if r.timings]
-    if timed:
-        slow = max(timed, key=lambda r: sum(r.timings.values()))
-        print(f"\n  最慢账号 {slow.email} 阶段分解：")
-        for k, v in slow.timings.items():
-            print(f"    {k:<12} {v:6.2f}s")
-
-    led = Ledger(config.LEDGER_PATH)
-    print(f"\n  台账 {config.LEDGER_PATH} 现有 {len(led.load())} 条")
-
-    if args.json:
-        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.json).write_text(
-            json.dumps([r.to_dict() for r in recs], ensure_ascii=False, indent=2),
-            encoding="utf-8")
-        print(f"  结果已写入 {args.json}")
-    return 0
+    return report(recs, mode=args.mode, json_path=args.json)
 
 
 if __name__ == "__main__":

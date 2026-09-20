@@ -20,10 +20,15 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env      # 填 TEMPMAIL_ADMIN_KEY
 $PY tools/run_e2e.py --doctor          # 环境体检
+$PY tools/selftest.py                  # 自测 96 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
+$PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
 $PY tools/verify_keys.py               # ★ 验收：真打一次推理接口
 ```
+
+> `--concurrency` 只对**申请段 / 注册段**有效（每账号只读自己的收件箱索引端点）。
+> `--mode watch` **刻意不支持** —— 它读的是全表共享窗口，并发只会互相挤。
 
 ## 链路与可自动化程度
 
@@ -51,17 +56,17 @@ $PY tools/verify_keys.py               # ★ 验收：真打一次推理接口
 ```
 src/                       库代码
   config.py                常量 + .env 加载 + 启动校验
-  mailrules.py             收件过滤规则表（零内部依赖的纯叶子）
-  ledger.py                JSONL 台账（并集合并 / 幂等）
+  mailrules.py             收件规则表 + OTP 抽取（零内部依赖的纯叶子）
+  ledger.py                JSONL 台账（并集合并 / 幂等 / 等级语义）
   tempemail.py             CF Worker 收信
   framer_waitlist.py       申请表单 + PoW
   typesafe.py              Server Action / Stytch / onboarding / 建 Key
-  pipeline.py              阶段编排（唯一的上层聚合者）
+  pipeline.py              阶段编排（唯一的上层聚合者，含并发扇出）
 
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
   run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
-  selftest.py              自测 37 项（含负对照，离线可跑）
+  selftest.py              自测 96 项（含负对照，**全程离线**）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应
@@ -69,11 +74,12 @@ tools/                     入口脚本
 
 docs/
   architecture.md          目录 / 模块 / 耦合 / 数据流（依赖图由 AST 算出）
-  mail-filters.md          收件过滤规则（格式对齐 OpenXLab 项目）
+  mail-filters.md          收件过滤规则 + 取码锚定（格式对齐 OpenXLab 项目）
   runbook.md               怎么跑 + 故障处置
+  audit-2026-09-20.md      架构/耦合/目录/文档审计（含一个 P0 与全部证据）
 
-evidence/                  录制的 HAR / EML（gitignore）
-exports/                   台账 / 报告 / 凭据（gitignore）
+evidence/                  录制的证据（har / eml / 抓来的第三方 bundle）
+exports/                   运行产物：ledger.jsonl / keys.txt / run_*.json / _diag/
 ```
 
 **依赖方向单向**：`tools → pipeline → 叶子 → config`，无循环。
@@ -116,9 +122,14 @@ exports/                   台账 / 报告 / 凭据（gitignore）
 - ❌ 别把"此刻没查到"讲成"不存在"（批量审批有时间差）
 - ❌ 别在凭据有效性未验证前把 `403` 当结论
 - ❌ 别把长等待放前台（~120s 被 SIGTERM，日志截断会伪造业务结论）
+- ❌ 别在 `pipeline` 里就地写取码正则（走 `mailrules.extract_otp`；
+  降级路径会在日志里显式警告，**看到警告要去查模板变更，不是重新发码**）
+- ❌ 别把 `Pipeline` 的会话 client 挂成实例字段（并发会串号）
+- ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）
 
 ## 相关文档
 
 - `docs/architecture.md` —— 模块耦合、依赖分层、数据流
-- `docs/mail-filters.md` —— 收件规则的完整推导与实测数据
+- `docs/mail-filters.md` —— 收件规则的完整推导、实测数据、取码锚定
 - `docs/runbook.md` —— 五种模式、验收、故障处置
+- `docs/audit-2026-09-20.md` —— 架构审计（含一个已修的 P0 与全部证据）

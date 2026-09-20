@@ -1,0 +1,25 @@
+# 凭据 —— 用通配，不要逐条列举（`.env.bak-xxx` 这类备份一定漏）
+.env
+.env.*
+!.env.example
+
+# 运行产物：台账 / 导出 / 探针输出
+*.json
+*.jsonl
+*.csv
+*.log
+exports/
+
+# HAR / EML：含会话与令牌（通配已覆盖，这里显式列目录是为了可读）
+*.har
+*.eml
+evidence/
+
+# 工作目录整体排除（过程记录会持续累积，下次顺手回填就漏了）
+.workbuddy-ai/
+
+__pycache__/
+*.pyc
+*.png
+.pytest_cache/
+.ruff_cache/

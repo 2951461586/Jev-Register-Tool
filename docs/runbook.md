@@ -36,7 +36,7 @@ $PY tools/run_e2e.py --doctor
 | `--mode scan` | 按规则表给窗口内邮件分桶，**列出漏网主题** | 不会（只读） |
 | `--mode watch` | 轮询等获批，**命中即刻自动续跑 4→7** | 命中才会 |
 | `--mode resume` | 对指定已获批邮箱跑 4→7 | 会（注册段） |
-| `--mode claim` | 人工接力：发码 / 提交外部凭据 | 会（注册段） |
+| `--mode claim` | ⚠️ **实验性；两进程用法已知失效**（见 §1.5） | 会（注册段） |
 
 ### 并发（`--concurrency`）
 
@@ -141,12 +141,48 @@ $PY tools/run_e2e.py --mode resume \
 
 ### 1.5 人工接力（获批邮箱是真人邮箱时）
 
+> 🔴 **先读这段，不要直接照抄命令。**
+>
+> `--mode claim` 的**两进程用法已知失效**（2026-09-20 实测）：`--send` 与
+> `--token` 是**两个独立进程**，各自新建 `TypeSafeClient()`，中间**没有任何会话传递**。
+> 实测**码在 2 分钟内提交仍报 `401 Code expired`**。
+>
+> ⚠️ 而 §4.2 对这个错误码的处置写的是"重新发码，10 分钟内提交" ——
+> **照着做会掉进死循环**。这就是必须在这里显式警告的原因：错误码与根因毫无字面关联。
+
+**第一选择：`resume`**（同一进程内完成"发码 → 收码 → 提交"，会话是连续的）：
+
 ```bash
-# a) 先让站点把码发到那个邮箱（不提交）
+$PY tools/run_e2e.py --mode resume --email me@real.com
+```
+
+> 只要邮箱在 Worker 覆盖的域内（= 我们自己建的临时邮箱），**一律用 `resume`**。
+> 它才是"失败重试"的正常入口（见 §1.4）。
+
+**只有当邮箱是真人邮箱、Worker 读不到时**才轮到 `claim`，而它当前是坏的：
+
+```bash
+# ⚠️ 以下流程 2026-09-20 实测报 401 Code expired，仅作为"待修复路径"的记录，
+#    不要当成可用流程。
 $PY tools/run_e2e.py --mode claim --email me@real.com --send
-# b) 从邮箱取到 6 位码，10 分钟内提交
 $PY tools/run_e2e.py --mode claim --email me@real.com --token 123456
 ```
+
+**根因候选（⚠️ 未验证 —— 等一次真人邮箱场景实测）**：
+
+`stage_login()` 在提交回调**之前**会先 `GET /login?waitlist=<email>` 建立会话
+（经由 `fetch_actions()`），而 `stage_login_with_token()` **完全没有这一步** ——
+它上来就 `POST /api/auth/callback`。两条路唯一的差别就在这里，所以最可能的原因是
+回调缺少 `/login` 页面种下的会话 cookie。
+
+**验证方法**（不要跳过这一步就宣布修好了）：在 `stage_login_with_token()` 开头补一次
+`cl.s.get(config.SITE_LOGIN, params={"waitlist": rec.email})`，然后用一个真实获批邮箱
+重跑两进程流程。若 401 消失即证实。
+
+> 本项目已经有过"判据跑在错误的层上 ⇒ 假阴性"的教训（见 `tools/resume_pending.py`
+> 的 docstring：按"末行胜出"计数会把重跑失败记录压掉，导致计数**下降**、
+> 守卫误判"没有新增"而提前收工）。
+> **在拿到实测凭据之前，这个修复只能记为"候选"，不能记为"已完成"。**
 
 `claim` **不需要** `TEMPMAIL_ADMIN_KEY`，一次只处理一个地址
 （凭据一次性 + 10 分钟有效期）。
@@ -177,31 +213,48 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 125 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 161 项，含负对照，**全程离线**（不碰网络）
 ```
 
-覆盖：
+覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
 
-| 段 | 项数 | 钉住什么 |
-|---|---:|---|
-| PoW | 5 | `sha256(salt+secret)` 前缀 + Form-Fields 逐字一致 |
-| Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
-| Server Action 渲染形态 | 12 | **索引集合不许写死**；`:2` 缺失不许 skip；旧形态不能被弄坏 |
-| Stytch JS 字面量 | 4 | 裸键名不是 JSON |
-| 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
-| 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
-| 收件规则 | 18 | 发件人同域必须叠加 subject；弯引号 |
-| OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码** |
-| 编排：认证错误码分流 | 12 | 401/401/403 三条路不能混 |
-| 编排：申请段 / 邀请制 | 9 | 未获批**不算执行失败**；计时器不重叠 |
-| 编排：确认邮件等待阈值 | 4 | **迟到 ≠ 未发**；阈值不许退回 180s |
-| 编排：claim 两段式 | 7 | `code_sent` 不是 `failed` |
-| 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
-| 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
-| 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
+| 模块 | 段 | 项数 | 钉住什么 |
+|---|---|---:|---|
+| `test_parsing` | PoW | 5 | `sha256(salt+secret)` 前缀 + Form-Fields 逐字一致 |
+| `test_parsing` | Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
+| `test_parsing` | Server Action 渲染形态 | 12 | **索引集合不许写死**；`:2` 缺失不许 skip；旧形态不能被弄坏 |
+| `test_parsing` | Stytch JS 字面量 | 4 | 裸键名不是 JSON |
+| `test_ledger` | 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
+| `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
+| `test_ledger` | 身份字段空白归一化 / 只写 LF | 9 | CRLF 污染台账键（实测污染过 39 条） |
+| `test_mailrules` | 收件规则 | 21 | 发件人同域必须叠加 subject；弯引号；CODE/LINK 分组不重叠 |
+| `test_mailrules` | OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码**；非锚定必须显式告警 |
+| `test_orchestration` | 编排：认证错误码分流 | 12 | 401/401/403 三条路不能混 |
+| `test_orchestration` | 编排：申请段 / 邀请制 | 9 | 未获批**不算执行失败**；计时器不重叠 |
+| `test_orchestration` | 登录：Server Action 编号漂移 → 重试 | 7 | 缺索引先原样重试，别把编号漂移当"页面结构变了" |
+| `test_orchestration` | 登录：码模式 → 魔法链接回捞 | 5 | 同一次发码可能回**链接**而非码（实测 4 次里 1 次） |
+| `test_orchestration` | 编排：确认邮件等待阈值 | 6 | **迟到 ≠ 未发**；阈值不许退回 180s |
+| `test_orchestration` | 监听：不重复建 key | 3 | `watch` 续跑不许给同一账号建第二把 key |
+| `test_orchestration` | 编排：claim 两段式 | 7 | `code_sent` 不是 `failed`（**单进程内**的语义；两进程失效见 §1.5） |
+| `test_orchestration` | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
+| `test_orchestration` | 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
+| `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
+| `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
 
-> 合计 **125 项**。改了任一段的项数，要同步 `README.md` / `docs/architecture.md` /
-> `docs/mail-filters.md` 里写的数字。
+> 合计 **161 项**（20 段）。
+>
+> ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
+>
+> ```bash
+> $PY tools/selftest.py | tail -3                       # 看 "通过 N / 失败 0"
+> grep -rn "自测 [0-9]* 项\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
+> ```
+>
+> 自测本体在 `tools/tests/`（`selftest.py` 只是聚合入口）。**加新测试就落到
+> 对应的 `test_*.py`**，别往入口里塞 —— 见 `docs/architecture.md` §1 的目录树。
+>
+> 两处不一致就说明又漂了。**改了任一段的项数，必须重跑上面第二条命令并逐个同步。**
+> （把数字写死在散文里就是"注定漂移的第二份真源" —— 见 `audit-2026-09-20-round2.md` §9.4。）
 
 > 改了 `ledger.RANK` 却没同步管线状态 ⇒ `状态词汇覆盖` 立刻失败。
 > 这是 2026-09-20 那个 P0（重跑失败清空 `api_key`）的结构性修复。
@@ -230,6 +283,13 @@ $PY tools/selftest.py      # 125 项，含负对照，**全程离线**（不碰�
 **校验顺序**：token 先、白名单后。无效 token 时**根本不看邮箱**——
 所以只有"凭据正确时拿到的 403"才算白名单证据。
 
+> 🔴 **一个已知的例外，别照上表处置**：如果你用的是 `--mode claim` 的两进程用法
+> （`--send` 然后另起一个进程 `--token`），那么 `401 Code expired` **不是**
+> "码过期/抽错码"，而是**会话没接上**——两个进程各建一套会话，凭据再新也没用。
+> 此时"重新发码"是**无效处置**，会把你推进死循环。
+> 判据：同一个码，用 `--mode resume` 走单进程能过、用 claim 两进程必失败。
+> 详见 §1.5。
+
 ### 4.3 "没收到验证码邮件"
 
 先分清三种情况（`--mode scan` 的计数会告诉你）：
@@ -247,7 +307,7 @@ $PY tools/selftest.py      # 125 项，含负对照，**全程离线**（不碰�
 
 ### 4.3.1 取码走了降级路径（新增）
 
-`pipeline.stage_login` 用 `mailrules.extract_otp()` 取码：**模板固定句锚定优先，
+`stages.stage_login` 用 `mailrules.extract_otp()` 取码：**模板固定句锚定优先，
 宽松正则降级**。走降级时会打：
 
 ```
@@ -336,7 +396,7 @@ $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路
 - ❌ 别为了省事重装/重建环境；优先改配置与代码
 - ❌ 别在凭据有效性没被验证之前，把 `403` 当结论
 - ❌ 别把"此刻没查到"讲成"不存在"——批量审批有时间差
-- ❌ 别在 `pipeline` 里就地写取码正则（走 `mailrules.extract_otp`）
+- ❌ 别在 `stages` 里就地写取码正则（走 `mailrules.extract_otp`）
 - ❌ 别看到降级警告就去重新发码（模板没变的话，重发只会再降级一次）
 - ❌ 别把会话 client 挂成 `Pipeline` 的实例字段（并发会串号）
 - ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）

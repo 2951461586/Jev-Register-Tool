@@ -1,8 +1,9 @@
 # 收件过滤规则
 
 > 格式对齐同机 OpenXLab 项目的做法：**信封发件人子串做第一道过滤，主题子串做第二道。**
-> 实现：`src/mailrules.py`　自测：`tools/selftest.py`（`[收件规则 mailrules]` 段 18 项，
-> `[OTP 抽取]` 段 10 项；全套 125 项）
+> 实现：`src/mailrules.py`　自测：`tools/selftest.py`（`[收件规则 mailrules]` 段 21 项，
+> `[OTP 抽取（锚定 / 降级）]` 段 10 项；全套 161 项 —— 以 `$PY tools/selftest.py`
+> 末行的 `通过 N / 失败 0` 为准，本文不重复维护这个数字的副本）
 
 ## 1. 为什么要两道过滤
 
@@ -94,25 +95,27 @@ TypeSafe AI: You’re on the waitlist for Jev!
 ## 4. 用法
 
 ```python
-from src.mailrules import RULES, get, any_of, classify, diagnose, sender_ok
+from src.mailrules import RULES, CODE_RULES, LINK_RULES, get, any_of, classify, diagnose, sender_ok
 
 rule = get("account_ready")
 if rule.matches(mail): ...          # 规则对象本身可直接当谓词
 
-# 并集：取 6 位码时两条规则都要收
-MATCH_CODE = any_of("signin_code", "verify_code")
+# 并集：取 6 位码时两条规则都要收。
+# 🔴 `any_of` 收的是 **MailRule 对象**，不是规则名（2026-09-20 二轮审计改的）——
+#    收名字会让"哪些规则算码"出现两份定义，加规则时改一边漏一边。
+MATCH_CODE = any_of(*CODE_RULES)
 
 classify(mail)      # -> "account_ready" / "unknown"
 sender_ok(mail)     # 只按发件人：用来把"不是我们的"与"是我们的但主题不认识"分开
 ```
 
-`pipeline.py` 里已统一改为读规则表，不再散落 subject 子串：
+`stages.py` 里已统一改为读规则表，不再散落 subject 子串：
 
 ```python
 MATCH_WAITLIST_CONFIRM = get_rule("waitlist_confirm")
 MATCH_ACCOUNT_READY    = get_rule("account_ready")
-MATCH_CODE             = any_of("signin_code", "verify_code")
-MATCH_LINK             = any_of("welcome_confirm", "signin_link")
+MATCH_CODE             = any_of(*CODE_RULES)     # ← 分组只有这一处定义
+MATCH_LINK             = any_of(*LINK_RULES)
 ```
 
 ## 5. 漏网主题必须显式报出来
@@ -165,7 +168,7 @@ code, how = extract_otp(mail.body)      # how ∈ {"anchored", "loose", "none"}
 
 ### 降级必须可察觉
 
-`how == "loose"` 时 `pipeline.stage_login` 会打一行警告：
+`how == "loose"` 时 `stages.stage_login` 会打一行警告：
 
 ```
   [login] ⚠ 取码走了**降级**路径（模板锚定失配）主题='…' —— 站点可能改了邮件模板

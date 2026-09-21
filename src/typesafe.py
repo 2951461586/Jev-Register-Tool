@@ -17,6 +17,10 @@
 其中 `:2` 是服务端加密的 bound args，必须**原样回传**。每次 GET 都会变，
 所以每次提交前都要重新抓一遍 —— 这样也顺带免疫了部署换 hash。
 
+**解析层不在这里**：`$ACTION_*` 隐藏域、JS 对象字面量、可见文案、魔法链接的抠取
+全部在 `src/parsing.py` —— 纯函数、零第三方依赖，可以脱离 `requests` 单独测。
+本模块只负责"发请求 / 判断状态码 / 组装 Result"。
+
 **已知门槛**：TypeSafe 是邀请制。未被邀请的邮箱在第 4 步返回
 `403 {"error":"Access restricted"}`，前端文案为
 "Sorry, TypeSafe is currently invite-only"。这一步无法绕过。
@@ -24,8 +28,6 @@
 
 from __future__ import annotations
 
-import html as html_mod
-import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -34,10 +36,17 @@ from typing import Any
 import requests
 
 from . import config
+from .parsing import (action_form_fields, actions_from_html, parse_js_object,
+                      visible_text)
 
-ACTION_GOOGLE = "4"
 ACTION_LINK = "2"      # "Continue" -> 魔法链接
 ACTION_CODE = "3"      # "Email me a code instead" -> 6 位验证码
+# ⚠️ 这里曾有一个 `ACTION_GOOGLE = "4"`，零引用，2026-09-20 二轮审计后删除。
+# 删的理由不是"没用到"，而是**它会误导**：action 编号会整体漂移
+# （实测 `('2','3','4')` → `('2','4','5')`，见 `fetch_actions` 的说明），
+# 留一个 `ACTION_GOOGLE = "4"` 会让人以为"4 号表单 = Google 登录"，
+# 从而写出 `acts["4"]` 这种脆弱依赖。真要支持 Google 登录，
+# 得先解决"如何在不写死编号的前提下识别 Google 表单"，那是另一件事。
 
 MODE_LINK = "link"
 MODE_CODE = "code"
@@ -68,91 +77,11 @@ class Result:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-#: 页面里渲染的 Server Action 隐藏域：`name="$ACTION_<n>:<idx>" value="…"`。
-#:
-#: 🔴 **不要把 `<n>` 的集合写死。** 以前是 `for n in ("2", "3", "4")`，并且要求
-#: `:0` 与 `:2` **同时存在**。2026-09-20 站点改版后 `/setup/*` 渲染的是索引 **1**、
-#: 且**只有 `:0` 和 `:1`**（另加一个 `$ACTION_KEY`）—— 两个条件都不满足，
-#: 于是 `acts` 恒为空 ⇒ 退化到 `FALLBACK_SETUP_ACTIONS` 里陈旧的 action id
-#: ⇒ POST 404 ⇒ 最终只看到 `onboarding 失败: HTTP 404`，
-#: 跟"索引集合被写死了"毫无字面关联。
-_ACTION_FIELD_RE = re.compile(r'name="\$ACTION_(\d+):(\d+)"\s+value="([^"]*)"')
-_ACTION_KEY_RE = re.compile(r'name="\$ACTION_KEY"\s+value="([^"]*)"')
-
-
-def _actions_from_html(page: str) -> dict[str, dict[str, Any]]:
-    """抓出页面渲染的 Server Action 隐藏域，**原样**留着待回填。
-
-    返回 `{n: {"id": …, "bound": …, "fields": {"0": …, "1": …}, "key": …}}`。
-
-    只要求 `:0` 存在（它带 action id）；`:1` / `:2` 有就收、没有就不发 ——
-    浏览器提交表单时也只回填页面上真实存在的隐藏域。
-    """
-    fields: dict[str, dict[str, str]] = {}
-    for n, idx, val in _ACTION_FIELD_RE.findall(page):
-        fields.setdefault(n, {})[idx] = html_mod.unescape(val)
-
-    km = _ACTION_KEY_RE.search(page)
-    key = html_mod.unescape(km.group(1)) if km else ""
-
-    out: dict[str, dict[str, Any]] = {}
-    for n, vals in fields.items():
-        if "0" not in vals:
-            continue                      # 没有 :0 就没有 action id，这条用不了
-        try:
-            ref = json.loads(vals["0"])
-        except ValueError:
-            continue                      # 不是 JSON ⇒ 不是 Server Action 引用
-        out[n] = {"id": ref.get("id", ""), "bound": ref.get("bound", "$@1"),
-                  "fields": vals, "key": key}
-    return out
-
-
-def _action_form_fields(n: str, a: dict[str, Any]) -> dict[str, tuple]:
-    """把 `_actions_from_html` 的产物还原成"要提交的隐藏域"（multipart 元组形式）。
-
-    `:0` 走 `_compact_ref()` 重新序列化 —— 保证紧凑 JSON（带空格会被 Next.js 判 500）。
-    """
-    parts: dict[str, tuple] = {f"$ACTION_REF_{n}": (None, "")}
-    for idx, val in sorted(a["fields"].items()):
-        parts[f"$ACTION_{n}:{idx}"] = (None, _compact_ref(a) if idx == "0" else val)
-    if a.get("key"):
-        parts["$ACTION_KEY"] = (None, a["key"])
-    return parts
-
-
-def _compact_ref(a: dict[str, str]) -> str:
-    """还原 `$ACTION_<n>:0` 的取值。
-
-    🔴 **必须是紧凑 JSON，不能带空格。** 页面里渲染的是
-    `{"id":"60e492...","bound":"$@1"}`，而 `json.dumps` 默认分隔符是
-    `", "` / `": "`，会产出 `{"id": "60e492...", "bound": "$@1"}`。
-    服务端对此**不做容错**，直接抛 `500 Internal Server Error` ——
-    报的是"服务器内部错误"，跟"多了一个空格"看起来毫无关系。
-    实测：紧凑 200 / 带空格 500，唯一变量就是这个字符串。
-    """
-    return json.dumps({"id": a["id"], "bound": a["bound"]},
-                      separators=(",", ":"), ensure_ascii=False)
-
-
-def _parse_js_object(text: str) -> dict[str, str]:
-    """解析 JS 对象字面量（键**没有**引号，所以不是 JSON）。
-
-    Stytch 的落地页里是 `xhr.send(JSON.stringify({ public_token: '...', ... }))` ——
-    单引号字符串 + 裸键名。`json.loads` 会报
-    `Expecting property name enclosed in double quotes`，别把它当 JSON 解。
-    """
-    out: dict[str, str] = {}
-    for m in re.finditer(r"([A-Za-z_$][\w$]*)\s*:\s*'((?:[^'\\]|\\.)*)'", text):
-        out[m.group(1)] = m.group(2).replace("\\'", "'").replace("\\\\", "\\")
-    return out
-
-
-def _visible_text(page: str) -> str:
-    t = re.sub(r"<script.*?</script>", "", page, flags=re.S)
-    t = re.sub(r"<style.*?</style>", "", t, flags=re.S)
-    t = re.sub(r"<[^>]+>", " ", t)
-    return " ".join(html_mod.unescape(t).split())
+# 解析层（`$ACTION_*` 隐藏域 / JS 对象字面量 / 可见文案 / 魔法链接）已整体挪到
+# `src/parsing.py`（2026-09-20 二轮审计 §8.2）。本模块只保留 HTTP 链路：
+# 抓页面 → 发信 → 换 session → 回调 → onboarding → 建 key。
+# ⚠️ 那两个模块的耦合只有"文本"这一层：本模块 `from .parsing import …`，
+#    `parsing` 不反向依赖本模块（也不依赖 `requests`，所以它能被单独 import）。
 
 
 class TypeSafeClient:
@@ -191,7 +120,7 @@ class TypeSafeClient:
             if r.status_code != 200:
                 raise TypeSafeError(f"GET /login -> HTTP {r.status_code}",
                                     status=r.status_code)
-            acts = _actions_from_html(r.text)
+            acts = actions_from_html(r.text)
             if ACTION_LINK in acts and ACTION_CODE in acts:
                 return acts
             last = tuple(sorted(acts))
@@ -209,11 +138,11 @@ class TypeSafeClient:
         n = ACTION_LINK if mode == MODE_LINK else ACTION_CODE
         acts = self.fetch_actions(email)
         a = acts[n]
-        files = _action_form_fields(n, a)
+        files = action_form_fields(n, a)
         files["email"] = (None, email)
         r = self.s.post(config.SITE_LOGIN, params={"waitlist": email}, files=files,
                         headers=self._login_headers(email), timeout=40)
-        txt = _visible_text(r.text)
+        txt = visible_text(r.text)
         self.email = email
         self.log.append(f"send_login_email(mode={mode}) HTTP {r.status_code}")
         return Result(ok=r.status_code == 200, stage="send_login_email",
@@ -230,15 +159,15 @@ class TypeSafeClient:
                 "魔法链接页面未找到 dfp 交换参数（链接可能已被使用/过期，"
                 f"页面长度 {len(page.text)}）"
             )
-        payload = _parse_js_object(m.group(1))
+        payload = parse_js_object(m.group(1))
         if "public_token" not in payload or "redirect_url" not in payload:
             raise TypeSafeError(f"dfp 参数解析不完整: {sorted(payload)}")
         payload["telemetry_id"] = ""      # 浏览器侧是 Promise.race(5s) 兜底成 ''
-        r = self.s.post("https://login.typesafe.ai/v1/magic_links/redirect/dfp",
+        r = self.s.post(f"{config.STYTCH_LOGIN_HOST}/v1/magic_links/redirect/dfp",
                         json=payload,
                         headers={"Accept": "application/json",
                                  "Content-Type": "application/json;charset=UTF-8",
-                                 "Origin": "https://login.typesafe.ai",
+                                 "Origin": config.STYTCH_LOGIN_HOST,
                                  "Referer": magic_url},
                         timeout=40)
         if r.status_code != 200:
@@ -299,7 +228,7 @@ class TypeSafeClient:
         r = self.s.get(f"{config.SITE_ORIGIN}{path}", timeout=30)
         if r.status_code != 200:
             raise TypeSafeError(f"GET {path} -> HTTP {r.status_code}", status=r.status_code)
-        acts = _actions_from_html(r.text)
+        acts = actions_from_html(r.text)
         if not acts:
             raise TypeSafeError(
                 f"{path} 未渲染出 Server Action 隐藏域 —— 该页可能直接跳过了"
@@ -328,7 +257,7 @@ class TypeSafeClient:
         if acts:
             n = action_n or next(iter(acts))
             a = acts[n]
-            files = _action_form_fields(n, a)
+            files = action_form_fields(n, a)
             for k, v in fields.items():
                 files[k] = (None, v)
             headers = {"Origin": config.SITE_ORIGIN,

@@ -23,8 +23,8 @@ from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加�
 import requests  # noqa: E402
 
 from src import config  # noqa: E402
+from src.parsing import parse_js_object, visible_text  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
-from src.typesafe import _parse_js_object, _visible_text  # noqa: E402
 
 LINK_RE = re.compile(r"https://login\.typesafe\.ai/v1/magic_links/redirect\?[^\s\"<>\)\]]+")
 
@@ -91,9 +91,9 @@ def main() -> int:
     mm = re.search(r"xhr\.send\(JSON\.stringify\((\{.*?\})\)\);", page.text, re.S)
     if not mm:
         print("  ✗ 未找到 dfp 交换参数（链接可能已被用过/过期）")
-        print("  —— 页面可见文案：", _visible_text(page.text)[:400])
+        print("  —— 页面可见文案：", visible_text(page.text)[:400])
         return 1
-    payload = _parse_js_object(mm.group(1))
+    payload = parse_js_object(mm.group(1))
     print(f"  dfp payload 键: {sorted(payload)}")
     print(f"  payload = {json.dumps(payload, ensure_ascii=False)[:400]}")
     if "redirect_url" in payload:

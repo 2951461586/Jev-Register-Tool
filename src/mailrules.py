@@ -52,8 +52,17 @@ from typing import Any, Iterable
 SENDER_TYPESAFE = "typesafe.ai"
 # 营销/通知流：申请确认 + 获批**共用**这个域
 SENDER_UPDATES = "envelope.updates.typesafe.ai"
-# 事务流：确认邮件 + 验证码（SendGrid `em*` 与 Postmark `pm-bounces` 两条腿）
-SENDER_TRANSACTIONAL = ("em", "pm-bounces")
+#
+# ⚠️ 这里曾有一个 `SENDER_TRANSACTIONAL = ("em", "pm-bounces")`，零引用，
+# 2026-09-20 二轮审计后删除。**它不是无害的残留**：它的注释声称收件过滤分了
+# "营销流 / 事务流"两档，而规则表里**每一条** `sender_contains` 用的都是
+# `SENDER_TYPESAFE`（见下方 RULES）—— 也就是说那套分层**实现上根本没落地**。
+# 下一个按注释理解的人会以为"事务流只匹配 `em*`/`pm-bounces*`"，实际匹配整个域。
+#
+# 为什么**不**去把它落地（即把事务流四条规则收紧到 `em*`/`pm-bounces*`）：
+# 事务流实测走了 **SendGrid（`em5082`）与 Postmark（`pm-bounces`）两条腿**，
+# 将来还可能换供应商。按域匹配更稳，收紧只会引入新的漏匹配风险。
+# ⇒ 结论是删常量、保留宽匹配，而不是反过来。
 
 
 def _norm(s: str) -> str:
@@ -205,7 +214,7 @@ def extract_otp(text: str) -> tuple[str, str]:
     | `"loose"` | 锚定失配，退回"第一个 6 位数字" | **低** —— 可能抽到报文头里的标识 |
     | `"none"` | 一个都没找到 | — |
 
-    调用方（`pipeline.stage_login`）必须在 `how == "loose"` 时**把这件事写进日志**，
+    调用方（`stages.stage_login`）必须在 `how == "loose"` 时**把这件事写进日志**，
     否则"站点改了邮件模板"会伪装成"验证码过期"。
     """
     if not text:
@@ -226,10 +235,21 @@ def get(name: str) -> MailRule:
         raise KeyError(f"未知规则 {name!r}，可用：{sorted(_BY_NAME)}") from None
 
 
-def any_of(*names: str):
-    """把多条规则合成一个谓词（OR）。"""
-    rs = [get(n) for n in names]
-    return lambda m: any(r.matches(m) for r in rs)
+def any_of(*rules: MailRule):
+    """把多条规则合成一个谓词（OR）。
+
+    🔴 参数是 **`MailRule` 对象**，不是规则名 —— 2026-09-20 二轮审计改的。
+
+    以前收的是名字（`any_of("signin_code", "verify_code")`），于是"哪些规则算验证码"
+    有了**两份定义**：本文件里的 `CODE_RULES` / `LINK_RULES` 常量，
+    和 `stages.py` 里按名字重写一遍的 `any_of("signin_code", "verify_code")`。
+    危害不是"多写了几个字"，而是：加一条新验证码规则时**改一边漏一边** ⇒
+    新规则不生效；而 `--mode scan` 会显示"窗口内所有 TypeSafe 邮件都被规则覆盖"
+    （因为 `RULES` 表里确实有这条），把排查引向"D1 窗口被挤爆 / 邮箱坏了"。
+
+    ⇒ 现在只有一处定义：`any_of(*CODE_RULES)` / `any_of(*LINK_RULES)`。
+    """
+    return lambda m: any(r.matches(m) for r in rules)
 
 
 # ── 分诊断用的谓词 ────────────────────────────────────────────────────

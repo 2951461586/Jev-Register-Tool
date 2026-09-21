@@ -6,7 +6,7 @@
 `verify_keys.py` 验的是"我们记下来的 key 能不能用"，它回答不了另一个方向的问题：
 **站点上有没有我们根本没记下来的 key？**
 
-台账和交付物是**同一条写路径**的产物——pipeline 写台账、交付物从台账导出。
+台账和交付物是**同一条写路径**的产物——生产流程写台账、交付物从台账导出。
 两者对得再齐，也只能证明"没抄错"，不能证明"没漏掉"。
 能对上的独立真源只有一个：站点自己的 `GET /api/api-keys`。
 
@@ -30,7 +30,7 @@ from _bootstrap import ROOT  # noqa: E402,F401
 
 from src import config  # noqa: E402
 from src.ledger import Ledger  # noqa: E402
-from src.pipeline import Pipeline  # noqa: E402
+from src.runner import Pipeline  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
 
 
@@ -74,7 +74,7 @@ def main() -> int:
                         success_ledger=Ledger(tmp / "s.jsonl"), verbose=False)
         rec = pipe.new_record(em) if hasattr(pipe, "new_record") else None
         if rec is None:
-            from src.pipeline import AccountRecord
+            from src.stages import AccountRecord
             rec = AccountRecord(key=em, email=em)
         try:
             cl = pipe.stage_login(rec, mail_timeout=a.mail_timeout)

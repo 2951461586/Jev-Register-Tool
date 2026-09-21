@@ -30,8 +30,8 @@ import requests  # noqa: E402
 
 from src import config  # noqa: E402
 from src.framer_waitlist import submit as framer_submit  # noqa: E402
+from src.parsing import parse_js_object  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
-from src.typesafe import _parse_js_object  # noqa: E402
 
 LINK_RE = re.compile(r"https://login\.typesafe\.ai/v1/magic_links/redirect\?[^\s\"<>\)\]]+")
 
@@ -72,7 +72,7 @@ def confirm_flow(email: str, *, verbose: bool = True) -> dict:
         out.update(stage="landing", status=page.status_code,
                    body="落地页没有 dfp 参数（链接可能已过期）")
         return out
-    payload = _parse_js_object(mm.group(1))
+    payload = parse_js_object(mm.group(1))
     payload["telemetry_id"] = ""
     out["stytch_user_id"] = payload.get("user_id", "")
     if verbose:

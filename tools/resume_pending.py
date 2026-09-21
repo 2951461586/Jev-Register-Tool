@@ -46,8 +46,24 @@ def pending(led: Ledger) -> list[str]:
 
     注意这里刻意包含**所有**状态：`applied` / `confirmed` / `partial` /
     `failed` / `approved` 都要算候选。只挑某一个状态词会让账号静默漏掉。
+
+    🔴 但要**排除 `worker-crash#<n>` 这类占位键**（2026-09-20 二轮审计）：
+    并发 worker 崩溃时邮箱是未知的（它是在崩溃的 worker **内部**才由
+    `create_mailbox()` 建出来的），只能用批次序号占位。拿它去
+    `--email worker-crash#0` 只会白刷一次站点。
+
+    判据刻意用"**像不像邮箱**"（`@`）而不是"是不是 failed"——
+    真正的失败账号**必须**留在候选里，那正是补跑的意义所在。
     """
-    return sorted(r["email"] for r in led.load() if not r.get("api_key"))
+    out: list[str] = []
+    for r in led.load():
+        if r.get("api_key"):
+            continue
+        email = str(r.get("email") or "")
+        if "@" not in email:
+            continue                      # 占位键（worker-crash#N），不是可登录的地址
+        out.append(email)
+    return sorted(out)
 
 
 def main() -> int:
@@ -61,7 +77,11 @@ def main() -> int:
     args = ap.parse_args()
 
     led = Ledger(config.LEDGER_PATH)
-    log_path = Path(args.log) if args.log else Path("exports/resume_pending.log")
+    # 🔴 默认落盘路径必须从 `config.EXPORT_DIR` 派生，**不要写相对路径**
+    #    （`Path("exports/…")` 是 CWD 依赖：从别的目录起进程会把日志写到别处，
+    #    而 `--log` 的默认值文档里写的是 `exports/resume_pending.log`，
+    #    两者会静默不一致）。2026-09-20 二轮审计 §10-9。
+    log_path = Path(args.log) if args.log else config.EXPORT_DIR / "resume_pending.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # newline="" —— Windows 上必须显式关掉 `\n` -> `\r\n` 的翻译。

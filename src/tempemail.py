@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import requests
@@ -27,11 +27,22 @@ class TempMailError(RuntimeError):
 
 @dataclass
 class Stats:
+    """只留**真的会被读**的计数器。
+
+    2026-09-20 二轮审计删掉了 `http_4xx` / `created` / `last_error`：三者只写不读。
+    - `http_4xx` / `last_error` 无用是因为失败信息**已经随异常抛出**：
+      4xx 走 `TempMailError(f"HTTP {code} {path}: {body}")`，
+      网络异常与 5xx 走 `TempMailError(f"网络失败 {path}: {exc}")` /
+      `f"邮箱服务持续 5xx（N 次，最近 HTTP {code}）"`。
+      再留一份副本在 `stats` 里没人读，就是"看着像有诊断能力、其实没有"。
+    - `created` 连失败诊断都不参与。
+    保留 `polls` / `http_5xx` 是因为它们出现在 `stage_apply` 的确认超时信息里
+    （`邮箱接口轮询 N 次，5xx M 次`）—— 那是"服务端读不出来"与"邮件没到"的唯一分界，
+    而这两件事的处置**恰好相反**。
+    """
+
     polls: int = 0
     http_5xx: int = 0
-    http_4xx: int = 0
-    created: int = 0
-    last_error: str = ""
 
 
 @dataclass
@@ -42,12 +53,6 @@ class Mail:
     subject: str
     body: str
     received_at: int
-    raw: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def text(self) -> str:
-        """主题 + 正文的合并文本，供正则抽取。"""
-        return f"{self.subject}\n{self.body}"
 
     @property
     def recipient(self) -> str:
@@ -74,7 +79,6 @@ class TempMailClient:
                 r = self.s.request(method, f"{self.base}{path}", timeout=30, **kw)
             except requests.RequestException as exc:
                 last = exc
-                self.stats.last_error = f"network: {exc}"
                 if attempt < retries - 1:
                     time.sleep(backoff * (attempt + 1))
                     continue
@@ -82,7 +86,6 @@ class TempMailClient:
 
             if 500 <= r.status_code < 600:
                 self.stats.http_5xx += 1
-                self.stats.last_error = f"HTTP {r.status_code} {path}"
                 if attempt < retries - 1:
                     time.sleep(backoff * (attempt + 1))
                     continue
@@ -91,7 +94,8 @@ class TempMailClient:
                     f"—— 不是邮件没到，是读不出来"
                 )
             if 400 <= r.status_code < 500:
-                self.stats.http_4xx += 1
+                # 4xx 立刻失败：错误文本里已带状态码与响应体，
+                # 不需要再维护一个"只写不读"的计数器（2026-09-20 二轮审计）。
                 raise TempMailError(f"HTTP {r.status_code} {path}: {r.text[:200]}")
             return r
         raise TempMailError(f"重试耗尽: {path} ({last})")
@@ -115,7 +119,6 @@ class TempMailClient:
         emails = data.get("emails") or []
         if not emails:
             raise TempMailError(f"建邮箱未返回地址: {data}")
-        self.stats.created += 1
         return emails[0]
 
     # ── 收信 ──────────────────────────────────────────────────────────
@@ -143,7 +146,6 @@ class TempMailClient:
                 subject=m.get("subject") or "",
                 body=m.get("body") or m.get("text") or m.get("raw_text") or "",
                 received_at=int(m.get("received_at") or 0),
-                raw=m,
             ))
         out.sort(key=lambda x: x.received_at)
         return out

@@ -37,7 +37,7 @@ from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加�
 
 from src import config  # noqa: E402
 from src.ledger import Ledger  # noqa: E402
-from src.pipeline import AccountRecord, Pipeline  # noqa: E402
+from src.runner import AccountRecord, Pipeline  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
 
 
@@ -117,6 +117,12 @@ def cmd_claim(pipe: Pipeline, args: argparse.Namespace) -> int:
     接住 —— `recs` 的"算"与"用"隔着 30 行和两个 return 点。
     这种形态下，任何人改动上面的 return 条件或新增模式，
     都可能让 `recs` 未定义、或串到 `run_batch` 上去。
+
+    ⚠️ **本模式的两进程用法已知失效（2026-09-20 实测）**：
+    `--send` 与 `--token` 是两个独立进程、各自新建 `TypeSafeClient()`，
+    中间没有任何会话传递 ⇒ 码到 2 分钟内提交仍报 `401 Code expired`。
+    **优先用 `--mode resume`**（同一进程内发码+提交，会话连续）。
+    根因候选与验证方法见 `docs/runbook.md` §1.5。
     """
     if not args.email:
         print("✗ mode=claim 需要一个 --email", file=sys.stderr)
@@ -125,6 +131,18 @@ def cmd_claim(pipe: Pipeline, args: argparse.Namespace) -> int:
         print("✗ mode=claim 一次只处理一个邮箱（验证码 10 分钟且一次性）",
               file=sys.stderr)
         return 1
+
+    if args.send:
+        # 把告警打在**动作发生之前**，而不是等 401 出来再让人去查。
+        # 用户照 runbook 走会先看到这一句，不至于掉进"重新发码"的死循环。
+        print("⚠️  --mode claim 的两进程用法**已知失效**：本进程发完码就退出了，\n"
+              "    而 --token 是另一个进程、另一套会话 ⇒ 实测提交时必报\n"
+              "    `401 Code expired`（与码对不对无关）。\n"
+              "    ⇒ 邮箱在 Worker 覆盖域内时请改用：\n"
+              f"       python tools/run_e2e.py --mode resume --email {args.email[0]}\n"
+              "    只有真人邮箱（Worker 读不到）才需要继续用 claim，\n"
+              "    且请先看 docs/runbook.md §1.5 的根因候选与验证方法。\n",
+              file=sys.stderr)
 
     rec = pipe.claim(args.email[0], args.token, kind=args.token_kind,
                      name=args.key_name, send_first=args.send)
@@ -192,7 +210,9 @@ def main() -> int:
                     default="full",
                     help="full=全链路；apply=只投递申请；resume=对已获批邮箱跑 4→7；"
                          "watch=监听获批邮件并自动续跑；scan=列出邮箱窗口内全部邮件；"
-                         "claim=用外部提供的验证码/链接 token 对单个已获批邮箱跑 4→7")
+                         "claim=⚠️实验性：用外部提供的验证码/链接 token 对单个已获批邮箱"
+                         "跑 4→7。**两进程用法已知失效**（--send 与 --token 各自建会话 ⇒ "
+                         "必报 401 Code expired），优先用 resume；见 docs/runbook.md §1.5")
     ap.add_argument("--count", type=int, default=1, help="批次数量（mode=full/apply）")
     ap.add_argument("--email", action="append", default=[], help="指定邮箱（mode=resume/claim）")
     ap.add_argument("--token", default="", help="mode=claim 的验证码或魔法链接 token")
@@ -206,7 +226,7 @@ def main() -> int:
     ap.add_argument("--approval-timeout", type=float, default=0.0,
                     help="等审批的秒数，0=只做一次快照检查")
     ap.add_argument("--confirm-timeout", type=float, default=None,
-                    help="等 waitlist 确认邮件的秒数（默认取 pipeline.CONFIRM_TIMEOUT=300；"
+                    help="等 waitlist 确认邮件的秒数（默认取 stages.CONFIRM_TIMEOUT=300；"
                          "调小会漏掉迟到的邮件并把成功申请记成 failed）")
     ap.add_argument("--watch-timeout", type=float, default=900.0,
                     help="mode=watch 的监听时长（秒）")

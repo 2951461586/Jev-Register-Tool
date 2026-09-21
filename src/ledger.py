@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 #: **可重入**锁。两点原因：
 #:
@@ -27,7 +27,7 @@ _LOCK = threading.RLock()
 
 #: 记录状态优先级：只用于"升级 / 降级"判断，不用来决定"是否写入"。
 #:
-#: 🔴 **本表的键必须覆盖 `src/pipeline.py` 实际写入的每一个 status 字面量。**
+#: 🔴 **本表的键必须覆盖 `src/stages.py` 实际写入的每一个 status 字面量。**
 #:
 #: 历史教训（2026-09-20 审计发现）：本表曾照搬兄弟项目的口径
 #: （`success` / `skipped`），而本项目写的是 `keyed` / `registered` / `approved` …。
@@ -42,7 +42,7 @@ _LOCK = threading.RLock()
 #: 现在由 `tools/selftest.py::test_status_vocabulary` 用 AST 扫源码钉住：
 #: 新增任何 status 字面量而没登记进本表，自测立刻失败。
 RANK: dict[str, int] = {
-    # ── pipeline 实际写入的词汇（唯一真源：src/pipeline.py） ──
+    # ── 阶段层实际写入的词汇（唯一真源：src/stages.py） ──
     "keyed": 5,         # 终态成功：拿到 api_key
     "partial": 4,       # 注册成功但没拿到 key（onboarding / 建 key 失败）
     "registered": 4,    # 会话已建立（过渡态，正常情况下会被 keyed/partial 覆盖）
@@ -110,7 +110,6 @@ class Ledger:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._extra_sources: list[Path] = []
 
     # ── 写 ────────────────────────────────────────────────────────────
     def append(self, rec: dict[str, Any]) -> None:
@@ -184,12 +183,12 @@ class Ledger:
             tmp.replace(self.path)
 
     # ── 读 ───────────────────────────────────────────────────────────
-    def add_source(self, path: Path) -> None:
-        """把"自己产出的导出文件"也列为输入来源 —— 防止原始来源被删后重跑缩水。"""
-        p = Path(path)
-        if p != self.path:
-            self._extra_sources.append(p)
-
+    #
+    # ⚠️ 这里曾有一个 `add_source()`：把"自己产出的导出文件"也列为输入来源，
+    # 声称"防止原始来源被删后重跑缩水"。**它零调用点** —— 机制是通的，
+    # 但没有任何地方调用它 ⇒ 这条保护**实际从未生效**。
+    # 属于"以为有护栏其实没有"，2026-09-20 二轮审计后连同 `_extra_sources`
+    # 一起删除。真要这个能力，得在 `verify_keys.py` 里真的调一次，而不是留个悬空方法。
     def load(self) -> list[dict[str, Any]]:
         """读台账。同键后写覆盖前写（与 append 语义一致），并按等级升级 / 降级保护。
 
@@ -197,21 +196,11 @@ class Ledger:
         """
         with _LOCK:
             by_key: dict[str, dict[str, Any]] = {}
-            for path in [*self._extra_sources, self.path]:
-                if not path.is_file():
+            for rec in self._iter_raw():
+                k = rec.get("key")
+                if not k:
                     continue
-                for raw in path.read_text(encoding="utf-8").splitlines():
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    k = rec.get("key")
-                    if not k:
-                        continue
-                    by_key[k] = merge(by_key[k], rec) if k in by_key else rec
+                by_key[k] = merge(by_key[k], rec) if k in by_key else rec
             return list(by_key.values())
 
     def raw_rows(self) -> list[dict[str, Any]]:
@@ -222,20 +211,22 @@ class Ledger:
         静默少一行和 `verify_keys` 少一行是同一类错误。
         所以需要合并视图（拿权威元数据）**加**原始行（拿全部 key）两个视角。
         """
-        out: list[dict[str, Any]] = []
         with _LOCK:
-            for path in [*self._extra_sources, self.path]:
-                if not path.is_file():
-                    continue
-                for raw in path.read_text(encoding="utf-8").splitlines():
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        out.append(json.loads(raw))
-                    except json.JSONDecodeError:
-                        continue
-        return out
+            return list(self._iter_raw())
 
-    def keys(self) -> set[str]:
-        return {r["key"] for r in self.load() if r.get("key")}
+    def _iter_raw(self) -> Iterator[dict[str, Any]]:
+        """逐行读台账文件，解析失败的行**静默跳过**（不炸整次读）。
+
+        `load()` 与 `raw_rows()` 共用这一份读循环 —— 以前是两份完全相同的复制，
+        合并规则改一处忘另一处就会让两个视图不一致。
+        """
+        if not self.path.is_file():
+            return
+        for raw in self.path.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                yield json.loads(raw)
+            except json.JSONDecodeError:
+                continue

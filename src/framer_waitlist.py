@@ -25,7 +25,6 @@ PoW 算法从 `framer.CwAF0H4T.mjs` 的 `ff()` / `df()` 里读出来的，不是
 from __future__ import annotations
 
 import hashlib
-import json
 import random
 import string
 import time

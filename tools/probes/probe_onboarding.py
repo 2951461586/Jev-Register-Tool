@@ -32,9 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加进 sys.path）
 
 from src import config  # noqa: E402
-from src.pipeline import AccountRecord, Pipeline  # noqa: E402
-from src.typesafe import (_action_form_fields,  # noqa: E402
-                          _actions_from_html, _visible_text)
+from src.parsing import (action_form_fields,  # noqa: E402
+                         actions_from_html, visible_text)
+from src.runner import AccountRecord, Pipeline  # noqa: E402
 from src.typesafe import FALLBACK_SETUP_ACTIONS  # noqa: E402
 
 PAGES = ["/setup/tos", "/setup/set-name", "/setup/console-survey"]
@@ -77,7 +77,7 @@ def main() -> int:
     for p in PAGES:
         full = f"{p}?returnTo=%2Fhook"
         r = cl.s.get(f"{config.SITE_ORIGIN}{full}", timeout=30)
-        acts = _actions_from_html(r.text)
+        acts = actions_from_html(r.text)
         print(f"\n  ── {full}")
         print(f"     HTTP {r.status_code}  content-type={r.headers.get('content-type','')!r}  "
               f"len={len(r.text)}  location={r.headers.get('location')!r}")
@@ -86,7 +86,7 @@ def main() -> int:
         if r.status_code != 200:
             print(f"     body[:300] = {r.text[:300]!r}")
         else:
-            print(f"     可见文案[:220] = {_visible_text(r.text)[:220]!r}")
+            print(f"     可见文案[:220] = {visible_text(r.text)[:220]!r}")
 
     if not args.post:
         print("\n（未加 --post，只做了只读探测）")
@@ -101,14 +101,14 @@ def main() -> int:
 
     # A. 渐进增强形态：页面里带 $ACTION_* 隐藏域 → 无 JS 表单提交
     print("\n  ── A. 渐进增强（$ACTION_* 隐藏域）")
-    acts = _actions_from_html(cl.s.get(f"{config.SITE_ORIGIN}{path}", timeout=30).text)
+    acts = actions_from_html(cl.s.get(f"{config.SITE_ORIGIN}{path}", timeout=30).text)
     if not acts:
         print("     跳过：GET 页面里没有 $ACTION_* 隐藏域（这就是降级的触发条件）")
     else:
         n = next(iter(acts))
         a = acts[n]
         print(f"     action_{n}: id={a['id']}  fields={sorted(a['fields'])}  key={a['key'][:16]!r}")
-        files = _action_form_fields(n, a)
+        files = action_form_fields(n, a)
         for k, v in fields.items():
             files[k] = (None, v)
         r = cl.s.post(f"{config.SITE_ORIGIN}{path}", files=files,

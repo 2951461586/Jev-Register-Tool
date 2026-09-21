@@ -39,7 +39,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
-$PY tools/selftest.py                  # 自测 125 项，离线可跑
+$PY tools/selftest.py                  # 自测 161 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
 $PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
@@ -79,15 +79,32 @@ src/                       库代码
   ledger.py                JSONL 台账（并集合并 / 幂等 / 等级语义）
   tempemail.py             CF Worker 收信
   framer_waitlist.py       申请表单 + PoW
-  typesafe.py              Server Action / Stytch / onboarding / 建 Key
-  pipeline.py              阶段编排（唯一的上层聚合者，含并发扇出）
+  parsing.py               页面/邮件文本解析（`$ACTION_*`、JS 字面量、魔法链接）——
+                           **纯函数、零第三方依赖**，可脱离 `requests` 单测
+  typesafe.py              Server Action / Stytch / onboarding / 建 Key（只发 HTTP）
+  stages.py                ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord`
+                           出网动作全在这里：apply / login / onboarding / 建 Key
+  runner.py                ★ `Pipeline`：批量 / 并发 / 监听 / 人工接力 / 台账写入
+                           继承 `stages.StageMixin`，`stages` 不反向依赖它
 
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
-  run_e2e.py               ★ 主入口：apply / watch / resume / claim / scan
-  selftest.py              自测 125 项（含负对照，**全程离线**）
+  run_e2e.py               ★ 主入口：apply / watch / resume / scan
+                           （另有 claim，⚠️ 两进程用法已知失效 → runbook §1.5）
+  resume_pending.py        ★ 补跑台账里还没拿到 key 的账号（幂等，可反复跑）。
+                           进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
+  normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
+  selftest.py              自测**入口**：只做聚合与调度（20 个用例段在 `tests/`）
+  tests/                   自测本体（6 个文件 1192 行，161 项，含负对照，**全程离线**）
+    __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
+    support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
+    test_parsing.py          解析层（PoW / 紧凑 JSON / Server Action / JS 字面量）
+    test_ledger.py           台账（并集合并 / 状态词汇 / 身份字段归一化）
+    test_mailrules.py        收件规则 + OTP 抽取
+    test_orchestration.py    编排层（错误码分流 / 申请 / 登录 / 监听 / 并发）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针（只读，除注明外都不写台账）
+    audit_keys_against_site.py   站点侧对账：`GET /api/api-keys` vs 我们的交付物
     probe_confirm.py             看"确认邮件"那一步的每跳原始响应
     probe_confirm_flow.py        干净实验：先确认再回调，用状态码判假设
     probe_onboarding.py          探 `/setup/*` 的 Server Action 形态（`--post` 才发请求）
@@ -99,7 +116,8 @@ docs/
   architecture.md          目录 / 模块 / 耦合 / 数据流（依赖图由 AST 算出）
   mail-filters.md          收件过滤规则 + 取码锚定（格式对齐 OpenXLab 项目）
   runbook.md               怎么跑 + 故障处置
-  audit-2026-09-20.md      架构/耦合/目录/文档审计（含一个 P0 与全部证据）
+  audit-2026-09-20.md      一轮审计（时间点快照：37/96 项，**数字刻意不改**）
+  audit-2026-09-20-round2.md  二轮审计 + 批次 A/B/C 修复状态（§0.5 / §0.6 / §0.7）
 
 evidence/                  录制的证据（har / eml / 抓来的第三方 bundle）
 exports/                   运行台账与记录：ledger.jsonl / run_*.json / *.log / _diag/
@@ -112,7 +130,7 @@ result/                    ★ 交付物（**只放成功的**）：success.json
 > —— 那是**唯一**产出 key 的地方，写在这里就自动覆盖全部四条路径
 > （`run_batch` / `resume` / `watch` / `claim`），不需要在四个调用点各写一遍。
 
-**依赖方向单向**：`tools → pipeline → 叶子 → config`，无循环。
+**依赖方向单向**：`tools → runner → stages → 叶子 → config`，无循环。
 第三方依赖**只有 `requests`**（刻意不用 `bs4` / `lxml`）。
 详见 `docs/architecture.md`。
 
@@ -152,7 +170,7 @@ result/                    ★ 交付物（**只放成功的**）：success.json
 - ❌ 别把"此刻没查到"讲成"不存在"（批量审批有时间差）
 - ❌ 别在凭据有效性未验证前把 `403` 当结论
 - ❌ 别把长等待放前台（~120s 被 SIGTERM，日志截断会伪造业务结论）
-- ❌ 别在 `pipeline` 里就地写取码正则（走 `mailrules.extract_otp`；
+- ❌ 别在 `stages` 里就地写取码正则（走 `mailrules.extract_otp`；
   降级路径会在日志里显式警告，**看到警告要去查模板变更，不是重新发码**）
 - ❌ 别把 `Pipeline` 的会话 client 挂成实例字段（并发会串号）
 - ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）

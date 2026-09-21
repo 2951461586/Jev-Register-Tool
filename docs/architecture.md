@@ -39,7 +39,7 @@ Jev-Register-Tool/
 │   │                          不是"末行胜出"（那会让重跑失败把计数压低）
 │   ├── normalize_ledger.py    修被 CR / 尾部空白污染的 key、email（**不折叠行**）
 │   ├── selftest.py            自测**入口**（112 行）：只做聚合与调度 + 登记完整性元检查
-│   ├── tests/                 自测本体（6 个文件 1406 行，按被测对象分）
+│   ├── tests/                 自测本体（6 个文件 1425 行，按被测对象分）
 │   │   ├── __init__.py        仅为让 `tests` 可当包导入（**不是** pytest 测试包）
 │   │   ├── support.py         共享夹具：`check()` 计数 + 离线替身 + 模块别名转手
 │   │   ├── test_parsing.py    解析层：PoW / 紧凑 JSON / Server Action / JS 字面量
@@ -73,7 +73,8 @@ Jev-Register-Tool/
 │   └── _diag/                 一次性诊断残留（探针输出、抓下的页面快照）
 │
 └── result/                    ★ 交付物（已 gitignore，**只放成功的**）
-    ├── success.jsonl          成功账号（append-only，按 key 并集去重）
+    ├── success.jsonl          成功**账号**（append-only，按邮箱去重 ⇒ 每邮箱一行）
+    │                          ⚠️ 账号级：同账号的第二把 key 会被合并；凭据级看 keys.txt
     ├── keys.txt               email----api_key----api_key_id（明文，人可读）
     └── keys_verified.json     机器可读的验收结果
 ```
@@ -109,10 +110,10 @@ Jev-Register-Tool/
 | `selftest.py` | 112 | 自测**入口**：按顺序调用 `tests/` 下 23 个 `test_*` + 登记完整性元检查 | `tests.*` |
 | `tests/support.py` | 237 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
 | `tests/test_parsing.py` | 143 | 解析层 4 组（PoW / 紧凑 JSON / Server Action / JS 字面量） | `support` |
-| `tests/test_ledger.py` | 205 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化） | `support` |
+| `tests/test_ledger.py` | 224 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化 + 交付物自证） | `support` |
 | `tests/test_mailrules.py` | 118 | 收件规则 + OTP 抽取 | `support` |
 | `tests/test_orchestration.py` | 698 | 编排层 14 组（错误码分流 / 申请 / 登录 / 监听 / setup 降级 / 并发…） | `support` |
-| `verify_keys.py` | 165 | 验收 + 导出 | `config` `ledger` |
+| `verify_keys.py` | 192 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
 > **行数怎么算的**：`wc -l`（即文件里 `\n` 的个数）。复算：
@@ -273,10 +274,10 @@ Jev-Register-Tool/
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
 | ~~无并发~~ | **已加** `--concurrency`（申请段/注册段） | `watch` 刻意保持串行 |
-| ~~`pipeline.py` 零测试~~ | **已补** 184 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
+| ~~`pipeline.py` 零测试~~ | **已补** 188 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
 | ~~`typesafe.py` 混了 HTTP 客户端 + HTML/JS 解析~~ | **2026-09-20 已拆**：解析层独立成 `src/parsing.py`，`typesafe.py` 413 → **359** 行，只留 HTTP | — |
 | ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py`（417 行，阶段 + `AccountRecord`）+ `src/runner.py`（324 行，调度）。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | 若再膨胀，先拆 `runner.watch`（66 行） |
-| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` 112 行 + `tools/tests/` 6 个文件 1406 行（四个 `test_*.py` + `support.py` 夹具 + `__init__.py`）。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
+| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` 112 行 + `tools/tests/` 6 个文件 1425 行（四个 `test_*.py` + `support.py` 夹具 + `__init__.py`）。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
 | ~~`FALLBACK_SETUP_ACTIONS` 是**假护栏**~~ | **2026-09-21 已修**：`post_setup()` 的降级通路以前 `except TypeSafeError: acts = {}` **静默**退化到一张已知全部作废的 action id 表（文档三处写明），于是"站点改版"最终只表现为 `onboarding 失败: HTTP 404`。现在降级必打可辨识告警、失败时 `error` 点出真因 + 给下一步 | 兜底表本身仍会随部署失效（这是它的性质）。重录 HAR 拿到新 id 后，要同步 `typesafe.py` 的注释与 runbook §4.6 |
 | ~~`auth_callback` 请求体多传 `waitlistEmail`（站点已收紧 schema）~~ | **2026-09-21 已修**：站点把 `/api/auth/callback` 的 schema 收紧成 **strict**，多一个未知键直接 400。当时**所有**账号登录全灭（含 122 个已获批、早已拿到 key 的），而错误文案只有一句 `HTTP 400: Bad request` —— 排查会被引向"验证码错/白名单"，方向完全相反。已删该键（邮箱改由 token/session 在服务端推导），并让 `_fail_auth` 特判 Zod 的 `Unrecognized key`、把真因与处置直接写进 `error` | 这类"站点收紧请求体"**没有通用护栏** —— 只能靠我们自己维护的键集测试（`test_auth_callback_payload_shape`）。下次见到 `400 Bad request`，先跑 `tools/probes/audit_keys_against_site.py` 分清"回调坏了"还是"未获批"（runbook §4.8） |
 | ~~`complete_onboarding` 把"POST 报错"直接当成失败~~ | **2026-09-21 已修**：站点把三步合成同一张表单、而 `/api/me` **读有滞后** ⇒ 多发的那次 survey POST 必然 404，于是**账号明明已完全 onboard 却被记成 `partial`**（实跑 25 个里误报 **19 个**）。现在 POST 报错后**回读 `/api/me`**：缺口关了就是成功，并往 `log` 留痕 | 另一半是站点侧行为（**最后一跳在同一会话里做不到**，换会话才行），只能靠下一轮补 —— 见 runbook §4.9。这类问题没有通用护栏，判据只能写进文档 |
@@ -328,7 +329,7 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 184 项」，本文 §6 写「已补 184 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 188 项」，本文 §6 写「已补 188 项自测」。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。
 grep -rn "自测 [0-9]* 项\|[0-9]* 项自测\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
 ```

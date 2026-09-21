@@ -39,7 +39,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
-$PY tools/selftest.py                  # 自测 184 项，离线可跑
+$PY tools/selftest.py                  # 自测 188 项，离线可跑
 $PY tools/run_e2e.py --mode apply --count 5   # 投递申请
 $PY tools/run_e2e.py --mode watch --watch-timeout 900   # 等获批并自动续跑 4→7
 $PY tools/run_e2e.py --mode resume --email a@b.com --concurrency 4   # 并发补跑
@@ -95,7 +95,7 @@ tools/                     入口脚本
                            进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
   normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
   selftest.py              自测**入口**：只做聚合与调度（20 个用例段在 `tests/`）
-  tests/                   自测本体（6 个文件 1406 行，184 项，含负对照，**全程离线**）
+  tests/                   自测本体（6 个文件 1425 行，188 项，含负对照，**全程离线**）
     __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
     support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
     test_parsing.py          解析层（PoW / 紧凑 JSON / Server Action / JS 字面量）
@@ -121,7 +121,13 @@ docs/
 
 evidence/                  录制的证据（har / eml / 抓来的第三方 bundle）
 exports/                   运行台账与记录：ledger.jsonl / run_*.json / *.log / _diag/
-result/                    ★ 交付物（**只放成功的**）：success.jsonl / keys.txt / keys_verified.json
+result/                    ★ 交付物（**只放成功的**）：见下方口径说明
+                           · success.jsonl       成功**账号**（账号级：每邮箱一行）
+                           · keys.txt            凭据清单（凭据级：每把 key 一行）
+                           · keys_verified.json  机器可读验收结果（凭据级）
+                           ⚠️ 两套口径**行数天然不等**：同账号重跑会拿到第二把 key，
+                              账号级会按邮箱合并掉、凭据级两把都留。交付凭据以
+                              keys.txt 为准，别拿三者行数相等当对账判据。
 ```
 
 > **`exports/` 与 `result/` 的分工**（2026-09-20 起）：台账要留**全部**尝试

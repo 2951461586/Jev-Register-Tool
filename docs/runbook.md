@@ -196,7 +196,11 @@ $PY tools/verify_keys.py
 拿台账里每个 key **真打一次** `POST https://api.typesafe.ai/v1/systemone`，
 输出可用/不可用统计，并把**成功数据**导出到 `result/`（交付物目录）：
 
-- `result/success.jsonl` —— 成功账号（从台账补录，幂等；每次跑批也会自动追加）
+- `result/success.jsonl` —— 成功**账号**（账号级：每邮箱一行；从台账补录，幂等；每次跑批也会自动追加）
+- ⚠️ **两套口径别混**：`success.jsonl` 是**账号级**（`Ledger` 以邮箱为主键，同账号重跑的
+  第二把 key 会被合并掉），而 `keys.txt` / `keys_verified.json` 是**凭据级**（每把 key 一行）
+  ⇒ 三者行数**天然不等**（实测 177 / 242 / 242）。要交付凭据以 `keys.txt` 为准；
+  `verify_keys.py` 现在会把「输入条数」与「落盘行数」两个口径都印出来自证。
 - `result/keys.txt` —— `email----api_key----api_key_id`（可复制）
 - `result/keys_verified.json` —— 机器可读的验收结果
 
@@ -213,7 +217,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 184 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 188 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -226,7 +230,7 @@ $PY tools/selftest.py      # 184 项，含负对照，**全程离线**（不碰�
 | `test_parsing` | Stytch JS 字面量 | 4 | 裸键名不是 JSON |
 | `test_ledger` | 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
 | `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
-| `test_ledger` | 身份字段空白归一化 / 只写 LF | 9 | CRLF 污染台账键（实测污染过 39 条） |
+| `test_ledger` | 身份字段空白归一化 / 只写 LF / 交付物自证 | 13 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
 | `test_mailrules` | 收件规则 | 21 | 发件人同域必须叠加 subject；弯引号；CODE/LINK 分组不重叠 |
 | `test_mailrules` | OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码**；非锚定必须显式告警 |
 | `test_orchestration` | 编排：认证错误码分流 | 12 | 401/401/403 三条路不能混 |
@@ -245,7 +249,7 @@ $PY tools/selftest.py      # 184 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | onboarding：合并提交 + `/api/me` 读滞后 | 5 | POST 报错后**必须回读** `/api/me`：缺口关了就是成功，不许把"已经好了"记成失败（实测误报 76%，见 §4.9） |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **184 项**（23 段 + 1 项入口元检查）。
+> 合计 **188 项**（23 段 + 1 项入口元检查）。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >

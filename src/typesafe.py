@@ -334,46 +334,80 @@ class TypeSafeClient:
                       error=err)
 
     def complete_onboarding(self, display_name: str = "Auto User") -> Result:
-        """按 /api/me 的缺口依次补 TOS / 姓名 / 问卷。"""
+        """按 /api/me 的缺口依次补 TOS / 姓名 / 问卷。
+
+        🔴 **判据不能只看 POST 的返回码 —— 失败后必须回读一次状态。**
+        （2026-09-21 实测，与 `post_setup` 的降级告警是同一批发现。）
+
+        站点现在把三步合成了**同一张表单**（`/setup/tos` / `/setup/set-name` /
+        `/setup/console-survey` 三个路由返回**逐字节相同**的页面，len 都是 39760），
+        提交一次之后服务端把三项**一起**标记完成。而紧接着的 `/api/me` **读有滞后**，
+        仍报 `console_survey_completed_at = None`。
+
+        于是我们会多发一次 survey POST —— 可那时 onboarding 已完成，页面渲染的是
+        欢迎页、**没有 `$ACTION_*` 隐藏域** ⇒ 退化到已作废的 fallback ⇒ 404。
+        结果：**账号明明已经完全 onboard，却被记成 `partial`（假阴性）**，
+        实跑 25 个里误报 19 个，交付流程在"最后一跳"上白跑一整轮。
+
+        ⇒ `onboarding_state()`（即 `/api/me`）是**唯一可信的真源**：
+        POST 报错后回读一次，缺口关了就是成功。
+        自测 `test_onboarding_merged_submit_is_not_a_failure` 钉住。
+        """
         st = self.onboarding_state()
         done: list[str] = []
+
+        def step(label: str, need_key: str, path: str,
+                 fields: dict[str, str]) -> Result | None:
+            """跑一步；返回非 None 表示**真失败**。"""
+            r = self.post_setup(path, fields)
+            if r.ok:
+                done.append(label)
+                return None
+            if not self.onboarding_state()[need_key]:
+                # 回读判定：缺口已关 ⇒ 是上一步顺带完成的，不是失败
+                done.append(f"{label}（上一步已顺带完成）")
+                self.log.append(
+                    f"⚠ post_setup({path}) 报 {r.error!r}，但回读 /api/me 显示 "
+                    f"`{need_key}` 已关闭 ⇒ 判**成功**"
+                    f"（站点把三步合并成一次提交，而 /api/me 读有滞后）")
+                return None
+            return r
+
         if st["needs_tos"]:
-            r = self.post_setup("/setup/tos?returnTo=%2Fhook", {
+            r = step("tos", "needs_tos", "/setup/tos?returnTo=%2Fhook", {
                 "legalAcknowledged": "true",
                 "returnTo": "/hook",
                 "marketingOptIn": "true",
                 "marketingOptedOutInitial": "",
             })
-            if not r.ok:
+            if r is not None:
                 return r
-            done.append("tos")
         st = self.onboarding_state()
         if st["needs_name"]:
-            r = self.post_setup("/setup/set-name?returnTo=%2Fhook", {
+            r = step("set-name", "needs_name", "/setup/set-name?returnTo=%2Fhook", {
                 "returnTo": "/hook",
                 "accountEmail": self.email,
                 "displayName": display_name,
                 "jobFunction": "",
                 "skip": "true",
             })
-            if not r.ok:
+            if r is not None:
                 return r
-            done.append("set-name")
         st = self.onboarding_state()
         if st["needs_survey"]:
             org = ""
             for m in (st["profile"].get("org_memberships") or []):
                 org = (m.get("org") or {}).get("id", "") or org
-            r = self.post_setup("/setup/console-survey?returnTo=%2Fhook", {
-                "returnTo": "/hook",
-                "needsOrgFields": "false",
-                "orgSurveyOrgId": org,
-                "needsUserFields": "true",
-                "skip": "true",
-            })
-            if not r.ok:
+            r = step("console-survey", "needs_survey",
+                     "/setup/console-survey?returnTo=%2Fhook", {
+                         "returnTo": "/hook",
+                         "needsOrgFields": "false",
+                         "orgSurveyOrgId": org,
+                         "needsUserFields": "true",
+                         "skip": "true",
+                     })
+            if r is not None:
                 return r
-            done.append("console-survey")
         return Result(ok=True, stage="onboarding", data={"completed": done,
                                                         "state": self.onboarding_state()})
 

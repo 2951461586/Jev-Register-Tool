@@ -137,6 +137,34 @@ class _FakeSession:
         return self.post_resp
 
 
+class _SetupSession:
+    """按 **URL** 应答的假会话 —— 测 `complete_onboarding` 的"回读判定"。
+
+    与 `_FakeSession`（按序吐页面）的区别：这里 `/api/me` 要能**逐次变化**
+    （第一次报缺口、第二次报缺口已关），其余 `/setup/*` 页面返回**已完成
+    onboarding** 的形态 —— 也就是**没有 `$ACTION_*` 隐藏域**的欢迎页。
+    """
+
+    def __init__(self, *, me_seq: list[dict], post_status: int = 404):
+        self.headers: dict = {}
+        self.me_seq = list(me_seq)
+        self.post_status = post_status
+        self.me_calls = 0
+        self.posts: list[dict] = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if url.endswith("/api/me"):
+            i = min(self.me_calls, len(self.me_seq) - 1)
+            self.me_calls += 1
+            return _FakeResp(json.dumps(self.me_seq[i]), 200)
+        # /setup/*：onboarding 已完成 ⇒ 渲染欢迎页，**没有任何隐藏域**
+        return _FakeResp("<html><body>Welcome inside TypeSafe</body></html>", 200)
+
+    def post(self, url, files=None, headers=None, timeout=None, json=None):
+        self.posts.append({"url": url, "files": files or {}, "headers": headers or {}})
+        return _FakeResp('{"error":"Server action not found."}', self.post_status)
+
+
 def test_auth_callback_payload_shape() -> None:
     """`/api/auth/callback` 的请求体**键集**逐字钉住。
 
@@ -189,6 +217,51 @@ def test_auth_callback_payload_shape() -> None:
         check("★ 400 Unrecognized key → 报出具体键名，并指向 auth_callback",
               "Unrecognized key" in rec.error and "auth_callback" in rec.error,
               rec.error)
+
+
+def test_onboarding_merged_submit_is_not_a_failure() -> None:
+    """onboarding 的 POST 报错后**必须回读状态**：缺口关了就不是失败。
+
+    🔴 2026-09-21 实测：站点把 `/setup/tos` / `/setup/set-name` /
+    `/setup/console-survey` 合并成**同一张表单**（三个路由返回逐字节相同的页面），
+    提交一次三项一起完成；而紧接着的 `/api/me` **读有滞后**。
+
+    于是我们会多发一次 survey POST —— 可那时 onboarding 已完成，页面渲染的是
+    欢迎页、**没有 `$ACTION_*` 隐藏域** ⇒ 退化到已作废的 fallback ⇒ 404
+    ⇒ 被记成 `partial`。实跑 25 个里误报 **19 个（76%）**，
+    交付流程在"最后一跳"上白跑一整轮，还会把"账号已就绪"错报成"失败"。
+    """
+    print("\n[onboarding：合并提交 + /api/me 读滞后]")
+
+    me_open = {"human_name": "u1", "latest_tos_acceptance": {"tos_version": 3},
+               "console_survey_completed_at": None, "org_memberships": []}
+    me_closed = {**me_open, "console_survey_completed_at": "2026-09-21T05:38:22"}
+
+    # 正例：POST 404，但回读显示 survey 已关 ⇒ 判成功。
+    # ⚠️ 前面要给 **3 个** `me_open` —— `complete_onboarding` 在跑 survey 前会读
+    #    3 次 `/api/me`（初始 + 两次重读）。少给一项会被 index 截断，
+    #    于是 survey 步骤根本不会执行，用例就测了个空（第一版踩过）。
+    ses = _SetupSession(me_seq=[me_open, me_open, me_open, me_closed])
+    cl = ts.TypeSafeClient(session=ses)
+    cl.email = "u1@example-mail.test"
+    ob = cl.complete_onboarding(display_name="u1")
+    check("★ POST 报 404 但回读缺口已关 ⇒ 整体 ok（不再误报 partial）",
+          ob.ok, f"ok={ob.ok} error={ob.error!r}")
+    check("★ 该步被记成「上一步已顺带完成」",
+          any("顺带完成" in str(d) for d in ob.data.get("completed", [])),
+          str(ob.data.get("completed")))
+    check("★ 回读判定留了日志痕迹（不是静默放过）",
+          any("回读" in line for line in cl.log), str(cl.log[-2:]))
+    check("确实打了 POST（证明走的是降级通路那条真实路径）",
+          len(ses.posts) >= 1, str(len(ses.posts)))
+
+    # 负对照：POST 404 且回读仍显示缺口未关 ⇒ 必须如实报失败
+    ses2 = _SetupSession(me_seq=[me_open])
+    cl2 = ts.TypeSafeClient(session=ses2)
+    cl2.email = "u2@example-mail.test"
+    ob2 = cl2.complete_onboarding(display_name="u2")
+    check("★ [负对照] 回读后缺口仍在 ⇒ 如实报失败（不许把真失败放行）",
+          not ob2.ok, f"ok={ob2.ok} error={ob2.error!r}")
 
 
 def _login_html(nums) -> str:

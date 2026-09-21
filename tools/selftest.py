@@ -35,6 +35,7 @@ from tests.test_orchestration import (test_apply_and_approval,  # noqa: E402
                                       test_fan_out_worker_crash_is_recorded,
                                       test_key_survives_rerun_failure,
                                       test_login_action_index_drift_retries,
+                                      test_onboarding_merged_submit_is_not_a_failure,
                                       test_post_setup_degrade_is_observable,
                                       test_success_ledger,
                                       test_watch_skips_keyed)
@@ -86,6 +87,7 @@ def main() -> int:
     test_auth_callback_payload_shape()
     test_apply_and_approval()
     test_login_action_index_drift_retries()
+    test_onboarding_merged_submit_is_not_a_failure()
     test_code_mode_falls_back_to_magic_link()
     test_confirm_timeout_headroom()
     test_watch_skips_keyed()

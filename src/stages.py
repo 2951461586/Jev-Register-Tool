@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .mailrules import (CODE_RULES, LINK_RULES, any_of, extract_otp,
                         get as get_rule)
@@ -77,15 +77,40 @@ MATCH_LINK = any_of(*LINK_RULES)
 LINK_FALLBACK_TIMEOUT = 30.0
 #: 等确认邮件（魔法链接）的秒数。
 #:
-#: 🔴 **不要调小。** 这个阈值的取值有实测依据，且"超时"与"没发"是两件事：
-#: 2026-09-20 连跑 10 批次实测的到达延迟单调爬升
-#: （41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 s），
-#: 阈值 180s 会把后两条**误判成 `failed`** —— 而它们其实在超时后 12s / 18s 就落了库。
-#: 300s ≈ 健康期实测最大延迟的 1.5 倍。
+#: 🔴 **2026-09-21 从 300s 下调到 60s** —— 依据是**实测延迟分布**，不是拍脑袋。
+#:
+#: 43 个成功账号实测（`signup.mail_at ÷ 1000 − created_at`，50 批次跑批）：
+#:     min 2.66s · P50 3.26s · P90 3.80s · max 4.57s
+#: 60s 对实测最大延迟仍有 **13 倍**余量。
+#:
+#: ⚠️ **旧值 300s 的两条依据都已失效**（留档，避免有人再引回去）：
+#:   ① 旧 docstring 引的是"2026-09-20 实测延迟单调爬升到 198s" —— 该结论**当天就被
+#:      证伪**（`memory/2026-09-20.md`：那批是**批量发出**的 waitlist 回执，
+#:      一次性涌入 47 封、延迟约 25 分钟，被误读成"单调爬升"）；
+#:   ② 那条链路（等 waitlist 审批回执）**已随邀请制取消整体删除**，
+#:      现在等的是**实时**登录确认邮件（3s 级）。
+#: ⇒ 阈值是"针对某个延迟分布"的；分布变了，它就该变。
+#:
+#: ⚠️ **下调必须与"超时后批内重发"成对使用**（见 `RETRY_SEND_ON_TIMEOUT`）：
+#: 只降阈值不重发，偶发的慢邮件会被直接判死，成功率**反而下降**。
 #: ⚠️ 另注：站点发信存在**丢包**（2026-09-21 实测 12 次发码只到 1 封），
 #: 但魔法链接 **7 天有效** ⇒ 超时后重跑时，`relogin_pending` 会把手上的历史链接
 #: 也用上（它不设 `since_ms` 门槛），所以"这次没等到"不等于"这个账号废了"。
-MAIL_TIMEOUT = 300.0
+MAIL_TIMEOUT = 60.0
+
+#: 确认邮件超时后，是否在**同一批次内**重发一次再等一轮。
+#:
+#: 依据：正常邮件 3s 内必到（P90 3.80s），所以"等到 60s 还没有"几乎必然是
+#: **丢包**而非"慢"。重发一次的成本是一次 `POST /login`，而收益是把成功率
+#: 从 ~86% 拉到 95%+ —— 比让账号落到下一轮 `relogin_pending` 划算得多。
+#:
+#: ⚠️ 它和 `MAIL_TIMEOUT` 是**一个改动**，不是两个：只降阈值不重发，
+#: 会把偶发的慢邮件直接判死，成功率反而下降。
+RETRY_SEND_ON_TIMEOUT = True
+#: 重发次数上限。刻意只给 1 次 —— 站点对"短时间重复发信"的容忍度未知，
+#: 而且真有第二次丢包时，让账号落到 `relogin_pending`（不设 `since_ms`，
+#: 能复用历史链接）比在批内死磕更有效。
+MAX_SEND_RETRIES = 1
 # 本模块写入的 `status` 字面量（registered / keyed / partial / failed）必须在
 # `ledger.RANK` 里有登记 —— 台账的升级/降级判断依赖它。
 # 自测 `test_status_vocabulary` 会用 AST 扫本文件，漏登记新状态会直接失败。
@@ -169,6 +194,58 @@ class StageMixin:
         return (f"{what}（邮箱接口轮询 {polls} 次，5xx {bad} 次）—— "
                 f"站点发信存在丢包，但魔法链接 7 天有效："
                 f"重跑一次（relogin_pending 会连历史链接一起用）比改请求更有效")
+
+    def _wait_with_retry(self, rec: AccountRecord, cl: TypeSafeClient,
+                         match: Callable[[Any], bool], *,
+                         mail_timeout: float, since_ms: int,
+                         allow_retry: bool = True) -> Any:
+        """等一封满足条件的邮件；超时后按 `RETRY_SEND_ON_TIMEOUT` **批内重发**再等。
+
+        返回 `Mail`，或 `None`（等不到，且重发也没救回来）。
+
+        `allow_retry=False` 用于码模式的**回捞链接**那一步：它是在**同一次**
+        发信周期内换凭据形态（站点把码回成了链接），不是"丢包"，
+        再发一次信既无必要、又白白增加站点压力。
+
+        🔴 **计时成功失败都写**（`rec.timings["mail_wait"]`，**累加** ——
+        码模式会调它两次）。旧实现在失败路径上完全不留耗时：50 批次复跑里
+        6 个超时账号各白等 300s、占总墙钟 58%，而台账里连"等了多久"都查不到，
+        只能靠 `mail_at − created_at` 反推。**任何"等待"都要留痕，成功失败都要留。**
+        """
+        t_wait = time.time()
+        tries = 0
+        while True:
+            m = self.mail.wait_for_mail(rec.email, match, timeout=mail_timeout,
+                                        interval=2.0, since_ms=since_ms)
+            if m is not None:
+                break
+            if (not allow_retry or not RETRY_SEND_ON_TIMEOUT
+                    or tries >= MAX_SEND_RETRIES):
+                rec.timings["mail_wait"] = (rec.timings.get("mail_wait", 0.0)
+                                            + time.time() - t_wait)
+                return None
+            tries += 1
+            self.log(f"  [login] ⚠ {mail_timeout:.0f}s 未收到确认邮件"
+                     f"（正常 3s 内必到 ⇒ 疑似丢包），批内重发第 {tries} 次")
+            since_ms = int(time.time() * 1000) - 5_000
+            try:
+                r = cl.send_login_email(rec.email, mode=self.login_mode)
+            except TypeSafeError as exc:
+                self.log(f"  [login] ⚠ 重发异常: {exc}")
+                rec.timings["mail_wait"] = (rec.timings.get("mail_wait", 0.0)
+                                            + time.time() - t_wait)
+                return None
+            if not r.ok:
+                self.log(f"  [login] ⚠ 重发 HTTP {r.status}")
+                rec.timings["mail_wait"] = (rec.timings.get("mail_wait", 0.0)
+                                            + time.time() - t_wait)
+                return None
+            rec.signup["send_retries"] = tries
+            self.log(f"  [login] 重发成功，再等 {mail_timeout:.0f}s")
+
+        rec.timings["mail_wait"] = (rec.timings.get("mail_wait", 0.0)
+                                    + time.time() - t_wait)
+        return m
 
     @staticmethod
     def _fail(rec: AccountRecord, stage: str, msg: str, *,
@@ -291,18 +368,23 @@ class StageMixin:
         try:
             r = cl.send_login_email(rec.email, mode=self.login_mode)
         except TypeSafeError as exc:
+            rec.timings["login"] = time.time() - t0
             self._fail(rec, "login", f"发信失败: {exc}")
             return None
         if not r.ok:
+            rec.timings["login"] = time.time() - t0
             self._fail(rec, "login",
                        f"发信 HTTP {r.status}: {r.data.get('page_text', '')[:120]}")
             return None
         rec.stages["send"] = "ok"
 
         if self.login_mode == MODE_LINK:
-            m = self.mail.wait_for_mail(rec.email, MATCH_LINK, timeout=mail_timeout,
-                                        interval=2.0, since_ms=since)
+            m = self._wait_with_retry(rec, cl, MATCH_LINK,
+                                      mail_timeout=mail_timeout, since_ms=since)
             if m is None:
+                # 🔴 失败路径也要写 `timings`（旧实现只在成功路径写 ⇒ 失败账号
+                # 的耗时是空的，300s 空等不留痕）。下同。
+                rec.timings["login"] = time.time() - t0
                 self._fail(rec, "login",
                            self._mail_timeout_msg(mail_timeout, code_first=False))
                 return None
@@ -310,20 +392,22 @@ class StageMixin:
             rec.signup["mail_at"] = m.received_at
             res = self._exchange_link(rec, m, cl)
             if res is None:
+                rec.timings["login"] = time.time() - t0
                 return None
         else:
-            m = self.mail.wait_for_mail(rec.email, MATCH_CODE, timeout=mail_timeout,
-                                        interval=2.0, since_ms=since)
+            m = self._wait_with_retry(rec, cl, MATCH_CODE,
+                                      mail_timeout=mail_timeout, since_ms=since)
             if m is None:
                 # 🔴 2026-09-20 实测：站点对**同一次**发码请求可能回魔法链接
                 # （主题 "Sign in to TypeSafe"）而不是 6 位码——同一账号 4 次发码里
                 # 就有 1 次是链接。此时继续等码必然超时；若直接判
                 # "未收到验证码邮件"，排查会被引向"D1 窗口被挤爆 / 邮箱坏了"，
                 # 而真相只是凭据形态换了一种。先回捞一次链接再判死。
-                m = self.mail.wait_for_mail(rec.email, MATCH_LINK,
-                                            timeout=LINK_FALLBACK_TIMEOUT,
-                                            interval=2.0, since_ms=since)
+                m = self._wait_with_retry(rec, cl, MATCH_LINK,
+                                          mail_timeout=LINK_FALLBACK_TIMEOUT,
+                                          since_ms=since, allow_retry=False)
                 if m is None:
+                    rec.timings["login"] = time.time() - t0
                     self._fail(rec, "login",
                                self._mail_timeout_msg(mail_timeout, code_first=True))
                     return None
@@ -331,6 +415,7 @@ class StageMixin:
                          f"（主题={m.subject!r}）—— 改走链接交换回捞")
                 res = self._exchange_link(rec, m, cl)
                 if res is None:
+                    rec.timings["login"] = time.time() - t0
                     return None
             else:
                 token, how = extract_otp(m.body)

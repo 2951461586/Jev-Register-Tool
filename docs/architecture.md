@@ -108,7 +108,7 @@ Jev-Register-Tool/
 | `parsing.py` | 150 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
 | `tempemail.py` | 183 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `typesafe.py` | 551 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
-| `stages.py` | 418 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
+| `stages.py` | 503 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
 | `runner.py` | 258 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 | `config` `ledger` `stages` `tempemail` |
 | `run_e2e.py` | 211 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` |
 | `selftest.py` | 119 | 自测**入口**：按顺序调用 `tests/` 下 22 个 `test_*` + 登记完整性元检查 | `tests.*` |
@@ -270,6 +270,7 @@ Jev-Register-Tool/
 | **`/api/auth/callback` 请求体键集** | `typesafe.auth_callback` | 🔴 站点是 **strict** schema：多一个未知键 ⇒ **全员**登录 `400 Bad request`（含已获批账号），而文案毫无指向性。2026-09-21 实测 —— 删掉站点已废弃的 `waitlistEmail` 才恢复（邮箱改由 token/session 在服务端推导）。键集由 `test_auth_callback_payload_shape` 逐键钉住 |
 | **`/setup/*` action id** | `typesafe.FALLBACK_SETUP_ACTIONS` | 🔴 仅降级用，**会随部署失效**。2026-09-20 实测该表里的 id 已全部作废（POST 回 `404 Server action not found.`）。首选永远是运行时抓隐藏域。**2026-09-21 起**：走降级必打告警，失败时 `error` 指向真因（不再只回 `HTTP 404`）—— 见 §6 与 `test_post_setup_degrade_is_observable` |
 | **onboarding 门禁链** | `typesafe.onboarding_gate` / `KNOWN_ONBOARDING_GATES` | 🔴 站点**随时增删步骤**，而且**自己都不稳定**：实测相邻两次 `GET /hook` 给出不同答案（`set-name` 与 200 交替）。⇒ ① 遇到不认识的步骤**只记录不判失败**（`console-survey` 就是这种：它的页面没有 `$ACTION_*` 隐藏域，我们提交不了）；② 同一跳重复出现就停，别空转；③ 判据一律不放在这里。改站点后跑 `tools/probes/probe_gate_chain.py` 看完整链路 |
+| **确认邮件超时阈值 + 批内重发** | `stages.MAIL_TIMEOUT` / `RETRY_SEND_ON_TIMEOUT` / `MAX_SEND_RETRIES` | 🔴 阈值是**针对某个延迟分布**的，站点改了发信节奏它就该变。2026-09-21 实测延迟 `P50 3.26s / max 4.57s` ⇒ 从 300s 下调到 **60s**。**阈值与重发是一个改动**：只降阈值不重发 ⇒ 偶发慢邮件被直接判死，成功率**反降**。两条都由 `test_mail_timeout_headroom` 钉住（含"真的重发了"的行为验证：数发信次数）。⚠️ 旧依据"实测延迟爬升到 198s"**已被证伪**（那是批量发的 waitlist 回执），别再引回去 |
 | **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 `stages` 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住（扫描面 `src/*.py` + `tools/**/*.py`）。⚠️ 还要覆盖**历史词汇**（`applied` / `confirmed` / `approved` / `code_sent`）—— 它们不再被写入，但历史台账里有，删掉会让那些行 `rank()` 落 0 分，任何一次重跑都能把凭据覆盖成空 |
 | **台账身份字段** | `ledger.EARNED_FIELDS` / `DICT_FIELDS` | 决定"哪些字段不许被空值覆盖"（`api_key` 等）与"哪些是累积型字典"。`DICT_FIELDS` 里的 `waitlist` 是**历史键名**（现名 `signup`），必须留着兜住老台账 |
 | **推理端点** | `verify_keys.API_URL` | 站点换端点 ⇒ 验收误判为"key 不可用" |
@@ -293,7 +294,7 @@ Jev-Register-Tool/
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
 | ~~无并发~~ | **已加** `--concurrency`（注册段） | `watch` 已删除（见下），不再有"刻意串行"的通路 |
-| ~~`pipeline.py` 零测试~~ | **已补** 186 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
+| ~~`pipeline.py` 零测试~~ | **已补** 192 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
 | ~~`typesafe.py` 混了 HTTP 客户端 + HTML/JS 解析~~ | **2026-09-20 已拆**：解析层独立成 `src/parsing.py`，`typesafe.py` 413 → **359** 行，只留 HTTP | — |
 | ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py` + `src/runner.py`。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | `typesafe.py` 现在 551 行（**变大了**，见下），若再膨胀优先拆它的 onboarding 段 |
 | ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` + `tools/tests/` 6 个文件。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
@@ -352,7 +353,7 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 186 项」，本文 §6 写「已补 186 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 192 项」，本文 §6 写「已补 192 项自测」。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。
 grep -rn "自测 [0-9]* 项\|[0-9]* 项自测\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
 ```

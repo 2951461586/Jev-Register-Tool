@@ -451,22 +451,34 @@ def test_post_setup_degrade_is_observable() -> None:
 
 
 def test_mail_timeout_headroom() -> None:
-    """🔴 回归护栏：等确认邮件的阈值不能调小。
+    """🔴 回归护栏：等确认邮件的阈值**必须有依据，且与重发成对**。
 
-    2026-09-20 连跑 10 批次的实测延迟（秒）：
-        41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 / ∞
-    后两条在阈值 180s 处被判 `failed`，但收件箱复核显示它们分别**在超时后
-    12s / 18s 就落了库** —— 是假阴性。台账里多两条"失败"，运营者会据此重投。
+    2026-09-21 依据**实测延迟分布**把阈值从 300s 下调到 60s ——
+    43 个成功账号实测（`signup.mail_at ÷ 1000 − created_at`，50 批次跑批）：
+        min 2.66s · P50 3.26s · P90 3.80s · max 4.57s
+    ⇒ 60s 仍有 **13 倍**余量。
 
-    阈值必须留出实测最大延迟的余量；这条断言把"不许调回 180s"钉在测试里。
+    ⚠️ 旧断言守的是「≥ 240s，因为 2026-09-20 实测最大延迟 198s」——
+    那个 198s **当天就被证伪**：那批是**批量发出**的 waitlist 回执
+    （一次性涌入 47 封、延迟约 25 分钟），被误读成"单调爬升"；
+    而且那条链路（等审批回执）**已随邀请制取消整体删除**。
+
+    ⇒ 本用例不再钉死具体秒数（那是注定漂移的第二份真源），改成守**设计意图**：
+    ① 阈值有下限（防手滑调到秒级）；② 降阈值**必须**配批内重发。
     """
     print("\n[编排：确认邮件等待阈值]")
 
     d = inspect.signature(st.StageMixin.stage_login).parameters["mail_timeout"].default
-    check("★ 默认阈值 ≥ 240s（实测最大延迟 198s，180s 会误判成失败）",
-          isinstance(d, (int, float)) and d >= 240, f"default={d}")
+    check("★ 默认阈值有下限（防手滑调到秒级，把慢邮件直接判死）",
+          isinstance(d, (int, float)) and d >= 30, f"default={d}")
     check("★ 默认阈值取自常量 MAIL_TIMEOUT（单一真源，别写字面量）",
           d == pl.MAIL_TIMEOUT, f"{d} vs {pl.MAIL_TIMEOUT}")
+    # 🔴 本轮的核心约束：**降阈值与重发是一个改动，不是两个**。
+    # 只降阈值不重发 ⇒ 偶发的慢邮件被直接判死，成功率反而**下降**。
+    check("★ 🔴 批内重发已开启（降阈值的**配套**，缺了它成功率会反降）",
+          st.RETRY_SEND_ON_TIMEOUT, "RETRY_SEND_ON_TIMEOUT=False")
+    check("★ 重发次数有界（防死循环把站点打爆）",
+          1 <= st.MAX_SEND_RETRIES <= 3, f"MAX_SEND_RETRIES={st.MAX_SEND_RETRIES}")
 
     # 超时文案必须点明"丢包 + 链接 7 天有效 ⇒ 重跑比改请求有效"。
     # 否则运维只会看到一句"没收到"，而它的正确处置（重跑）在假阴性场景下
@@ -479,6 +491,23 @@ def test_mail_timeout_headroom() -> None:
           "丢包" in rec.error and "7 天" in rec.error, rec.error)
     check("★ 超时文案带上了邮箱接口的轮询计数（区分'读不出来'与'没发'）",
           "轮询" in rec.error and "5xx" in rec.error, rec.error)
+
+    # ── 行为验证：超时后**真的**重发了，而不是只把常量改了个数 ──────────
+    # 🔴 为什么必须有这条：常量改对、重发逻辑没接上线，是最容易出现的
+    # "看着改了其实没生效"。只有数**发信次数**才钉得住它。
+    with offline(mails=[]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        r2 = pl.AccountRecord(key="", email="")
+        pipe.stage_login(r2, mail_timeout=0.2)
+    check("★ 超时后真的重发了（发信次数 == 1 + 重发上限）",
+          _FakeTypeSafe.send_calls == 1 + st.MAX_SEND_RETRIES,
+          f"send_calls={_FakeTypeSafe.send_calls}")
+    check("★ 重发次数记进台账（signup.send_retries，便于事后复盘）",
+          r2.signup.get("send_retries") == st.MAX_SEND_RETRIES, str(r2.signup))
+    check("★ 🔴 失败路径也写了耗时（mail_wait / login）—— 旧实现这里是**空的**",
+          "mail_wait" in r2.timings and "login" in r2.timings, str(r2.timings))
+    check("★ 重发后仍超时 ⇒ 判 failed（重发不是「无限续命」）",
+          r2.status == "failed", r2.status)
 
 
 def test_resume_skips_keyed() -> None:

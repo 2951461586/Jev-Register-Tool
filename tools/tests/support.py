@@ -112,7 +112,13 @@ class _FakeTypeSafe:
     #: 用于断言"码模式回捞链接"时确实走的是链接分支。
     last_token_type = ""
 
+    #: `send_login_email` 的累计调用次数（**类级**；`offline()` 进入时清零）。
+    #: 用来断言"超时后**真的**重发了"，而不是只把常量改了个数 ——
+    #: 常量改对但重发没接上线，是本轮最容易出现的"看着改了其实没生效"。
+    send_calls = 0
+
     def send_login_email(self, email, mode="code"):
+        type(self).send_calls += 1
         self.email = email
         return Result(ok=True, status=200, stage="send_login_email",
                       data={"page_text": "Check your email"})
@@ -191,6 +197,7 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
     _FakeTypeSafe.callback_body = dict(ts_body or {})
     _FakeTypeSafe.fail_key = fail_key
     _FakeTypeSafe.onboarding_ok = onboarding_ok
+    _FakeTypeSafe.send_calls = 0
     fake = {
         "TypeSafeClient": _FakeTypeSafe,
         "TempMailClient": _FakeTempMailClient,

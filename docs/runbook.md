@@ -519,9 +519,12 @@ $PY tools/run_e2e.py --mode claim --email <已获批账号> --send
 
 1. **D1 直查**（`tools/probes/probe_worker_health.py` 第 2 节）：看 `newest` 距现在多久。
    若 `newest` 很近 ⇒ 收信链路正常，问题在**发信**侧。
-2. **看那封"唯一到的邮件"的正文**：若主题是
-   `Welcome to TypeSafe — confirm your email`、正文 `finish creating your account`，
-   说明站点认为该邮箱**还没有账号**（未获批的**弱**信号 —— 站点不稳定时不足以定论）。
+2. 🔴 **别拿 `Welcome to TypeSafe — confirm your email` 当"未获批"信号 —— 它恰恰是凭据。**
+   它是 Stytch 的**魔法链接**（`stytch_token_type=magic_links`、`finish creating your account`、
+   **7 天有效、一次性**）；`mailrules.LINK_RULES` 里的 `welcome_confirm` 就是它。
+   2026-09-21 实测它**发给了两个最终拿到 key 的账号**，也发给了一个已获批待领号的账号
+   ⇒ **与获批状态无关**。曾据正文 `finish creating your account` 把它误判成
+   "站点认为该邮箱还没有账号"，方向**是反的**。
 3. **看本批申请确认邮件是否都到了**（`You're on the waitlist for Jev!`）。
    都到了 ⇒ **申请段正常**，问题只在登录段。
 
@@ -530,6 +533,36 @@ $PY tools/run_e2e.py --mode claim --email <已获批账号> --send
 **在已获批和待审批账号里都出现** ⇒ 与账号状态无关。
 
 **处置**：等站点发信恢复后重跑 `tools/resume_pending.py`。故障期间重试只是浪费请求。
+
+### 4.11 🔑 判"是否获批"的**唯一可信**方法：直接实测登录（2026-09-21）
+
+**背景**：`stage_wait_approval` 等的是获批邮件 `TypeSafe AI: Your account is ready`，
+但共享 Worker 的 D1 窗口只有 100 行、被同机邻居项目刷屏 ⇒ 这封信会被挤掉。
+本批 50 个账号**全部停在 `confirmed`，一封获批邮件都没见着**。
+
+🔴 **「窗口里没看到获批邮件」≠「未获批」**。可信判据只有**站点侧实测**：
+
+| `POST /api/auth/callback` 响应 | 含义 |
+|---|---|
+| `200` + `{"success":true,"userId":…,"org_memberships":[…]}` | **已获批**（白名单通过、会话已建立） |
+| `403 {"error":"Access restricted"}` | **未获批**（业务门槛，不是技术故障） |
+| `401 Authentication failed` | 凭据一次性、**已被用过** ⇒ 换一封，**别当判据** |
+
+⇒ 对无 key 的账号，**不要等获批邮件，直接跑登录**。
+
+🔴 **并且要用上"已经躺在收件箱里"的魔法链接。**
+`stage_login` 的 `wait_for_mail(since_ms=now-5s)` 只认**请求之后到达**的信
+⇒ 上一轮收到、当时没消费掉的链接永远用不上，而它 **7 天有效**。
+2026-09-21 实测：一个账号的 `welcome_confirm` 链接在收件箱里躺了 35 分钟，
+用它走 `exchange_magic_link → auth_callback` **一次就拿到 200**
+（此前该账号一直报 `未收到验证码邮件`）。
+
+工具：`python tools/relogin_pending.py --email <邮箱> --rounds 3 --wait 180`
+（先消费历史链接 → 再发新的 → 等码/链接 → onboarding → 建 key → 落账）。
+`--all-pending` 对台账里所有无 key 账号跑。**刻意串行，别加并发。**
+
+⚠️ **别把 `--mode claim --send` 的"已发出"当"发码成功"** —— 站点会**接受请求却不发信**
+（实测送达率 ~8%，已获批账号也在丢信）。判据落在**信到了没**，不是**站点回没回 200**。
 
 ## 5. 别做这些事
 

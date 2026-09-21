@@ -54,6 +54,11 @@ from typing import Any, Callable
 
 from . import config
 from .ledger import Ledger
+# 🔴 邮箱后端的**两个**实现都必须在**模块级**名字上 import（不能延迟 import、
+#    更不能写成 `remail.RemailClient()`）—— 它们是 `tools/tests/support.py::offline()`
+#    的 patch 接缝，而 monkeypatch 只认"读这个符号的模块的 globals"。
+#    详见 `stages.py` 头部的接缝说明与 `support._PATCH_NAMES` 的断言。
+from .remail import RemailClient, RemailError
 # 🔴 `AccountRecord` 刻意定义在 `stages`（不在本模块）：依赖必须单向
 #    runner → stages，反过来就成环了。这里导入是为了让 `from src.runner import
 #    AccountRecord` 继续可用（生产与自测都这么引）。
@@ -73,20 +78,75 @@ from .typesafe import MODE_CODE
 #: 并发时多线程会同时 print，不加锁会在一行中间交错，日志直接没法读。
 _LOG_LOCK = threading.Lock()
 
+# ── 邮箱后端选择（2026-09-21）──────────────────────────────────────────
+#: 可选后端名。**唯一真源** —— 各 CLI 入口的 `--mail-backend` 都取它做 choices，
+#: 不要在各处各写一份字面量（加后端时会漏改某一处，而漏改的入口**不报错**，
+#: 只是静默回落到默认后端）。
+MAIL_BACKENDS = ("cf", "remail")
+#: 默认后端。刻意仍是 CF Worker —— 它是当前跑批在用、成本为零的那一个；
+#: Remail 是**付费**后端（每建一个邮箱扣积分），不该是默认值。
+DEFAULT_MAIL_BACKEND = "cf"
+
+
+def make_mail_client(backend: str = DEFAULT_MAIL_BACKEND) -> Any:
+    """按名字造一个邮箱客户端。
+
+    两个后端的**公开接口是同一套**（`create_mailbox` / `list_mails` /
+    `wait_for_mail` / `scan_all` / `health` / `stats`），所以 `stages` 层
+    不需要知道用的是哪个 —— 这就是 `remail.py` 刻意对齐 `tempemail.py` 的目的。
+    差异全部收在各自模块内部（`remail.py` 头部列了四条根本差异）。
+
+    ⚠️ 未知名字**抛 ValueError 而不是回落到默认值**：静默回落会让
+    `--mail-backend remial` 这种拼写错误变成"跑了一批 CF 邮箱"，
+    而且因为不报错，要等很久以后对账时才发现。
+    """
+    name = (backend or DEFAULT_MAIL_BACKEND).strip().lower()
+    if name == "cf":
+        return TempMailClient()
+    if name == "remail":
+        return RemailClient()
+    raise ValueError(f"未知邮箱后端 {backend!r}（可选：{'、'.join(MAIL_BACKENDS)}）")
+
+
+def default_mail_domain(backend: str = DEFAULT_MAIL_BACKEND) -> str:
+    """该后端的默认地址后缀。
+
+    🔴 两个后端的 `create_mailbox(domain)` 参数**语义不同**，不能混用：
+      · CF     —— `domain` 是**完整域名**（如 `example-mail.test`）
+      · Remail —— `domain` 是商品名/`emailSuffix`（如 `domain` / `outlook.com`），
+                  服务端明确**不接受完整邮箱地址**
+    ⇒ 把 CF 的域名传给 Remail 会被服务端拒掉；反过来也会买到意外商品。
+    所以默认值必须按后端取，而不是各入口自己 `or config.TEMPMAIL_DOMAIN`。
+    """
+    return (config.REMAIL_EMAIL_SUFFIX if (backend or "").strip().lower() == "remail"
+            else config.TEMPMAIL_DOMAIN)
+
 
 class Pipeline(StageMixin):
-    def __init__(self, *, mail: TempMailClient | None = None,
+    def __init__(self, *, mail: Any | None = None,
+                 mail_factory: Callable[[], Any] | None = None,
+                 backend: str = DEFAULT_MAIL_BACKEND,
                  ledger: Ledger | None = None,
                  success_ledger: Ledger | None = None,
                  domain: str | None = None,
                  login_mode: str = MODE_CODE, verbose: bool = True):
-        self.mail = mail or TempMailClient()
+        self.backend = (backend or DEFAULT_MAIL_BACKEND).strip().lower()
+        #: 造"同款"邮箱客户端的方式。`_clone()` 靠它保证并发 worker 用的是
+        #: **同一个后端** —— 见 `_clone()` 的 🔴。
+        self._mail_factory: Callable[[], Any] = (
+            mail_factory or (lambda: make_mail_client(self.backend)))
+        # ⚠️ 判断写成 `is not None` 而不是 `mail or ...`：显式传进来的客户端
+        #    必须被采纳。用 `or` 的话，将来任何一个客户端定义了 `__bool__`/`__len__`
+        #    就会被**静默换成默认后端**（正是本项目最忌讳的"不报错的替换"）。
+        self.mail = mail if mail is not None else self._mail_factory()
         self.ledger = ledger or Ledger(config.LEDGER_PATH)
         # 成功数据单独落一份到 `result/`（**交付物**），与 `exports/` 的运行台账分开：
         # 台账要留全部历史（含失败的，便于复盘），交付物只该有成功的。
         self.success_ledger = success_ledger if success_ledger is not None \
             else Ledger(config.SUCCESS_LEDGER_PATH)
-        self.domain = domain or config.TEMPMAIL_DOMAIN
+        # 默认后缀**按后端取** —— 两个后端的 `domain` 参数语义不同，见
+        # `default_mail_domain()` 的 🔴。
+        self.domain = domain or default_mail_domain(self.backend)
         self.login_mode = login_mode
         self.verbose = verbose
 
@@ -98,11 +158,20 @@ class Pipeline(StageMixin):
     def _clone(self) -> "Pipeline":
         """给一个并发 worker 用的**独立**实例。
 
-        独立是硬要求，不是优化：`TempMailClient` 持有 `requests.Session`
+        独立是硬要求，不是优化：邮箱客户端持有 `requests.Session`
         （不保证线程安全），且 `stats` 计数器会被多线程搅乱。
         唯一共享的是 `Ledger`（运行台账与成功台账）—— 它的读写都有锁。
+
+        🔴 **必须显式传 `mail`**（2026-09-21 修）：
+        以前这里只传 ledger/domain/login_mode，`mail` 走 `Pipeline.__init__`
+        的默认值 ⇒ **每个 worker 都会新建一个 CF 客户端**。串行跑（`concurrency=1`
+        走的是另一条路径）永远复现不出来，只有在 `--concurrency > 1` 且
+        **主实例不是 CF 后端**时才暴露 —— 表现是"一半账号建在 CF、一半建在
+        Remail"，而且不报任何错。这正是本项目最忌讳的静默替换。
+        现在改为从 `self._mail_factory()` 造同款客户端，后端由 `self.backend` 决定。
         """
-        return Pipeline(ledger=self.ledger, success_ledger=self.success_ledger,
+        return Pipeline(mail=self._mail_factory(), backend=self.backend,
+                        ledger=self.ledger, success_ledger=self.success_ledger,
                         domain=self.domain, login_mode=self.login_mode,
                         verbose=self.verbose)
 
@@ -175,7 +244,12 @@ class Pipeline(StageMixin):
             if cl is None:
                 return rec
             self.stage_create_key(rec, cl, name=name)
-        except TempMailError as exc:
+        except (TempMailError, RemailError) as exc:
+            # 两个后端**各抛自己的异常类型**（刻意不让 `RemailError` 继承
+            # `TempMailError` —— 那会让"CF Worker 的 5xx 语义"看起来也适用于
+            # Remail，而 Remail 的失败里还夹着"余额不足 / 库存不足"这类
+            # 完全不同的处置）。这里并列捕获，只为把错误文案统一成
+            # "邮箱服务异常"，不让后端细节泄漏到台账分类里。
             rec.status = "failed"
             rec.error = f"邮箱服务异常: {exc}"
         except Exception as exc:  # noqa: BLE001 —— 兜底，保证台账一定写得进去

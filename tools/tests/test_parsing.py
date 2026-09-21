@@ -127,3 +127,39 @@ def test_js_object() -> None:
         check("[负对照] json.loads 应该失败", False, "居然解析成功了")
     except json.JSONDecodeError:
         check("[负对照] json.loads 确实失败（所以不能用 JSON 解析）", True)
+
+
+def test_magic_link_html_entity() -> None:
+    """魔法链接提取必须做 **HTML 实体反转义**。
+
+    2026-09-21 接入 Remail（第二个邮箱后端）时实测踩到：两个后端给的正文形态
+    **不同** —— CF Worker 是纯文本，Remail 是 **HTML**，后者的链接里 `&`
+    被转义成 `&amp;`。不还原的话，提取出的查询串是
+
+        ?public_token=X&amp;stytch_token_type=magic_links&amp;token=Y
+
+    解析方（Stytch）看到的参数名是 `amp;stytch_token_type` / `amp;token`
+    ⇒ **等于根本没传 token**，交换必然失败，而报错读起来像"链接无效/过期"，
+    会把排查引向"重新发信"，白烧账号。
+
+    ⚠️ 样本用的是**实测抓到的原文形态**（真实参数顺序 + 真实 `&amp;`），不是编的。
+    """
+    print("\n[魔法链接：HTML 实体反转义]")
+    html_body = ('<a href="https://login.typesafe.ai/v1/magic_links/redirect'
+                 '?public_token=public-token-live-abc&amp;stytch_token_type=magic_links'
+                 '&amp;token=TOK123">Confirm</a>')
+    u = ps.extract_magic_link(html_body)
+    check("★ HTML 正文里的链接被反转义（&amp; → &）",
+          "&amp;" not in u and "&token=TOK123" in u, u)
+    check("★ token 能正常抽出（不带上 `amp;` 前缀）",
+          ts.TypeSafeClient.token_from_redirect_url(u) == "TOK123", u)
+    check("★ 参数名没被污染成 `amp;token`", "amp;token" not in u, u)
+
+    # 负对照：纯文本形态（CF Worker 的正文）必须**逐字不变**
+    plain = ("https://login.typesafe.ai/v1/magic_links/redirect"
+             "?stytch_token_type=magic_links&token=PLAIN1")
+    check("[负对照] 纯文本形态不受影响（CF 后端零回归）",
+          ps.extract_magic_link(plain) == plain, ps.extract_magic_link(plain))
+    check("空输入返回空串（不抛异常）", ps.extract_magic_link("") == "")
+    check("正文里没有链接时返回空串",
+          ps.extract_magic_link("hello, no link here") == "")

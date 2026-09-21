@@ -3,7 +3,8 @@
 TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onboarding → 建 API Key → 入库**
 全链路工具，**纯 HTTP、无浏览器**。
 
-结合 CF Temp Email Worker 收信，可直接批量出号，**没有需要等待的外部阻断点**。
+收信支持**两个后端**（CF Temp Email Worker / Remail 聚合），可直接批量出号，
+**没有需要等待的外部阻断点**。
 
 > 🔴 **2026-09-21：邀请制已取消。** 链路从 7 段缩到 4 段 —— 站点不再有
 > "投申请 / 等回执 / 等人工审批"，注册后直接收到
@@ -25,6 +26,18 @@ TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onb
 > ⚠️ 报速率必须同时报**当批丢包率**：本批丢包 9%（上批 0%），重发等待拖长了尾部。
 > 依据与复算命令见 `docs/optimization-2026-09-21.md`。
 
+> ✅ **2026-09-21 接入 Remail**（`--mail-backend remail`，第二个邮箱后端）：
+> 实测 1 单 `outlook.com` 走完全链路拿到 key，验收 `HTTP 200 / model=jev-1.13.0`。
+> 过程中踩到两个**只在这个后端上出现**的坑（都已修 + 已加护栏）：
+>
+> 1. 它的 `bodyPreview` 是**截断预览**（实测 248 字符，**完全不含链接**）⇒
+>    必须再取全文（4012 字符）才能拿到魔法链接，否则报"魔法链接邮件里没找到链接"
+>    —— 把"我们只读了预览"说成"站点没发链接"；
+> 2. 全文是 **HTML**，链接里的 `&` 被转义成 `&amp;` ⇒ 不还原的话 token 参数名
+>    变成 `amp;token`，**等于根本没传 token**，交换必失败且报错像"链接已过期"。
+>
+> 详见 `src/remail.py` 头注与 `docs/optimization-2026-09-21.md` §7.4。
+
 > ⚠️ 两套口径**行数天然不等**，别拿它们相等当对账判据：
 > `result/success.jsonl` 是**账号级**（按邮箱去重 ⇒ 388 行）；
 > `result/keys.txt` 是**凭据级**（同账号重跑会拿到第二把 key ⇒ 453 条）。
@@ -43,12 +56,22 @@ TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onb
 
 | 变量 | 必填 | 用途 |
 |---|---|---|
-| `TEMPMAIL_ADMIN_KEY` | ✅ | 建邮箱 / `/admin/*` |
-| `TEMPMAIL_BASE` | ✅ | Worker 根地址（`https://<子域>.workers.dev`） |
-| `TEMPMAIL_DOMAIN` | ✅ | 建邮箱用哪个域名 |
+| `TEMPMAIL_ADMIN_KEY` | ✅ 后端=cf | 建邮箱 / `/admin/*` |
+| `TEMPMAIL_BASE` | ✅ 后端=cf | Worker 根地址（`https://<子域>.workers.dev`） |
+| `TEMPMAIL_DOMAIN` | ✅ 后端=cf | 建邮箱用哪个域名（**完整域名**） |
+| `REMAIL_API_KEY` | ✅ 后端=remail | remail.aishop6.com 的 `rk-` 开头 key |
+| `REMAIL_BASE` | ✅ 后端=remail | 默认 `https://remail.aishop6.com` |
+| `REMAIL_PROJECT_ID` | ⬜ | TypeSafe 在 Remail 上的项目 id（默认 `155`） |
+| `REMAIL_EMAIL_SUFFIX` | ⬜ | 商品后缀（默认 `outlook.com`）。⚠️ **不是完整邮箱地址** |
+| `REMAIL_SERVICE_MODE` | ⬜ | `code`=短效接码 10 分钟窗口（默认）/ `purchase`=长效购买 |
 | `CF_API_TOKEN` | ⬜ | 只有 `tools/probes/*` 诊断脚本用；主流程不需要 |
 | `CF_ACCOUNT_ID` / `CF_D1_ID` | ⬜ | 同上 |
 | `TEMPMAIL_DOMAINS` | ⬜ | `probe_email_routing.py` 要查的域名；留空则问 Worker 的 `/health` |
+
+> **两个邮箱后端二选一**：`--mail-backend cf`（默认，免费）或 `remail`（**付费**）。
+> 启动校验**按后端走** —— 用 `cf` 跑批不会被 Remail 的缺失项拦住，反之亦然。
+> 两边接口是同一套（`create_mailbox` / `list_mails` / `wait_for_mail`），
+> 所以 `stages` 层不知道用的是哪个。差异与坑见 `src/remail.py` 头注。
 
 ## 快速开始
 
@@ -57,12 +80,14 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
-$PY tools/selftest.py                  # 自测 192 项，离线可跑
+$PY tools/run_e2e.py --doctor --mail-backend remail   # Remail 体检：只读，**不下单**
+$PY tools/selftest.py                  # 自测 235 项，离线可跑
 $PY tools/run_e2e.py --count 5         # ★ 全链路：建邮箱 → 发信 → 登录 → 建 key
 $PY tools/run_e2e.py --count 10 --concurrency 4   # 并发
+$PY tools/run_e2e.py --count 1 --mail-backend remail  # ★ 换 Remail 后端（**每单扣积分**）
 $PY tools/run_e2e.py --mode resume --email a@b.com --email c@d.com   # 对已知邮箱补跑
-$PY tools/run_e2e.py --mode scan       # 诊断：列出邮箱窗口内全部邮件并按规则分桶
-$PY tools/verify_keys.py               # ★ 验收：真打一次推理接口
+$PY tools/run_e2e.py --mode scan       # 诊断：列出窗口内全部邮件并按规则分桶（**仅 cf**）
+$PY tools/verify_keys.py               # ★ 验收：真打推理接口 + 导出 result/ 下 4 份交付物
 ```
 
 > `--concurrency` 对整条链路有效（每个 worker 一个独立会话 + 独立收件箱索引端点，
@@ -71,6 +96,18 @@ $PY tools/verify_keys.py               # ★ 验收：真打一次推理接口
 > 🔴 **`--mode resume` 默认跳过台账里已有 `api_key` 的地址**（`skip_keyed=True`）——
 > 重跑会给同一账号**造出第二把 key**，而 `Ledger.load()` 按邮箱去重、末行胜出，
 > 交付物里会少一把。确需重跑请显式传 `skip_keyed=False`（只有库内调用有这个参数）。
+>
+> ⚠️ **`--mail-backend remail` 是付费后端**：`create_mailbox()` = **真实下单扣积分**
+> （TypeSafe 项目下 `outlook.com` 实测 8 积分/单）。因此：
+>
+> - `--doctor` 对 remail **只做只读检查**（key 是否有效 + 余额 + 当前商品配置），
+>   **不会**偷偷下单 —— 体检不该花钱，要验证下单请直接 `--count 1`；
+> - **补跑时后端必须与建这些邮箱时一致**：Remail 的取件凭证 `serviceToken`
+>   是 per-order 的（存在 `result/remail_orders.jsonl`），CF 建的地址它取不了，
+>   反之亦然。`resume_pending.py` 会在开跑前把不匹配的地址数报出来；
+> - 站点侧还有一条硬限制：`code` 模式的邮箱是 **10 分钟窗口**
+>   （`codeWindowMinutes: 10`）⇒ 下单后要尽快跑完，**过窗口就收不到新信**，
+>   只能靠 `relogin_pending.py` 复用窗口内已收到的历史链接。
 
 ## 链路与可自动化程度
 
@@ -109,6 +146,9 @@ src/                       库代码
   mailrules.py             收件规则表 + OTP 抽取（零内部依赖的纯叶子）
   ledger.py                JSONL 台账（并集合并 / 幂等 / 等级语义）
   tempemail.py             CF Worker 收信
+  remail.py                Remail 聚合收信（**第二个邮箱后端**，接口刻意对齐
+                           `tempemail`：`create_mailbox` / `list_mails` /
+                           `wait_for_mail`）⇒ `stages` 层无感切换
   parsing.py               页面/邮件文本解析（`$ACTION_*`、JS 字面量、魔法链接）——
                            **纯函数、零第三方依赖**，可脱离 `requests` 单测
   typesafe.py              Server Action / Stytch / onboarding / 建 Key（只发 HTTP）
@@ -116,6 +156,7 @@ src/                       库代码
                            出网动作全在这里：login / onboarding / 建 Key
   runner.py                ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入
                            继承 `stages.StageMixin`，`stages` 不反向依赖它
+                           另有邮箱后端工厂 `make_mail_client(backend)`
 
 tools/                     入口脚本
   _bootstrap.py            按标记文件定位仓库根，统一 sys.path
@@ -125,14 +166,14 @@ tools/                     入口脚本
   resume_pending.py        ★ 补跑台账里还没拿到 key 的账号（幂等，可反复跑）。
                            进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
   normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-  selftest.py              自测**入口**：只做聚合与调度（22 个用例段在 `tests/`）
-  tests/                   自测本体（6 个文件 1552 行，192 项，含负对照，**全程离线**）
+  selftest.py              自测**入口**：只做聚合与调度（24 个用例段在 `tests/`）
+  tests/                   自测本体（6 个文件 1841 行，235 项，含负对照，**全程离线**）
     __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
     support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
-    test_parsing.py          解析层（紧凑 JSON / Server Action / JS 字面量）
+    test_parsing.py          解析层（紧凑 JSON / Server Action / JS 字面量 / HTML 实体）
     test_ledger.py           台账（并集合并 / 状态词汇 / 身份字段归一化）
     test_mailrules.py        收件规则 + OTP 抽取
-    test_orchestration.py    编排层（错误码分流 / 登录 / 门禁 / 并发 / 重跑去重）
+    test_orchestration.py    编排层（错误码分流 / 登录 / 门禁 / 并发 / 邮箱后端选择）
   verify_keys.py           ★ 验收 + 导出可用凭据
   probes/                  一次性诊断探针（只读，除注明外都不写台账）
     probe_gate_chain.py          ★ 逐跳走 onboarding 门禁 + 最后试建 key
@@ -158,11 +199,16 @@ evidence/                  录制的证据（har / eml / 抓来的第三方 bund
 exports/                   运行台账与记录：ledger.jsonl / run_*.json / *.log / _diag/
 result/                    ★ 交付物（**只放成功的**）：见下方口径说明
                            · success.jsonl       成功**账号**（账号级：每邮箱一行）
-                           · keys.txt            凭据清单（凭据级：每把 key 一行）
+                           · keys.txt            凭据清单（凭据级：`email----key----id`）
                            · keys_verified.json  机器可读验收结果（凭据级）
+                           · apikeys.txt         纯 api_key 一行一个（keys.txt 的**无元数据版**）
                            ⚠️ 两套口径**行数天然不等**：同账号重跑会拿到第二把 key，
                               账号级会按邮箱合并掉、凭据级两把都留。交付凭据以
                               keys.txt 为准，别拿三者行数相等当对账判据。
+                           ⚠️ `apikeys.txt` 与 `keys.txt` 由**同一次** verify 写出，
+                              故两者**集合恒等**（只差元数据形态）—— 可当交叉对账用。
+                           · remail_orders.jsonl  **不是交付物**：Remail 的 per-order
+                              取件凭证（`serviceToken`），补跑跨进程取件靠它。
 ```
 
 > **`exports/` 与 `result/` 的分工**（2026-09-20 起）：台账要留**全部**尝试

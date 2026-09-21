@@ -22,6 +22,11 @@ Jev-Register-Tool/
 │   ├── mailrules.py           收件规则表 + OTP 抽取（纯叶子，零内部依赖）
 │   ├── ledger.py              JSONL 台账：并集合并 / 幂等 / 等级语义
 │   ├── tempemail.py           CF Temp Email Worker 客户端
+│   ├── remail.py              Remail 聚合客户端（**第二个邮箱后端**）。
+│   │                          接口刻意对齐 `tempemail`（`create_mailbox` /
+│   │                          `list_mails` / `wait_for_mail`）⇒ `stages` 层无感切换；
+│   │                          复用它的 `Mail` / `Stats`，但**异常类型独立**
+│   │                          （`RemailError` 不继承 `TempMailError`）
 │   ├── parsing.py             页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 魔法链接）
 │   │                          **纯函数、零第三方依赖** ⇒ 可脱离 `requests` 单测
 │   ├── typesafe.py            Server Action / Stytch / onboarding / 建 Key（只发 HTTP）
@@ -29,6 +34,7 @@ Jev-Register-Tool/
 │   │                          出网动作**全在这里**：login / onboarding / 建 Key
 │   └── runner.py              ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入
 │                              继承 `stages.StageMixin`；`stages` **不**反向依赖它
+│                              另有邮箱后端工厂 `make_mail_client(backend)`
 │
 ├── tools/                     入口脚本（含命令行逻辑）
 │   ├── _bootstrap.py          按标记文件定位仓库根，统一 sys.path
@@ -39,15 +45,15 @@ Jev-Register-Tool/
 │   │                          **只信它** —— 走 `Ledger.load()` 合并视图，
 │   │                          不是"末行胜出"（那会让重跑失败把计数压低）
 │   ├── normalize_ledger.py    修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-│   ├── selftest.py            自测**入口**（119 行）：只做聚合与调度 + 登记完整性元检查
-│   ├── tests/                 自测本体（6 个文件 1511 行，按被测对象分）
+│   ├── selftest.py            自测**入口**（126 行）：只做聚合与调度 + 登记完整性元检查
+│   ├── tests/                 自测本体（6 个文件 1841 行，235 项，按被测对象分）
 │   │   ├── __init__.py        仅为让 `tests` 可当包导入（**不是** pytest 测试包）
 │   │   ├── support.py         共享夹具：`check()` 计数 + 离线替身 + 模块别名转手
-│   │   ├── test_parsing.py    解析层：紧凑 JSON / Server Action / JS 字面量
+│   │   ├── test_parsing.py    解析层：紧凑 JSON / Server Action / JS 字面量 / HTML 实体
 │   │   ├── test_ledger.py     台账：并集合并 / 状态词汇 / 身份字段归一化
 │   │   ├── test_mailrules.py  收件规则 + OTP 抽取
-│   │   └── test_orchestration.py  编排层：错误码分流 / 登录 / 门禁 / 并发 / 重跑去重
-│   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
+│   │   └── test_orchestration.py  编排层：错误码分流 / 登录 / 门禁 / 并发 / 邮箱后端选择
+│   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出 4 份交付物
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── audit_keys_against_site.py  站点侧对账：`GET /api/api-keys` vs 交付物
 │       ├── probe_gate_chain.py       ★ 逐跳走 onboarding 门禁，打完整链路 + 试建 key
@@ -65,6 +71,7 @@ Jev-Register-Tool/
 │   ├── architecture.md        本文件
 │   ├── mail-filters.md        收件过滤规则（任务交付）
 │   ├── runbook.md             怎么跑 + 故障处置
+│   ├── optimization-2026-09-21.md  性能优化实测（并发/超时/重发 + §7.4 Remail 接入）
 │   ├── audit-2026-09-20.md    一轮审计（**时间点快照**：37/96 项，数字刻意不改）
 │   └── audit-2026-09-20-round2.md  二轮审计 + 批次 A/B/C 修复状态（§0.5 §0.6 §0.7）
 │
@@ -81,7 +88,11 @@ Jev-Register-Tool/
     ├── success.jsonl          成功**账号**（append-only，按邮箱去重 ⇒ 每邮箱一行）
     │                          ⚠️ 账号级：同账号的第二把 key 会被合并；凭据级看 keys.txt
     ├── keys.txt               email----api_key----api_key_id（明文，人可读）
-    └── keys_verified.json     机器可读的验收结果
+    ├── keys_verified.json     机器可读的验收结果
+    ├── apikeys.txt            纯 api_key，一行一个（keys.txt 的**无元数据版**）
+    │                          ⚠️ 与 keys.txt 由**同一次** verify 写出 ⇒ 两者集合恒等
+    └── remail_orders.jsonl    ⚠️ **不是交付物**：Remail 的 per-order 取件凭证
+                               （`serviceToken`）。跨进程补跑取件靠它，别当垃圾清掉
 ```
 
 **分层原则**：`src/` 只放可复用的库代码，`tools/` 只放入口与一次性探针。
@@ -102,22 +113,23 @@ Jev-Register-Tool/
 
 | 模块 | 行数 | 职责 | 内部依赖 |
 |---|---:|---|---|
-| `config.py` | 117 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` 启动校验 | 无 |
+| `config.py` | 176 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` / `validate_remail()` 启动校验 | 无 |
 | `mailrules.py` | 288 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
 | `ledger.py` | 244 | 台账读写、并集合并、等级语义 | 无 |
-| `parsing.py` | 150 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
-| `tempemail.py` | 183 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
+| `parsing.py` | 160 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
+| `tempemail.py` | 183 | CF Worker 收信（索引端点、5xx 重试、计数） | `config` |
+| `remail.py` | 385 | Remail 聚合收信（**第二个后端**：下单 / 取件 / 取全文 / 凭证落盘） | `config` `tempemail`（复用 `Mail` `Stats`） |
 | `typesafe.py` | 551 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
 | `stages.py` | 503 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
-| `runner.py` | 258 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 | `config` `ledger` `stages` `tempemail` |
-| `run_e2e.py` | 211 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` |
-| `selftest.py` | 119 | 自测**入口**：按顺序调用 `tests/` 下 22 个 `test_*` + 登记完整性元检查 | `tests.*` |
-| `tests/support.py` | 255 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
-| `tests/test_parsing.py` | 129 | 解析层 3 组（紧凑 JSON / Server Action / JS 字面量） | `support` |
-| `tests/test_ledger.py` | 224 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化 + 交付物自证） | `support` |
+| `runner.py` | 332 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 + 邮箱后端工厂 | `config` `ledger` `remail` `stages` `tempemail` |
+| `run_e2e.py` | 261 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` `tempemail` |
+| `selftest.py` | 126 | 自测**入口**：按顺序调用 `tests/` 下 24 个 `test_*` + 登记完整性元检查 | `tests.*` |
+| `tests/support.py` | 299 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
+| `tests/test_parsing.py` | 165 | 解析层 4 组（紧凑 JSON / Server Action / JS 字面量 / HTML 实体） | `support` |
+| `tests/test_ledger.py` | 263 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化 + 交付物自证） | `support` |
 | `tests/test_mailrules.py` | 105 | 收件规则 + OTP 抽取 | `support` |
-| `tests/test_orchestration.py` | 793 | 编排层 14 组（错误码分流 / 登录 / 门禁 / setup 降级 / 并发…） | `support` |
-| `verify_keys.py` | 192 | 验收 + 导出 | `config` `ledger` |
+| `tests/test_orchestration.py` | 1004 | 编排层 15 组（错误码分流 / 登录 / 门禁 / setup 降级 / 并发 / 邮箱后端…） | `support` |
+| `verify_keys.py` | 205 | 验收 + 导出（`keys.txt` / `apikeys.txt` / `keys_verified.json`） | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
 > **行数怎么算的**：`wc -l`（即文件里 `\n` 的个数）。复算：
@@ -154,21 +166,25 @@ Jev-Register-Tool/
 第 0.5 层              │      │      │      parsing       ← 纯函数、
                         │      │      │         │            零第三方依赖
 第 0 层   配置        └──────┴──────┴─────────┴── src/config.py
+
+并列叶子   remail ──(只复用 `Mail` / `Stats`)──▶ tempemail
+           ⚠️ 两个邮箱客户端**互不引用**，只共享数据结构；异常类型也各自独立
 ```
 
 **被依赖次数**（越大越底层，改动越要谨慎）：
 
 | 模块 | 被依赖 | 说明 |
 |---|---:|---|
-| `config` | 16 | 常量集中地。改它要跑全量自测 |
+| `config` | 19 | 常量集中地。改它要跑全量自测 |
 | `parsing` | 12 | 解析层。**纯函数、不依赖 `requests`** ⇒ 可以脱离网络单测 |
+| `tempemail` | 11 | CF 收信唯一入口（`remail` 也复用它的 `Mail` / `Stats`） |
 | `typesafe` | 11 | 登录链路（阶段层与 4 个探针都直引） |
-| `tempemail` | 10 | 收信唯一入口 |
 | `ledger` | 7 | 台账唯一写入口 |
-| `runner` | 6 | CLI + 自测 + 探针（原 `pipeline` 的调度半边） |
+| `runner` | 7 | CLI + 自测 + 探针（原 `pipeline` 的调度半边） |
 | `stages` | 5 | 阶段层；被 `runner` + CLI + 探针引用 |
 | `mailrules` | 5 | 规则表 + OTP 抽取；**纯叶子**，可离线测 |
-| `tests/support.py` | 4 | 自测共享夹具（4 个 `test_*` 模块都从这里取） |
+| `tests/support.py` | 5 | 自测共享夹具（5 个 `test_*` 模块都从这里取） |
+| `remail` | 3 | **第二个邮箱后端**；被 `runner` + 自测引用 |
 
 > 复算命令见文末附录（`from src import X` 那种写法必须单独计 —— 旧版脚本就漏在这里）。
 > ⚠️ 该表是**脚本输出**，加/删任何 `.py` 文件后**必须重跑**，否则立刻过期。
@@ -178,8 +194,8 @@ Jev-Register-Tool/
 > `support`（它只被 `tools/tests/` 里的模块 import）。也就是说
 > **复算命令复算不出表里的数字** —— 表里的 `support` 项在脚本输出里根本不会出现。
 > 现在两边都含 `tools/tests/`，命令与表**逐项对齐**（实测
-> `config 16 / parsing 12 / typesafe 11 / tempemail 10 / ledger 7 / runner 6 /
-> stages 5 / mailrules 5 / support 4`）。
+> `config 19 / parsing 12 / tempemail 11 / typesafe 11 / ledger 7 / runner 7 /
+> stages 5 / mailrules 5 / support 5 / remail 3`）。
 >
 > 历史沿革（数字都是当时实测的）：旧版表格（`config=4 / typesafe=3 / framer=2 /
 > mailrules=2`）是错的 —— 附录脚本用 `startswith('src.')` 判断，而
@@ -274,6 +290,7 @@ Jev-Register-Tool/
 | **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 `stages` 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住（扫描面 `src/*.py` + `tools/**/*.py`）。⚠️ 还要覆盖**历史词汇**（`applied` / `confirmed` / `approved` / `code_sent`）—— 它们不再被写入，但历史台账里有，删掉会让那些行 `rank()` 落 0 分，任何一次重跑都能把凭据覆盖成空 |
 | **台账身份字段** | `ledger.EARNED_FIELDS` / `DICT_FIELDS` | 决定"哪些字段不许被空值覆盖"（`api_key` 等）与"哪些是累积型字典"。`DICT_FIELDS` 里的 `waitlist` 是**历史键名**（现名 `signup`），必须留着兜住老台账 |
 | **推理端点** | `verify_keys.API_URL` | 站点换端点 ⇒ 验收误判为"key 不可用" |
+| **邮件正文形态** | `remail._hydrate` / `parsing.extract_magic_link` | 🔴 **两个后端给的正文形态不同**：CF 是纯文本全文；Remail 是 **HTML + 截断预览**（2026-09-21 实测：preview **248 字符、完全无链接**，全文 **4012 字符**才有）。⇒ ① 取件匹配成功后必须**再取全文**（`_hydrate`，只对匹配到的那一封取，否则 N+1 会打爆取件配额）；② 提取链接必须做 **HTML 实体反转义**（`&amp;` → `&`），否则 token 的参数名变成 `amp;token`，**等于没传 token**，而报错读起来像"链接已过期"。两条分别由 `test_magic_link_html_entity` 与 `test_mail_backend_selection` 钉住 |
 
 **已刻意解耦的地方**：
 
@@ -303,6 +320,7 @@ Jev-Register-Tool/
 | ~~`complete_onboarding` 用 `/api/me` 字段判缺口~~ | **2026-09-21 换过两次判据**，每次的错法都记在 `typesafe.complete_onboarding()` 的表里：① `/api/me` 的 `console_survey_completed_at` 有滞后且语义会变 ⇒ 账号已完全 onboard 却被记 `partial`（实跑 25 个误报 **19 个**）；② 改成 `/hook` 归零 ⇒ **站点自己非确定性**（相邻两次 GET 答案不同）⇒ 空转 + 报空错误 | 现在判据是**建 key 的结果**，门禁只作诊断。护栏 `test_onboarding_gate_is_guidance_not_a_gate`（含"门禁卡住但 key 建得出 ⇒ 必须记 keyed"的正向断言） |
 | ~~`--mode watch`~~ / ~~`--mode claim`~~ / ~~`--mode apply`~~ | **2026-09-21 已删除**（不是"修好"，是**删除**）：三个模式都是邀请制的产物。`watch` 轮询全表共享窗口找"获批邮件"（该事件已不存在）；`claim` 的两进程设计**实测已失效**（`--send` 与 `--token` 各建会话、cookie 不传递 ⇒ 必报 `401 Code expired`）；`apply` 投的 Framer 表单本身不存在了。连带删除 `stages.stage_login_with_token()`（`claim` 的唯一落点）与 `tempemail.first_mail_matching()`（`stage_wait_approval` 的唯一调用者） | 需要"人工粘凭据"改用 `resume`：魔法链接 7 天有效。原文件在 `.workbuddy-ai/backup/refactor-20260921-180438/` |
 | `typesafe.py` 从 442 → **551 行**（变大） | 如实记录：新增了 `onboarding_gate()` / `_onboarding_result()` / 门禁序列诊断，并把"判据换过三次"的复盘写进 docstring | 模块行数**不是**指标。本轮 `complete_onboarding` 的重复块归零、错误文案从"空字符串"变成可定位，这些才是收益。若真要瘦身，把 onboarding 段整体挪成 `src/onboarding.py` |
+| `--mail-backend` 第二个邮箱后端（2026-09-21 新增） | **已接入并实测**：Remail 后端 1 单 `outlook.com` 走完全链路拿到 key（验收 `HTTP 200 / model=jev-1.13.0`）。过程中修掉两个**只在该后端出现**的坑：① `bodyPreview` 是**截断预览**（248 字符、无链接）⇒ 必须再取全文；② 全文是 **HTML**，`&` 转义成 `&amp;` ⇒ token 参数名被污染成 `amp;token`。⚠️ 另修一个静默洞：`runner._clone()` 原本**不传 `mail`** ⇒ 并发 worker 会悄悄换回 CF 后端（串行 `concurrency=1` 永远复现不出来） | 成本量级：Remail 是**付费**后端（`outlook.com` 实测 **8 积分/单**）。曾经最便宜的 `domain`（0.01/单）2026-09-21 已 **0 库存** ⇒ 别按旧印象估预算。库存**会变**，报"库存不足"时先查 `GET /v1/open/projects/155`，不要改代码猜。Remail 的 `code` 模式邮箱是 **10 分钟窗口**，下单后要尽快跑完 |
 
 ## 附录：复算依赖图
 
@@ -353,7 +371,9 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 192 项」，本文 §6 写「已补 192 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 235 项」，本文 §6 写「已补 192 项自测」。
+#    ⚠️ 两者数字**本来就不同**：README 是现状，§6 那条是**历史快照**（审计当时 96 项）。
+#       不要为了"对齐"去改 §6 —— 那会把历史记录改成假的。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。
 grep -rn "自测 [0-9]* 项\|[0-9]* 项自测\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
 ```

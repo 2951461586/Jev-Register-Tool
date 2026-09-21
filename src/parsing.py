@@ -71,7 +71,17 @@ def extract_magic_link(text: str) -> str:
     域名本身又来自 `config.STYTCH_LOGIN_HOST`，所以三处不会各写一份。
     """
     m = MAGIC_LINK_RE.search(text or "")
-    return m.group(0) if m else ""
+    if not m:
+        return ""
+    # 🔴 **必须做 HTML 实体反转义**（2026-09-21 接入 Remail 时实测踩到）：
+    #    不同后端给的正文形态不同 —— CF Worker 是纯文本，Remail 是 **HTML**，
+    #    后者的链接里 `&` 被转义成 `&amp;`。不还原的话，提取出来的查询串是
+    #        ?public_token=X&amp;stytch_token_type=magic_links&amp;token=Y
+    #    解析方（Stytch）看到的参数名是 `amp;stytch_token_type` / `amp;token`
+    #    ⇒ **等于根本没传 token**，交换必然失败，而报错读起来像"链接无效/过期"，
+    #    会把排查引向"重新发信"，白烧账号。
+    #    `unescape` 对纯文本是无操作 ⇒ 对 CF 后端零影响（已由自测钉住）。
+    return html_mod.unescape(m.group(0))
 
 
 def actions_from_html(page: str) -> dict[str, dict[str, Any]]:

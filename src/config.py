@@ -45,6 +45,43 @@ CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
 CF_D1_ID = os.getenv("CF_D1_ID", "")
 
+# ── Remail 邮箱接口聚合（remail.aishop6.com）─────────────────────────────
+# 与上面的 CF Worker **并列的第二个邮箱后端**：一个 API 切换多种邮箱
+# （outlook / gmail / icloud / proto / 自有域名）。2026-09-21 接入。
+#
+# 🔴 与 CF Worker 的**根本差异**（设计 `src/remail.py` 时必须记住）：
+#   下单 `POST /v1/open/orders` 用 Bearer API Key，返回 `deliveryEmail` +
+#   `serviceToken`；而取件 `GET /v1/pickup` **不用 API Key**，只认
+#   `email` + `token` 这一对 ⇒ token 必须按邮箱存起来，不能只存全局 key。
+#
+# 规格真源：`exports/remail_openapi.json`（从 `/openapi.json` 拉的 OpenAPI 3.0.3）。
+REMAIL_BASE = os.getenv("REMAIL_BASE", "")
+REMAIL_API_KEY = os.getenv("REMAIL_API_KEY", "")
+# TypeSafe 在 Remail 上的项目 id（`GET /v1/open/projects` 里 name='TypeSafe' 那条）。
+# 这不是凭据，是公开商品编号，可以留默认值。
+REMAIL_PROJECT_ID = int(os.getenv("REMAIL_PROJECT_ID") or 155)
+# 商品后缀（`emailSuffix`）。⚠️ **不是完整邮箱地址**，服务端明确不接受。
+#
+# 🔴 2026-09-21 实测：**`domain` 商品已无货**，下单直接
+#    `HTTP 422 {"message":"Insufficient inventory."}`。
+#    `GET /v1/open/projects/155` 当天各商品的有货情况：
+#      microsoft      code 8.00   purchase 10.00   库存 4,539,067（24 个后缀）
+#      gmail_variant  code 8.00   purchase 10.00   库存 1,000,534,521
+#      proto          code 10.00  purchase 20.00   库存 5        ← 几乎等于没货
+#      gmail          code **关闭**  purchase 500.00  库存 6
+#      icloud         code **关闭**  purchase 10.00   库存 221,677
+#      domain         code 0.01   purchase 0.02    库存 **0**   ← 曾经最便宜，现已无货
+#    ⇒ 默认取 `outlook.com`（microsoft 商品下库存最大的后缀，4,008,800）。
+#      刻意用**具体后缀**而不是加权随机的 `outlook`：注册场景要的是可控、主流，
+#      而不是被随机分到 `outlook.com.gr` 这类冷门域名（对站点风控的影响未知）。
+#    ⚠️ **成本量级变了**：8 积分/单，是原来 domain 的 **800 倍**。跑批前先看余额
+#      （`--doctor --mail-backend remail` 会打出来），别按 0.01/单 的旧印象估预算。
+#    ⚠️ 库存是**会变**的（`domain` 就从有货变成 0）⇒ 报"库存不足"时先去
+#      `GET /v1/open/projects/155` 看当天哪个后缀有货，不要改代码猜。
+REMAIL_EMAIL_SUFFIX = os.getenv("REMAIL_EMAIL_SUFFIX", "outlook.com")
+# `code` = 短效接码（10 分钟窗口，更便宜）；`purchase` = 长效购买。
+REMAIL_SERVICE_MODE = os.getenv("REMAIL_SERVICE_MODE", "code")
+
 # ── TypeSafe 站点 ───────────────────────────────────────────────────────
 SITE_ORIGIN = "https://console.typesafe.ai"
 SITE_LOGIN = f"{SITE_ORIGIN}/login"
@@ -93,6 +130,21 @@ RESULT_DIR = ROOT / "result"
 SUCCESS_LEDGER_PATH = RESULT_DIR / "success.jsonl"     # 成功账号（append-only，按 key 去重）
 KEYS_TXT_PATH = RESULT_DIR / "keys.txt"                # email----api_key----api_key_id
 KEYS_JSON_PATH = RESULT_DIR / "keys_verified.json"     # 机器可读的验收结果
+# 纯 api_key，一行一个（`keys.txt` 的无元数据版：不带邮箱、不带 key_id）。
+# 面向"直接把 key 灌进别的系统"的场景；与 keys.txt 由**同一次** verify 写出，故集合恒等。
+APIKEYS_TXT_PATH = RESULT_DIR / "apikeys.txt"
+
+# Remail 的**取件凭证台账**（JSONL，append-only）。
+#
+# 🔴 为什么必须落盘：`GET /v1/pickup` **不认 API Key**，只认下单时返回的
+#    `email` + `serviceToken` 这一对。而 `serviceToken` 只在**下单那个进程的内存**里
+#    ⇒ `resume_pending.py` / `relogin_pending.py` 这类**另起进程**的补跑入口
+#    会拿着台账里的邮箱却取不了信，报"没有 serviceToken"。
+#    CF Worker 那边没这个问题（全局 admin key 就够），所以这是 Remail **独有**的坑。
+#
+# ⚠️ 放 `result/` 下：它含 per-order 凭证，必须被 `.gitignore` 的 `result/` 覆盖。
+# ⚠️ 它是 `result/` 下**唯一非交付物**的文件 —— 不要把它混进交付清单。
+REMAIL_STATE_PATH = RESULT_DIR / "remail_orders.jsonl"
 
 
 def validate(*, need_tempmail: bool = True) -> list[str]:
@@ -115,3 +167,10 @@ def validate_cf() -> list[str]:
     return [k for k, v in (("CF_API_TOKEN", CF_API_TOKEN),
                            ("CF_ACCOUNT_ID", CF_ACCOUNT_ID),
                            ("CF_D1_ID", CF_D1_ID)) if not v]
+
+
+def validate_remail() -> list[str]:
+    """Remail 后端两项。**只有选了 Remail 后端才需要** —— 所以不并进 `validate()`，
+    否则用 CF Worker 跑批时会被无谓地拦下来。"""
+    return [k for k, v in (("REMAIL_BASE", REMAIL_BASE),
+                           ("REMAIL_API_KEY", REMAIL_API_KEY)) if not v]

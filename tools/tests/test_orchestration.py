@@ -820,3 +820,185 @@ def test_onboarding_gate_is_guidance_not_a_gate() -> None:
           rec.stages.get("onboarding") == "partial",
           str(rec.stages))
     check("★ 成功路径不往 error 里写东西", rec.error == "", repr(rec.error))
+
+
+def test_mail_backend_selection() -> None:
+    """邮箱后端选择：工厂分派 / 并发克隆 / 域名语义 / 凭证落盘。
+
+    2026-09-21 接入 Remail（第二个邮箱后端）时新增。每条断言都对应一个
+    **真实会出事**的场景，不是形式主义：
+
+      ① `_clone()` 丢后端 —— 串行**永远复现不出来**（`concurrency=1` 走的是
+         另一条路径），只在 `--concurrency > 1` 时把一部分账号建到另一个后端上，
+         而且不报任何错。这正是本项目最忌讳的静默替换。
+      ② `domain` 语义混用 —— CF 传完整域名、Remail 传商品名。传错要么被服务端
+         拒掉，要么**买到意外商品**（TypeSafe 项目下 `gmail` 是 500 积分/单，
+         是 `domain` 的 5 万倍）。
+      ③ 取件凭证不落盘 —— `resume` 另起进程时全部邮箱取不了信，而错误看起来
+         像"后端坏了"，真因却是"我们自己没存 token"。
+
+    ⚠️ 替身里的 `created` 与"能不能收到信"是**两件事**：`pending` 邮件池是
+    共享的，选错后端时信照样收得到（替身没有真实后端的隔离）⇒
+    **只看收信成功是查不出后端选错的**，必须看 `created`。
+    """
+    print("\n[编排：邮箱后端选择]")
+    from . import support as S
+
+    # ⚠️ 邮件必须显式喂进去：`offline()` 默认 `mails=None` ⇒ 待收池是空的。
+    #    收件人写 `"*"` —— 这批邮箱地址是**运行时**由 `create_mailbox()` 建的，
+    #    写死任何具体地址都匹配不上（替身的 `wait_for_mail` 支持 `"*"` 通配）。
+    with offline(mails=[_confirm_mail("*")]) as P:
+        # ① 工厂：按名字分派；未知名字**抛错而不是回落默认值**
+        check("★ make_mail_client('cf') 得到 CF 客户端",
+              type(P.make_mail_client("cf")) is S._FakeTempMailClient,
+              type(P.make_mail_client("cf")).__name__)
+        check("★ make_mail_client('remail') 得到 Remail 客户端",
+              type(P.make_mail_client("remail")) is S._FakeRemailClient,
+              type(P.make_mail_client("remail")).__name__)
+        try:
+            P.make_mail_client("remial")           # 拼错一个字母
+            check("★ 未知后端抛 ValueError（不静默回落成默认后端）", False, "没抛")
+        except ValueError:
+            check("★ 未知后端抛 ValueError（不静默回落成默认后端）", True)
+
+        # ② 域名语义必须按后端取 —— 两者不是一回事
+        check("★ remail 默认后缀取 REMAIL_EMAIL_SUFFIX（不是 CF 域名）",
+              P.default_mail_domain("remail") == P.config.REMAIL_EMAIL_SUFFIX,
+              f"remail={P.default_mail_domain('remail')!r} "
+              f"cf={P.default_mail_domain('cf')!r}")
+
+        # ③ `_clone()` 保留后端 —— 本轮核心修复
+        pipe = P.Pipeline(backend="remail", login_mode=ts.MODE_LINK,
+                          ledger=_tmp_ledger(), success_ledger=_tmp_ledger(),
+                          verbose=False)
+        check("★ Pipeline 记住后端名", pipe.backend == "remail", pipe.backend)
+        check("★ 主实例用的是 Remail 客户端",
+              type(pipe.mail) is S._FakeRemailClient, type(pipe.mail).__name__)
+        kid = pipe._clone()
+        check("★★ _clone() 不丢后端（并发 worker 不会静默换回 CF）",
+              type(kid.mail) is S._FakeRemailClient, type(kid.mail).__name__)
+        check("★ _clone() 的 mail 是**新实例**（不共享 Session）",
+              kid.mail is not pipe.mail)
+        # 源码级护栏：防止有人把 `mail=` 去掉又退回默认值（那正是本轮的 bug）
+        _csrc = inspect.getsource(P.Pipeline._clone)
+        check("★ _clone() 源码里显式传 mail（改回默认值就静默丢后端）",
+              "mail=self._mail_factory()" in _csrc, _csrc.strip()[:90])
+
+        # 决定性一问：**真跑一遍并发**，看邮箱到底是哪个后端建的。
+        # 只看"跑成功了"不够 —— 替身的邮件池是共享的，选错后端也会成功。
+        recs = pipe.run_batch(count=2, concurrency=2, mail_timeout=1.0)
+        check("  前置：2 个账号都拿到 key",
+              all(r.status == "keyed" for r in recs),
+              str([(r.status, r.error[:40]) for r in recs]))
+        check("★★ 并发 2 个 → 2 个邮箱都由 Remail 后端建出（后端没丢）",
+              len(S._FakeRemailClient.created) == 2,
+              f"created={S._FakeRemailClient.created}")
+        check("★ 同一批里没有 CF 后端掺进来",
+              all("remail" in e for e in S._FakeRemailClient.created),
+              str(S._FakeRemailClient.created))
+
+    # ④ 取件凭证落盘 —— 跨进程 resume 的**唯一**依靠
+    from src import config as cfg
+    from src.remail import RemailClient
+    with tempfile.TemporaryDirectory() as td:
+        old = cfg.REMAIL_STATE_PATH
+        cfg.REMAIL_STATE_PATH = Path(td) / "remail_orders.jsonl"
+        try:
+            c1 = RemailClient(base="http://unused.invalid", api_key="k")
+            c1._tokens["a@b.test"] = "tok-1"
+            c1._orders["a@b.test"] = "ORD-1"
+            c1._save_state("a@b.test", "domain")
+            c1._tokens["c@d.test"] = "tok-2"
+            c1._save_state("c@d.test", "domain")
+
+            # 另起一个实例 = 模拟 `resume` 的**新进程**
+            c2 = RemailClient(base="http://unused.invalid", api_key="k")
+            check("★ 凭证能跨实例恢复（resume 另起进程的前提）",
+                  c2.restored == 2 and c2._tokens.get("a@b.test") == "tok-1",
+                  f"restored={c2.restored} tokens={c2._tokens}")
+            check("★ 恢复后能通过取件前的凭证检查",
+                  c2._token_for("a@b.test") == "tok-1")
+
+            # 缺 token 的报错必须**可诊断**：三种原因处置完全不同
+            try:
+                c2._token_for("nope@x.test")
+                check("★ 缺 token 抛 RemailError", False, "没抛")
+            except Exception as exc:            # noqa: BLE001
+                _m = str(exc)
+                check("★ 缺 token 的错误文案覆盖三种原因（否则排查必跑偏）",
+                      "CF Worker" in _m and "台账" in _m, _m[:130])
+
+            # 坏行不该让整份凭证作废（JSONL 是 append-only，断电会留半行）
+            with open(cfg.REMAIL_STATE_PATH, "a", encoding="utf-8", newline="") as f:
+                f.write("{这不是合法 JSON\n")
+            c3 = RemailClient(base="http://unused.invalid", api_key="k")
+            check("★ 坏行被跳过（不因半行垃圾丢掉全部凭证）",
+                  c3.restored == 2, f"restored={c3.restored}")
+        finally:
+            cfg.REMAIL_STATE_PATH = old
+
+    # ⑤ 三个入口都必须有 `--mail-backend`，且 resume_pending 必须**透传**给子进程
+    #    （漏一个 = 那个入口静默用默认后端，而日志里写的却是另一个）
+    _root = Path(__file__).resolve().parents[2]
+    for _name in ("run_e2e.py", "resume_pending.py", "relogin_pending.py"):
+        _s = (_root / "tools" / _name).read_text(encoding="utf-8")
+        check(f"★ tools/{_name} 有 --mail-backend 参数",
+              '"--mail-backend"' in _s, "缺少参数")
+    check("★ resume_pending 把后端**透传**给子进程（漏了会静默用 cf）",
+          '"--mail-backend", args.mail_backend' in
+          (_root / "tools" / "resume_pending.py").read_text(encoding="utf-8"),
+          "没透传")
+    check("★ runner 模块级持有 RemailClient（patch 接缝，不能延迟 import）",
+          hasattr(pl, "RemailClient") and hasattr(pl, "TempMailClient"))
+
+    # ⑥ 取件必须把 `bodyPreview` 换成**全文** —— 预览会把正文里的链接截掉
+    from src.remail import RemailClient
+    _MAGIC = ("https://login.typesafe.ai/v1/magic_links/redirect"
+              "?stytch_token_type=magic_links&token=FULLTOK")
+
+    class _PreviewOnly(RemailClient):
+        """列表只给**没有链接的预览**，全文才有链接 —— 复刻 Remail 的真实形态。
+
+        2026-09-21 实测数据：Remail 的 `bodyPreview` 是 **248 字符**的纯文本摘要
+        （`"Confirm your email to finish setting up TypeSafe. …"`），
+        **完全没有链接**；而全文 **4012 字符**里才有魔法链接。
+        不补"取全文"这一步，`extract_magic_link` 永远返回空，外层报的是
+        `魔法链接邮件里没找到链接` —— 把"我们只读了预览"说成"站点没发链接"，
+        属于典型的"不报错、只是数据变错"。
+
+        ⚠️ 继承**真类**而不是替身：要测的就是真类自己的 `wait_for_mail`。
+        只覆写两个取数方法，不发任何网络请求。
+        """
+
+        def __init__(self):
+            super().__init__(base="http://unused.invalid", api_key="k")
+            self._tokens["p@q.test"] = "tok"
+
+        def list_mails(self, email=None, limit=None):
+            return [Mail(id="m-full", to="p@q.test", sender="login@typesafe.ai",
+                         subject="Welcome to TypeSafe \u2014 confirm your email",
+                         body="Confirm your email to finish setting up TypeSafe.",
+                         received_at=1)]
+
+        def fetch_body(self, email, message_id):
+            return f'<a href="{_MAGIC}">Confirm</a>'
+
+    _pv = _PreviewOnly()
+    _got = _pv.wait_for_mail("p@q.test", st.MATCH_LINK, timeout=2.0, interval=0.1)
+    check("  前置：匹配到了确认邮件", _got is not None)
+    if _got is not None:
+        check("★★ wait_for_mail 返回的是**全文**（预览里没有链接）",
+              "token=FULLTOK" in _got.body, _got.body[:90])
+        check("★ 因此 extract_magic_link 拿得到链接",
+              st.extract_magic_link(_got.body).endswith("token=FULLTOK"),
+              st.extract_magic_link(_got.body))
+    check("[负对照] 直接拿预览提取**确实为空**（证明这个坑真实存在）",
+          st.extract_magic_link("Confirm your email to finish setting up "
+                                "TypeSafe.") == "")
+
+    _rsrc = inspect.getsource(RemailClient.wait_for_mail)
+    check("★ 取全文发生在**匹配成功后**（轮询里逐封取会打爆取件配额）",
+          _rsrc.index("_hydrate") > _rsrc.index("if match(m)"), _rsrc.strip()[:90])
+    check("★ list_mails 保持轻量（不在里面逐封取全文）",
+          "_hydrate" not in inspect.getsource(RemailClient.list_mails),
+          "list_mails 里调了取全文")

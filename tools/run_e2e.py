@@ -41,37 +41,63 @@ from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加�
 
 from src import config  # noqa: E402
 from src.ledger import Ledger  # noqa: E402
-from src.runner import AccountRecord, Pipeline  # noqa: E402
+from src.runner import (DEFAULT_MAIL_BACKEND, MAIL_BACKENDS,  # noqa: E402
+                        AccountRecord, Pipeline, make_mail_client)
 from src.stages import MAIL_TIMEOUT  # noqa: E402
 from src.tempemail import TempMailClient  # noqa: E402
 
 
-def cmd_doctor() -> int:
-    missing = config.validate()
+def cmd_doctor(backend: str = DEFAULT_MAIL_BACKEND) -> int:
+    """环境体检。
+
+    ⚠️ 两个后端的体检**深度刻意不同**：
+      · CF     —— 建邮箱免费，所以直接建一个，端到端验一遍；
+      · Remail —— **建邮箱 = 真实下单扣积分**（TypeSafe 项目下 `domain`
+                  商品 0.01 积分/单）。体检**不该悄悄花钱**，所以只做只读检查
+                  （API Key 是否有效 / 余额 / 当前项目与商品配置），
+                  下单留给真实跑批 —— 那笔钱要花得看得见。
+    """
+    missing = (config.validate_remail() if backend == "remail"
+               else config.validate())
     if missing:
-        print(f"✗ 缺少必需配置：{'、'.join(missing)}", file=sys.stderr)
-        print("  修法：cp .env.example .env 并填入真实值（TEMPMAIL_ADMIN_KEY）", file=sys.stderr)
+        print(f"✗ 后端 {backend} 缺少必需配置：{'、'.join(missing)}", file=sys.stderr)
+        print("  修法：cp .env.example .env 并填入真实值", file=sys.stderr)
         return 1
-    c = TempMailClient()
+
+    c = make_mail_client(backend)
     try:
         h = c.health()
     except Exception as exc:  # noqa: BLE001
         print(f"✗ 邮箱服务不可用：{exc}", file=sys.stderr)
         return 1
-    print(f"✓ 邮箱服务 ok，storage={h.get('storage')} db={h.get('database')}")
-    print(f"  可用域名：{', '.join(h.get('domains') or [])}")
-    try:
-        mb = c.create_mailbox()
-        print(f"✓ 建邮箱 ok：{mb}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"✗ 建邮箱失败：{exc}", file=sys.stderr)
-        return 1
+
+    if backend == "remail":
+        # Remail 没有 `/health`，`health()` 走的是 `GET /v1/open/apikey/profile`。
+        k = (h or {}).get("apiKey") or {}
+        print(f"✓ Remail ok：key id={k.get('id')} enabled={k.get('enabled')} "
+              f"余额={k.get('balance')}")
+        print(f"  项目 id={config.REMAIL_PROJECT_ID} "
+              f"商品后缀={config.REMAIL_EMAIL_SUFFIX} "
+              f"模式={config.REMAIL_SERVICE_MODE}")
+        print(f"  凭证台账 {config.REMAIL_STATE_PATH} 已恢复 {c.restored} 条"
+              f"（跨进程 resume 靠它）")
+        print("  ⚠ 建邮箱 = 真实下单扣积分 ⇒ 体检不下单；验证下单请直接跑 --count 1")
+    else:
+        print(f"✓ 邮箱服务 ok，storage={h.get('storage')} db={h.get('database')}")
+        print(f"  可用域名：{', '.join(h.get('domains') or [])}")
+        try:
+            mb = c.create_mailbox()
+            print(f"✓ 建邮箱 ok：{mb}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ 建邮箱失败：{exc}", file=sys.stderr)
+            return 1
+
     led = Ledger(config.LEDGER_PATH)
     print(f"✓ 台账 {config.LEDGER_PATH} 现有 {len(led.load())} 条")
     return 0
 
 
-def cmd_scan() -> int:
+def cmd_scan(backend: str = DEFAULT_MAIL_BACKEND) -> int:
     """按 `src/mailrules.py` 的规则表给窗口内全部邮件分桶。
 
     🔴 关键：**把"漏网主题"显式列出来**。
@@ -80,7 +106,19 @@ def cmd_scan() -> int:
 
     ⚠️ 本模式**只读全表窗口**（`/admin/all`，retention 100 行），
     是纯诊断用途，不要用它做常规收信（常规收信走按收件人索引的端点）。
+
+    ⚠️ **只支持 CF 后端**：Remail 根本没有"扫全窗口"的端点
+    （取件必须带 `email` + `token`）。这里显式拒绝并给出替代做法，
+    而不是让它落到 `scan_all()` 里抛异常 —— 那个异常长得像故障，
+    而真相是"这个后端没有这个能力"，两者处置不同。
     """
+    if backend == "remail":
+        print("✗ scan 只支持 CF 后端：Remail 没有'扫全窗口'端点"
+              "（取件必须按 email + serviceToken 走）。", file=sys.stderr)
+        print("  替代：对单个地址跑 `--mode resume --email <地址>`，"
+              "看能不能取到信；规则分桶请用 CF 后端跑。", file=sys.stderr)
+        return 1
+
     from src.mailrules import RULES, diagnose
 
     c = TempMailClient()
@@ -160,7 +198,15 @@ def main() -> int:
                          "scan=列出邮箱窗口内全部邮件并按规则分桶（只读诊断）")
     ap.add_argument("--count", type=int, default=1, help="批次数量（mode=full）")
     ap.add_argument("--email", action="append", default=[], help="指定邮箱（mode=resume）")
-    ap.add_argument("--domain", default="", help="邮箱域名，默认取配置")
+    ap.add_argument("--mail-backend", choices=list(MAIL_BACKENDS),
+                    default=DEFAULT_MAIL_BACKEND,
+                    help="邮箱后端。cf=Cloudflare 临时邮箱 Worker（默认，建邮箱免费）；"
+                         "remail=remail.aishop6.com 聚合（**每建一个邮箱真实下单扣积分**，"
+                         "可买 outlook/gmail/icloud/自有域名，取件凭证按邮箱落盘）")
+    ap.add_argument("--domain", default="",
+                    help="地址后缀，默认按后端取配置。⚠️ 两个后端语义不同："
+                         "cf 传**完整域名**；remail 传**商品名/emailSuffix**"
+                         "（如 domain / outlook.com，不接受完整邮箱地址）")
     ap.add_argument("--login-mode", choices=["link", "code"], default="link",
                     help="link=确认邮件里的魔法链接（**默认，站点主路径**）；"
                          "code=6 位验证码（站点仍支持，但码 10 分钟过期且实测会丢包）")
@@ -177,19 +223,23 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.doctor:
-        return cmd_doctor()
+        return cmd_doctor(args.mail_backend)
 
-    missing = config.validate()
+    # 必需配置**按后端取**：用 CF 跑批时不该被 Remail 的配置缺失拦住（反之亦然）。
+    missing = (config.validate_remail() if args.mail_backend == "remail"
+               else config.validate())
     if missing:
-        print(f"✗ 缺少必需配置：{'、'.join(missing)}", file=sys.stderr)
+        print(f"✗ 后端 {args.mail_backend} 缺少必需配置：{'、'.join(missing)}",
+              file=sys.stderr)
         print("  修法：cp .env.example .env 并填入真实值", file=sys.stderr)
         return 1
 
     # scan 是纯只读诊断，自己建 client，不需要 Pipeline
     if args.mode == "scan":
-        return cmd_scan()
+        return cmd_scan(args.mail_backend)
 
-    pipe = Pipeline(domain=args.domain or None, login_mode=args.login_mode)
+    pipe = Pipeline(backend=args.mail_backend, domain=args.domain or None,
+                    login_mode=args.login_mode)
     kw = {}
     if args.mail_timeout is not None:
         kw["mail_timeout"] = args.mail_timeout

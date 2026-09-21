@@ -16,6 +16,9 @@
 `test_onboarding_gate_is_guidance_not_a_gate` / `test_mail_timeout_headroom` /
 `test_resume_skips_keyed`）。
 
+同日接入 Remail（**第二个邮箱后端**）时新增 `test_mail_backend_selection` ——
+覆盖工厂分派 / `_clone()` 不丢后端 / `domain` 语义按后端取 / 取件凭证落盘。
+
 ⚠️ **仍然不是 pytest**（刻意不引）：本项目零第三方依赖，跑法不变 ——
     $PY tools/selftest.py
 共享夹具见 `tests/support.py`。
@@ -41,6 +44,7 @@ from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa:
                                       test_fan_out_worker_crash_is_recorded,
                                       test_key_survives_rerun_failure,
                                       test_login_action_index_drift_retries,
+                                      test_mail_backend_selection,
                                       test_mail_timeout_headroom,
                                       test_onboarding_gate_drives_steps,
                                       test_onboarding_gate_is_guidance_not_a_gate,
@@ -48,6 +52,7 @@ from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa:
                                       test_resume_skips_keyed,
                                       test_success_ledger)
 from tests.test_parsing import (test_compact_ref, test_js_object,  # noqa: E402
+                                test_magic_link_html_entity,
                                 test_setup_action_forms)
 
 
@@ -85,6 +90,7 @@ def main() -> int:
     test_compact_ref()
     test_setup_action_forms()
     test_js_object()
+    test_magic_link_html_entity()
     test_ledger_union()
     test_status_vocabulary()
     test_identity_whitespace_normalization()
@@ -104,6 +110,7 @@ def main() -> int:
     test_success_ledger()
     test_concurrency_no_crosstalk()
     test_fan_out_worker_crash_is_recorded()
+    test_mail_backend_selection()
 
     # 元检查：登记完整性。放在最后跑，因为它扫的是本文件自己。
     gap, ghost = _registry_gap()

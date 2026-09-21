@@ -264,3 +264,78 @@ grep "status=failed" exports/batch50-20260921.log
 ✅ **上量结论（更新）**：并发 4 已在 **20 / 50 / 100** 三种规模下**连续三次未触发限流**，
 可作默认推荐值；再往上（6/8）仍需单独试点。
 
+### §7.4 Remail 后端接入（同日 22:00，第二个邮箱后端）
+
+需求是"换一个收信后端"（CF Worker 是共享的、retention 只有 100 行）。
+Remail（`remail.aishop6.com`）是聚合接码服务，接口形态与 CF **完全不同**。
+
+**成本实测（这一步别按旧印象估）**
+
+`GET /v1/open/projects/155`（TypeSafe 项目）当天各商品：
+
+| 商品 | code 价 | purchase 价 | 库存 |
+|---|---:|---:|---:|
+| microsoft | 8.00 | 10.00 | 4,539,067（24 个后缀） |
+| gmail_variant | 8.00 | 10.00 | 1,000,534,521 |
+| proto | 10.00 | 20.00 | 5 |
+| gmail | **code 关闭** | 500.00 | 6 |
+| icloud | **code 关闭** | 10.00 | 221,677 |
+| **domain** | 0.01 | 0.02 | **0 ← 已无货** |
+
+🔴 曾经最便宜的 `domain`（0.01/单）**已经 0 库存**，下单直接回
+`HTTP 422 {"message":"Insufficient inventory."}`。
+⇒ 有货的最便宜档是 **8 积分/单**（`outlook.com`），是原价的 **800 倍**。
+**库存会变** ⇒ 报"库存不足"时先查 `GET /v1/open/projects/155`，别改代码猜。
+
+**实测结果（1 单 `outlook.com`）**
+
+```
+下单     → chadharmon6645@outlook.com（8 积分）
+发信     → 6.98s 收到确认邮件
+取全文   → 4012 字符，含魔法链接
+交换     → 会话建立 → onboarding（门禁停在 console-survey）→ 建 key ✅
+验收     → HTTP 200 / model=jev-1.13.0 / noul=0.98
+```
+
+**踩到两个"只在这个后端上出现"的坑**
+
+1. **`bodyPreview` 是截断预览**。实测 preview **248 字符**，是纯文本摘要
+   （`"Confirm your email to finish setting up TypeSafe. …"`），**完全不含链接**；
+   魔法链接在**全文 4012 字符**里。不补"取全文"这一步，`extract_magic_link`
+   永远返回空，而外层报的是 `魔法链接邮件里没找到链接` ——
+   **把"我们只读了预览"说成"站点没发链接"**，排查方向完全错。
+   ⇒ 修法：`wait_for_mail` 匹配成功后调 `_hydrate()` 取全文。
+   ⚠️ 只在**匹配成功后**取，不能在轮询里逐封取（N+1 会把取件配额打爆）。
+
+2. **全文是 HTML，`&` 被转义成 `&amp;`**。提取出的 URL 是
+   `?public_token=X&amp;stytch_token_type=magic_links&amp;token=Y`，
+   解析方看到的参数名是 `amp;stytch_token_type` / `amp;token`
+   ⇒ **等于根本没传 token**，交换必失败，而报错读起来像"链接无效/过期"。
+   ⇒ 修法：`extract_magic_link` 加 `html.unescape()`。
+   它对纯文本是**无操作** ⇒ 对 CF 后端零影响（负对照已钉住）。
+
+**顺带修掉一个静默洞（不是 Remail 引入的，但只有它能暴露）**
+
+`runner._clone()` 原本**不传 `mail`** ⇒ `Pipeline.__init__` 走默认值，
+**每个并发 worker 都新建一个 CF 客户端**。串行（`concurrency=1` 走的是另一条路径）
+**永远复现不出来**；只有在 `--concurrency > 1` **且主实例不是 CF 后端**时才暴露 ——
+表现是"一部分账号建在 CF、一部分建在 Remail"，而且不报任何错。
+⇒ 现在 `_clone()` 从 `self._mail_factory()` 造同款客户端。
+
+**跨进程补跑的前提：凭证必须落盘**
+
+`GET /v1/pickup` **不认 API Key**，只认下单返回的 `email` + `serviceToken`，
+而 token 只存在于**下单那个进程的内存**里 ⇒ `resume_pending.py` 另起进程时
+全部取不了信，看起来像"Remail 坏了"。
+⇒ `serviceToken` 按邮箱落 `result/remail_orders.jsonl`（append-only JSONL：
+并发 worker 各持一个 client，"读改写整个 JSON"会互相覆盖，追加才安全）。
+实测：跨实例恢复成功，`resume` 能取件（轮询 54 次、5xx 0 次）。
+
+**⚠️ 站点侧硬限制**：`code` 模式邮箱是 **10 分钟窗口**（`codeWindowMinutes: 10`）。
+实测下单后立刻跑完全链路只用 ~30s，够用；但**过了窗口就收不到新信**，
+只能靠 `relogin_pending.py` 复用窗口内已收到的历史链接 —— 本次正是这样救回来的。
+
+**护栏**：自测 202 → **235 项**（新增 `test_mail_backend_selection` 21 项 +
+`test_magic_link_html_entity` 6 项，另有 `test_ledger.py` 里 10 项交付物护栏
+钉住"`apikeys.txt` 必须由正式流程产出、且落在 `result/` 下"）。
+

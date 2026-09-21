@@ -86,6 +86,33 @@ class _FakeTempMailClient:
         return list(type(self).pending)
 
 
+class _FakeRemailClient(_FakeTempMailClient):
+    """替换 `src.runner.RemailClient` —— **不是"为了对称"，是为了不花钱**。
+
+    🔴 为什么必须有（2026-09-21）：`runner._clone()` 现在从 `_mail_factory()`
+    造同款客户端，而工厂按 `backend` 分派 ⇒ 任何用了 `backend="remail"` 的
+    自测用例，都会让并发 worker 去调**真的** `RemailClient()`：
+    它会读凭证台账，`create_mailbox()` 更是**真实下单扣积分**。
+    没有这个替身，跑一次自测就是往站点账户上花钱 —— 而且**不会报错**。
+
+    继承 `_FakeTempMailClient` 是刻意的：两个后端的公开接口**本就该一致**
+    （这正是 `remail.py` 对齐 `tempemail.py` 的全部目的），所以"待收邮件池"
+    共享、行为一致。唯一新增的是 `created` —— 用来断言"后端选择真的生效了"。
+
+    ⚠️ 注意 `created` 与"能不能收到信"是**两件事**：`pending` 是共享的，
+    选错后端时信照样收得到（替身里没有真实后端的隔离）⇒ **只看收信成功
+    是查不出后端选错的**，必须看 `created`。
+    """
+
+    #: 本后端建出来的地址（`offline()` 进入时清零）。
+    created: list = []
+
+    def create_mailbox(self, domain: str | None = None, **kw) -> str:
+        email = f"fake-remail-{next(_FakeTempMailClient._seq)}@example-mail.test"
+        type(self).created.append(email)
+        return email
+
+
 class _FakeTypeSafe:
     """替换 `src.stages.TypeSafeClient`（`runner` 里那份也一起换）。
 
@@ -162,8 +189,10 @@ class _FakeTypeSafe:
 #:
 #: 2026-09-21：`framer_submit` 已从本集合移除 —— 它随 `src/framer_waitlist.py`
 #: 一起删除，`runner` / `stages` 两个命名空间里都不再有这个名字。
+#: 同日新增 `RemailClient` —— 它是**第二个邮箱后端**，读者只有 `runner`
+#: （`stages` 只读 `self.mail`，不直接引用任何客户端类）。
 #: 下面的 `assert` 会自动发现"某个符号已经不在任何读者里"这件事。
-_PATCH_NAMES = ("TypeSafeClient", "TempMailClient")
+_PATCH_NAMES = ("TypeSafeClient", "TempMailClient", "RemailClient")
 _PATCH_TARGETS = (pl, st)
 
 
@@ -193,6 +222,7 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
         f"{sorted({n for _, n in seams})} vs {sorted(_PATCH_NAMES)}")
     saved = [(m, n, getattr(m, n)) for m, n in seams]
     _FakeTempMailClient.pending = list(mails or [])
+    _FakeRemailClient.created = []
     _FakeTypeSafe.callback_status = ts_status
     _FakeTypeSafe.callback_body = dict(ts_body or {})
     _FakeTypeSafe.fail_key = fail_key
@@ -201,6 +231,7 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
     fake = {
         "TypeSafeClient": _FakeTypeSafe,
         "TempMailClient": _FakeTempMailClient,
+        "RemailClient": _FakeRemailClient,
     }
     for m, n in seams:
         setattr(m, n, fake[n])
@@ -210,6 +241,7 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
         for m, n, v in saved:
             setattr(m, n, v)
         _FakeTempMailClient.pending = []
+        _FakeRemailClient.created = []
 
 
 def _make_pipe(P, ledger: Ledger, success: Ledger | None = None):

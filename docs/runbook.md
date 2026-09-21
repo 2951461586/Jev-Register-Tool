@@ -16,10 +16,20 @@ cp .env.example .env      # 按注释填：3 个必填项见下
 $PY tools/run_e2e.py --doctor
 ```
 
-必填三项：`TEMPMAIL_ADMIN_KEY`（建邮箱 / `/admin/*`）、`TEMPMAIL_BASE`（Worker 根地址）、
-`TEMPMAIL_DOMAIN`（建邮箱用哪个域名）。
-选填：`CF_API_TOKEN` / `CF_ACCOUNT_ID` / `CF_D1_ID`（只有 `tools/probes/*` 诊断脚本用）、
+**必填项按后端二选一**（`--mail-backend cf|remail`，默认 `cf`）：
+
+| 后端 | 必填 | 性质 |
+|---|---|---|
+| `cf`（默认） | `TEMPMAIL_ADMIN_KEY` / `TEMPMAIL_BASE` / `TEMPMAIL_DOMAIN` | 免费；建邮箱只是本地 Worker 的一次调用 |
+| `remail` | `REMAIL_BASE` / `REMAIL_API_KEY` | ⚠️ **付费**：`create_mailbox()` = **真实下单扣积分** |
+
+选填：`REMAIL_PROJECT_ID`（默认 `155`）/ `REMAIL_EMAIL_SUFFIX`（默认 `outlook.com`）/
+`REMAIL_SERVICE_MODE`（默认 `code` = 10 分钟窗口）、
+`CF_API_TOKEN` / `CF_ACCOUNT_ID` / `CF_D1_ID`（只有 `tools/probes/*` 诊断脚本用）、
 `TEMPMAIL_DOMAINS`（`probe_email_routing.py` 要查的域名，留空则问 Worker 的 `/health`）。
+
+> ⚠️ **启动校验按后端走** —— 用 `cf` 跑批不会被 Remail 的缺失项拦住，反之亦然
+> （`config.validate()` vs `config.validate_remail()`）。
 
 > 🔴 **代码里没有任何真实默认值** —— 以前 `config.py` 的 `TEMPMAIL_BASE` / `TEMPMAIL_DOMAIN`
 > 带着真实值当默认，探针里还写着活的 `cfat_` 令牌。`os.getenv(k, "真值")` 就是泄漏点：
@@ -28,6 +38,9 @@ $PY tools/run_e2e.py --doctor
 
 `--doctor` 会验：配置齐全 → 邮箱服务健康 → 能建邮箱 → 台账可读。
 
+⚠️ 对 `remail` 后端**只做只读检查**（API Key 是否有效 + 余额 + 当前项目/商品配置），
+**不会下单** —— 体检不该花钱。要验证下单请直接 `--count 1`，那笔钱花得看得见。
+
 ## 1. 三种模式
 
 | 模式 | 干什么 | 会不会发注册请求 |
@@ -35,6 +48,14 @@ $PY tools/run_e2e.py --doctor
 | （默认）`full` | ★ 全链路：建邮箱 → 发信 → 登录 → onboarding → 建 key | 会 |
 | `--mode scan` | 按规则表给窗口内邮件分桶，**列出漏网主题** | 不会（只读） |
 | `--mode resume` | 对**指定邮箱**补跑（幂等，可反复跑） | 会 |
+
+**邮箱后端**（`--mail-backend`，默认 `cf`）：`full` / `resume` / `scan` 与 `--doctor` 都认。
+`cf` 与 `remail` 的公开接口是同一套，所以模式不变；但 **`scan` 只支持 `cf`**
+（Remail 没有"扫全窗口"端点，取件必须带 `email` + `serviceToken`），传 `remail` 会被显式拒绝。
+
+> ⚠️ **补跑时后端必须与建这些邮箱时一致**。Remail 的取件凭证 `serviceToken`
+> 是 per-order 的（落 `result/remail_orders.jsonl`）⇒ CF 建的地址它取不了，反之亦然。
+> `resume_pending.py` 会在开跑前把不匹配的地址数报出来，不会让你从一堆同样的报错里自己悟。
 
 > 🔴 **2026-09-21 邀请制取消后删掉了三个模式**（`apply` / `watch` / `claim`）：
 >
@@ -209,7 +230,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 192 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 235 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -219,6 +240,7 @@ $PY tools/selftest.py      # 192 项，含负对照，**全程离线**（不碰�
 | `test_parsing` | Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
 | `test_parsing` | Server Action 渲染形态 | 12 | **索引集合不许写死**；`:2` 缺失不许 skip；旧形态不能被弄坏 |
 | `test_parsing` | Stytch 落地页 JS 对象字面量 | 4 | 裸键名不是 JSON |
+| `test_parsing` | 魔法链接：HTML 实体反转义 | 6 | 🔴 两个后端正文形态不同：Remail 给 **HTML**，`&` 被转义成 `&amp;` ⇒ 不还原则 token 参数名变成 `amp;token`，**等于没传 token**（见 §4.12） |
 | `test_ledger` | 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
 | `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK`（含历史词汇） |
 | `test_ledger` | 身份字段空白归一化 / 只写 LF | 13 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
@@ -238,10 +260,11 @@ $PY tools/selftest.py      # 192 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
+| `test_orchestration` | 编排：邮箱后端选择（cf / remail） | 27 | 🔴 `_clone()` 不许丢后端（串行复现不出来）；`domain` 语义按后端取；取件凭证跨进程恢复；取全文只在**匹配成功后** |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **192 项**（21 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
-> 所以按输出分段统计时它会被算进"并发 worker 崩溃"那一段（显示 8 而非 7）——
+> 合计 **235 项**（24 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
+> 所以按输出分段统计时它会被算进"邮箱后端选择"那一段（显示 28 而非 27）——
 > 想复算就按"最后一段减 1"处理。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
@@ -576,6 +599,73 @@ $PY tools/relogin_pending.py --all-pending      # 台账里所有无 key 账号
 **刻意串行，别加并发**（它逐账号读收件箱 + 建会话，并发没有收益）。
 
 ⚠️ **判据落在"信到了没"，不是"站点回没回 200"** —— 站点会接受请求却不发信（§4.10）。
+
+### 4.12 Remail 后端专属故障（四个，处置各不相同）
+
+> 只在 `--mail-backend remail` 时出现。**共同点**：错误文案都容易把人引向错误方向 ——
+> 分别读起来像"站点没发链接"、"Remail 没库存"、"Remail 坏了"、"站点丢包"。
+
+**① `魔法链接邮件里没找到链接`** —— 两个独立根因，2026-09-21 实测**都踩过**：
+
+| 根因 | 判据 | 状态 |
+|---|---|---|
+| **只读了 `bodyPreview`**（截断预览：实测 **248 字符、完全无链接**，全文 **4012 字符**才有） | `send: ok`、`mail_wait` 正常，就是 extract 返回空 | 已修：`wait_for_mail` 匹配成功后调 `_hydrate()` 取全文 |
+| **全文是 HTML，`&` 被转义成 `&amp;`** | 提取出的 URL 含 `&amp;`，参数名变成 `amp;token` ⇒ **等于没传 token** | 已修：`extract_magic_link` 加 `html.unescape()` |
+
+```bash
+# 复算：直接看这个邮箱到底能取到什么（只读，不花钱）
+$PY -c "
+import sys; sys.path.insert(0,'.')
+from src.remail import RemailClient
+from src.parsing import extract_magic_link
+c = RemailClient(); print('恢复凭证', c.restored, '条')
+for m in c.list_mails('<邮箱>'):
+    print('preview', len(m.body), '| id', m.id)
+    full = c.fetch_body('<邮箱>', m.id)
+    print('全文', len(full), '| 提取', extract_magic_link(full)[:120])
+"
+```
+
+**② `HTTP 422 {"message":"Insufficient inventory."}`** —— 商品**没库存**。
+
+⚠️ 这不是故障，是**商品供给状态**。2026-09-21 实测：曾经最便宜的 `domain`
+（0.01 积分/单）**已 0 库存**，而有货的最便宜档是 `outlook.com` **8 积分/单**（**800 倍**）。
+
+```bash
+# 判据：看当天哪个商品/后缀有货（只读，不花钱）
+$PY -c "
+import sys; sys.path.insert(0,'.')
+import requests
+from src import config
+H={'Authorization': f'Bearer {config.REMAIL_API_KEY}','User-Agent': config.UA}
+d=requests.get(f'{config.REMAIL_BASE}/v1/open/projects/{config.REMAIL_PROJECT_ID}',
+               headers=H,timeout=20).json()
+for p in d['products']:
+    print(f\"{p['type']:<15} code={str(p['codeEnabled']):<6}{p['codePrice']:<11}库存={p['totalAvailable']}\")
+"
+```
+
+⇒ 把 `REMAIL_EMAIL_SUFFIX`（`.env` 或 `--domain`）换到一个有货的后缀。
+**不要改代码猜** —— 库存是动态的。
+
+**③ `没有 <邮箱> 的 serviceToken`** —— 三种可能，处置完全不同（错误文案里已列全）：
+
+| 可能 | 判据 | 处置 |
+|---|---|---|
+| 该地址是 **CF 后端**建的 | 域名是你的 CF 收信域 | 换 `--mail-backend cf` |
+| 凭证台账 `result/remail_orders.jsonl` 丢了 / 被清 | 文件不存在或明显偏小 | **无法补**：token 已随文件丢失，那些订单只能重新下单 |
+| 该地址在本 Remail 账号下确实没下过单 | — | 同上 |
+
+⚠️ `result/remail_orders.jsonl` **不是交付物，别当垃圾清掉** —— 它是跨进程补跑
+（`resume_pending.py` / `relogin_pending.py`）取件的**唯一**依据。
+
+**④ 补跑收不到新信（但取件本身正常）** —— `code` 模式邮箱是 **10 分钟窗口**
+（`codeWindowMinutes: 10`）。过了窗口收不到新信，但**窗口内收到的旧邮件仍在**。
+⇒ 用 `relogin_pending.py`（它**不设 `since_ms`**，会把历史链接一起用）：
+
+```bash
+$PY tools/relogin_pending.py --email <邮箱> --mail-backend remail --rounds 2
+```
 
 ## 5. 别做这些事
 

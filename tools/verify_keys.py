@@ -12,6 +12,7 @@
     result/success.jsonl        成功**账号**（账号级：每邮箱一行；从台账补录，幂等）
     result/keys.txt             email----api_key----api_key_id（人可读，直接复制）
     result/keys_verified.json   机器可读的验收结果
+    result/apikeys.txt          纯 api_key，一行一个（keys.txt 的**无元数据版**）
 
 用法：
     python tools/verify_keys.py                      # 验证全部有 key 的记录
@@ -76,6 +77,8 @@ def main() -> int:
                     help=f"人可读凭据清单（默认 {config.KEYS_TXT_PATH}）")
     ap.add_argument("--json", default=str(config.KEYS_JSON_PATH),
                     help=f"机器可读验收结果（默认 {config.KEYS_JSON_PATH}）")
+    ap.add_argument("--apikeys", default=str(config.APIKEYS_TXT_PATH),
+                    help=f"纯 api_key 清单，一行一个（默认 {config.APIKEYS_TXT_PATH}）")
     ap.add_argument("--ledger", default=str(config.LEDGER_PATH),
                     help=f"源台账（默认 {config.LEDGER_PATH}）")
     ap.add_argument("--limit", type=int, default=0)
@@ -184,7 +187,17 @@ def main() -> int:
         if v["ok"]:
             lines.append(f"{v['email']}----{v['api_key']}----{v['api_key_id']}")
     _write_lf(args.out, "\n".join(lines) + "\n")
-    print(f"已写入 {args.out} 和 {args.json}")
+
+    # 纯 key 版：**与 keys.txt 同源、同一次运行**写出 ⇒ 两者集合恒等，只差元数据形态。
+    # 单独产出的理由：下游常只要 key 本身，不该被迫解析 `email----key----id`。
+    # ⚠️ 同样**只写 ok 的行** —— 把不可用的 key 放进交付清单等于交付坏数据。
+    # 护栏：去重后条数必须等于可用数。`results` 已按 api_key 去重，这里再自证一次；
+    # 将来若有人只给其中一个清单加过滤条件，这条会立刻炸，而不是让两份交付物静默分叉。
+    apikeys = [v["api_key"] for v in results if v["ok"]]
+    assert len(apikeys) == len(set(apikeys)), "apikeys.txt 出现重复 key"
+    _write_lf(args.apikeys, "".join(f"{k}\n" for k in apikeys))
+
+    print(f"已写入 {args.out}、{args.apikeys} 和 {args.json}")
     return 0 if ok == len(results) else 1
 
 

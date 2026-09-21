@@ -222,3 +222,42 @@ def test_identity_whitespace_normalization() -> None:
     check("verify_keys 日志同时印出输入条数与落盘行数",
           "（输入 " in _after_upsert and "落盘 " in _after_upsert,
           "日志没把两个口径都写出来，读者会以为二者相等")
+
+    # 8) 交付物侧：`verify_keys.py` 必须同时产出**纯 key 清单**（`apikeys.txt`）。
+    #    2026-09-21 老板要求"后续正式流程也要存入这份纯 apikey 文件" ——
+    #    它此前是手工导出的，手工产物注定与台账漂移（实测旧文件停在 243 行，
+    #    而台账当时已有 388 把 key）。
+    #    护栏要点：它必须与 `keys.txt` **同源、同一次运行**写出（只差元数据形态），
+    #    所以判据是"同一份 results 上过滤"，不是"另起一遍查询"。
+    check("★ verify_keys 产出纯 key 清单（--apikeys）",
+          "--apikeys" in vsrc, "没有 --apikeys 参数")
+    check("★ 纯 key 清单默认路径取自 config（不是字面量）",
+          "config.APIKEYS_TXT_PATH" in vsrc, "默认路径没走 config")
+    _after_ak = vsrc.split("apikeys = [", 1)[-1] if "apikeys = [" in vsrc else ""
+    check("★ 纯 key 清单只写 ok 的行（不可用的 key 不进交付清单）",
+          'if v["ok"]' in _after_ak, "没看到 ok 过滤")
+    check("★ 纯 key 清单走 _write_lf（只写 LF，不带 CR）",
+          "_write_lf(args.apikeys" in vsrc, "没走 _write_lf")
+    check("★ 纯 key 清单有去重自证（防两份交付物静默分叉）",
+          "len(set(apikeys))" in vsrc, "缺少去重断言")
+
+    # 9) 交付物路径护栏：四个交付物都必须在 `result/` 下。
+    #    🔴 这条不是形式主义：`apikeys.txt` 是**一行一个明文 API Key**，
+    #    路径一旦写到 `result/` 之外，它就会被 git 跟踪 ⇒ 整份凭据直接进仓库。
+    #    `result/` 之所以被 ignore，正是因为 `*.txt` 没有任何通配规则覆盖
+    #    （见 .gitignore 里的注释）—— 别以为有通配符兜底。
+    from src import config as _cfg
+    _deliverables = {
+        "success.jsonl": _cfg.SUCCESS_LEDGER_PATH,
+        "keys.txt": _cfg.KEYS_TXT_PATH,
+        "keys_verified.json": _cfg.KEYS_JSON_PATH,
+        "apikeys.txt": _cfg.APIKEYS_TXT_PATH,
+    }
+    for _name, _p in _deliverables.items():
+        check(f"★ 交付物 {_name} 落在 result/ 下（被 gitignore 覆盖）",
+              _p.parent == _cfg.RESULT_DIR, f"{_p} 不在 {_cfg.RESULT_DIR}")
+    _gi = {ln.strip() for ln in
+           (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+           if ln.strip() and not ln.lstrip().startswith("#")}
+    check("★ .gitignore 显式列出 result/（不靠通配符兜底）",
+          "result/" in _gi, f"result/ 不在规则里，现有规则 {sorted(_gi)[:8]}")

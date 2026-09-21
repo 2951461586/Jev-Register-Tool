@@ -35,6 +35,38 @@ from _bootstrap import ROOT  # noqa: E402,F401
 
 from src import config  # noqa: E402
 from src.ledger import Ledger  # noqa: E402
+from src.runner import DEFAULT_MAIL_BACKEND, MAIL_BACKENDS  # noqa: E402
+
+
+def remail_known() -> set[str]:
+    """凭证台账里**有 serviceToken** 的邮箱（= 由 Remail 后端下单建出来的）。
+
+    🔴 为什么补跑入口需要它：`GET /v1/pickup` 只认 `email` + `serviceToken`，
+    而 token 是**下单时**才有的。待补清单里混着两种来源的地址 ——
+    CF Worker 建的（任何后端都能收）和 Remail 建的（**只有 Remail 后端能收**）。
+    拿 Remail 后端去补一批 CF 地址，会全部报"没有 serviceToken"，
+    看起来像"Remail 坏了"，实际是选错了后端。
+
+    这个函数就是为了**在跑之前把这件事说清楚**，而不是让人从 50 条同样的
+    错误里自己悟出来。台账不存在时返回空集（首次使用 Remail 的正常状态）。
+    """
+    path = config.REMAIL_STATE_PATH
+    if not path.is_file():
+        return set()
+    import json
+    out: set[str] = set()
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        e = str(d.get("email") or "").strip()
+        if e and d.get("token"):
+            out.add(e)
+    return out
 
 
 def keyed(led: Ledger) -> set[str]:
@@ -75,6 +107,11 @@ def main() -> int:
                     help="批内并发（默认 1=串行；共享 Worker 窗口小，别开大）")
     ap.add_argument("--rounds", type=int, default=3, help="最多跑几轮")
     ap.add_argument("--timeout", type=float, default=900.0, help="每批超时秒数")
+    ap.add_argument("--mail-backend", choices=list(MAIL_BACKENDS),
+                    default=DEFAULT_MAIL_BACKEND,
+                    help="邮箱后端，透传给 run_e2e.py。⚠️ 必须与**建这些邮箱时**用的"
+                         "后端一致：Remail 建的地址只能用 remail 补跑"
+                         "（它的取件凭证 serviceToken 是 per-order 的）")
     ap.add_argument("--log", default="", help="日志路径（默认 exports/resume_pending.log）")
     args = ap.parse_args()
 
@@ -97,7 +134,26 @@ def main() -> int:
 
     todo = pending(led)
     w(f"=== resume_pending {time.strftime('%F %T')} ===")
-    w(f"起点：keyed={len(keyed(led))}  待补={len(todo)}")
+    w(f"起点：keyed={len(keyed(led))}  待补={len(todo)}  后端={args.mail_backend}")
+
+    # 🔴 后端与地址来源不匹配 = 整批必失败，而错误长得像"后端坏了"。
+    #    判据是"这批地址里有没有该后端建出来的"，在**跑之前**说清楚。
+    remail_emails = remail_known()
+    if args.mail_backend == "remail":
+        wrong = [e for e in todo if e not in remail_emails]
+        if wrong:
+            w(f"⚠ 待补里有 {len(wrong)}/{len(todo)} 个地址**不是 Remail 建的**"
+              f"（凭证台账里没有它们的 serviceToken）——")
+            w(f"  Remail 取件只认 email+token，这些会全部报「没有 serviceToken」。")
+            w(f"  它们来自 CF Worker，请改用 --mail-backend cf（默认）补跑。"
+              f"例：{wrong[:3]}")
+    else:
+        overlap = sorted(remail_emails & set(todo))
+        if overlap:
+            w(f"⚠ 待补里有 {len(overlap)} 个地址是 **Remail 建的**，cf 后端取不到它们的信"
+              f"（CF 只认自己的收件箱索引）。")
+            w(f"  这些要用 --mail-backend remail 单独补。例：{overlap[:3]}")
+
     if not todo:
         w("没有待补账号。")
         log.close()
@@ -115,7 +171,10 @@ def main() -> int:
         for i in range(0, len(todo), args.batch):
             chunk = todo[i:i + args.batch]
             cmd = [sys.executable, str(ROOT / "tools" / "run_e2e.py"),
-                   "--mode", "resume", "--concurrency", str(args.concurrency)]
+                   "--mode", "resume", "--concurrency", str(args.concurrency),
+                   # 后端必须透传 —— 漏了它子进程会静默用默认的 cf，
+                   # 而本进程的日志头写着 remail，两边不一致且不报错。
+                   "--mail-backend", args.mail_backend]
             for e in chunk:
                 cmd += ["--email", e]
             try:

@@ -59,6 +59,7 @@ from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa:
                                       test_mail_timeout_headroom,
                                       test_onboarding_gate_drives_steps,
                                       test_onboarding_gate_is_guidance_not_a_gate,
+                                      test_skip_onboarding_a1,
                                       test_post_setup_degrade_is_observable,
                                       test_remail_probe_is_readonly,
                                       test_resume_skips_keyed,
@@ -116,6 +117,7 @@ def main() -> int:
     test_login_action_index_drift_retries()
     test_onboarding_gate_drives_steps()
     test_onboarding_gate_is_guidance_not_a_gate()
+    test_skip_onboarding_a1()
     test_code_mode_falls_back_to_magic_link()
     test_mail_timeout_headroom()
     test_resume_skips_keyed()

@@ -129,7 +129,8 @@ class Pipeline(StageMixin):
                  ledger: Ledger | None = None,
                  success_ledger: Ledger | None = None,
                  domain: str | None = None,
-                 login_mode: str = MODE_CODE, verbose: bool = True):
+                 login_mode: str = MODE_CODE, verbose: bool = True,
+                 strict_onboarding: bool = False):
         self.backend = (backend or DEFAULT_MAIL_BACKEND).strip().lower()
         #: 造"同款"邮箱客户端的方式。`_clone()` 靠它保证并发 worker 用的是
         #: **同一个后端** —— 见 `_clone()` 的 🔴。
@@ -149,6 +150,11 @@ class Pipeline(StageMixin):
         self.domain = domain or default_mail_domain(self.backend)
         self.login_mode = login_mode
         self.verbose = verbose
+        #: `True` = 走完整 onboarding 门禁链（**诊断用**）；`False` = 跳过（默认，见
+        #: `stages.StageMixin.stage_create_key` 的 A1 说明）。
+        #: ⚠️ 它和 `mail` / `backend` 一样**必须在 `_clone()` 里透传** ——
+        #: 漏传会让并发 worker 静默退回另一套行为，而串行永远复现不出来。
+        self.strict_onboarding = strict_onboarding
 
     def log(self, msg: str) -> None:
         if self.verbose:
@@ -173,7 +179,10 @@ class Pipeline(StageMixin):
         return Pipeline(mail=self._mail_factory(), backend=self.backend,
                         ledger=self.ledger, success_ledger=self.success_ledger,
                         domain=self.domain, login_mode=self.login_mode,
-                        verbose=self.verbose)
+                        verbose=self.verbose,
+                        # ⚠️ 必须透传：漏了它，`--strict-onboarding` 在并发下会静默失效
+                        #（串行 `concurrency=1` 走另一条路径，永远复现不出来）。
+                        strict_onboarding=self.strict_onboarding)
 
     def _fan_out(self, jobs: list[tuple[Any, Callable[["Pipeline", Any], AccountRecord]]],
                  *, concurrency: int) -> list[AccountRecord]:

@@ -349,13 +349,17 @@ class RemailClient:
         return m
 
     def wait_for_mail(self, email: str, match: Callable[[Mail], bool], *,
-                      timeout: float = 300.0, interval: float = 2.0,
+                      timeout: float = 300.0, interval: float = 0.5,
                       since_ms: int | None = None) -> Mail | None:
         """轮询等一封满足条件的邮件。
 
         与 `TempMailClient.wait_for_mail` 同签名 —— 这是两个后端能被 stages
         层互换的关键。区别只在**限流**：Remail 会在响应里给
         `fetch.nextFetchAllowedAt`，轮询间隔要尊重它，否则白打请求。
+
+        ⚠️ 注意 `interval` 在这里只是**下界**（下面 `wait = max(interval, 服务端节流)`）
+        ⇒ 把它从 2.0 调到 0.5 对 Remail 是**无害的 no-op**，服务端节流更大时仍以它为准。
+        理由与成本核算见 `stages.MAIL_POLL_INTERVAL`。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:

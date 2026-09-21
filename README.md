@@ -81,7 +81,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
 $PY tools/run_e2e.py --doctor --mail-backend remail   # Remail 体检：只读，**不下单**
-$PY tools/selftest.py                  # 自测 269 项，离线可跑
+$PY tools/selftest.py                  # 自测 282 项，离线可跑
 $PY tools/run_e2e.py --count 5         # ★ 全链路：建邮箱 → 发信 → 登录 → 建 key
 $PY tools/run_e2e.py --count 10 --concurrency 4   # 并发
 $PY tools/run_e2e.py --count 1 --mail-backend remail  # ★ 换 Remail 后端（**每单扣积分**）
@@ -168,7 +168,7 @@ tools/                     入口脚本
                            进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
   normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
   selftest.py              自测**入口**：只做聚合与调度（27 个用例段在 `tests/`）
-  tests/                   自测本体（6 个文件 2101 行，269 项，含负对照，**全程离线**）
+  tests/                   自测本体（6 个文件 2231 行，282 项，含负对照，**全程离线**）
     __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
     support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
     test_parsing.py          解析层（紧凑 JSON / Server Action / JS 字面量 / HTML 实体）

@@ -239,7 +239,7 @@ $PY tools/check_deliverables.py     # ★ 独立复核那 4 份（只读；退�
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 269 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 282 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -262,8 +262,9 @@ $PY tools/selftest.py      # 269 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 登录：Server Action 编号漂移 → 重试 | 7 | 缺索引先原样重试，别把编号漂移当"页面结构变了" |
 | `test_orchestration` | onboarding：站点门禁驱动 | 11 | 门禁链按站点重定向走；未知步骤报名字；非 `/setup/*` 跳转不许当"已通过" |
 | `test_orchestration` | 编排：门禁是引导，不是门槛 | 9 | ★ **门禁卡住但 key 建得出 ⇒ 必须记 `keyed`**（不误报 partial）；同一跳只提交一次；有界停下 |
+| `test_orchestration` | 编排：A1 跳过 onboarding（含 `_clone` 透传） | 10 | ★ 默认路径**一步都不提交**（只问一次门禁留痕）；`--strict-onboarding` 才走全链；`_clone()` 漏传 ⇒ 并发下静默退回旧行为（串行复现不出） |
 | `test_orchestration` | 登录：码模式 → 魔法链接回捞 | 5 | 同一次发码可能回**链接**而非码（实测 4 次里 1 次） |
-| `test_orchestration` | 编排：确认邮件等待阈值 | 11 | **迟到 ≠ 未发**；阈值不许退回 180s；超时文案必须带轮询计数 |
+| `test_orchestration` | 编排：确认邮件等待阈值 | 14 | **迟到 ≠ 未发**；阈值不许退回 180s；超时文案必须带轮询计数；★ 轮询间隔必须**真的传到 `wait_for_mail`**（数实参，不是读常量） |
 | `test_orchestration` | 编排：resume 不重复建 key | 4 | `resume` 不许给同一账号建第二把 key（含"没 key 的照常处理"正对照） |
 | `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
 | `test_orchestration` | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
@@ -276,7 +277,7 @@ $PY tools/selftest.py      # 269 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 工具：交付物复核必须只读（源码级） | 7 | ★ 不许有写盘调用点（`open w/a/x` · `write_text` · `os.remove/rename` · `shutil`）；**正则里不许写死 key 的 hex 长度**（写死会造出"459 条全畸形"的假警报）；退出码 0/1 |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **269 项**（27 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
+> 合计 **282 项**（28 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
 > 所以按输出分段统计时它会被算进**最后一个**用例段（当前是「交付物复核必须只读」，
 > 显示 8 而非 7）——想复算就按"最后一段减 1"处理。
 >

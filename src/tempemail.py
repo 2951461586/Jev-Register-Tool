@@ -152,13 +152,16 @@ class TempMailClient:
         return out
 
     def wait_for_mail(self, email: str, match: Callable[[Mail], bool], *,
-                      timeout: float = 300.0, interval: float = 2.0,
+                      timeout: float = 300.0, interval: float = 0.5,
                       since_ms: int | None = None) -> Mail | None:
         """轮询等一封满足条件的邮件。
 
         `since_ms` 用于跳过历史邮件 —— 同一个地址可能已经收过旧邮件。
         读信必须当场读走：该 Worker 的 retention 是"全表 100 行"，
         我们自己跑批次时写入速率可达 ~600 封/时，未读邮件存活仅约 10 分钟。
+
+        ⚠️ `interval` 默认值 2026-09-21 从 2.0 降到 **0.5**，理由与成本核算见
+        `stages.MAIL_POLL_INTERVAL`（那边是生产策略的真源，这里是同签名默认值）。
         """
         deadline = time.time() + timeout
         while time.time() < deadline:

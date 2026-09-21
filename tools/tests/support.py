@@ -73,7 +73,14 @@ class _FakeTempMailClient:
     def create_mailbox(self, domain: str | None = None) -> str:
         return f"fake-{self._n}@example-mail.test"
 
+    #: 最近一次 `wait_for_mail` 收到的 `interval`（A2 的接线判据）。
+    #: 🔴 为什么要记它：把常量从 2.0 改成 0.5、却没让 `_wait_with_retry`
+    #: 真的把它传下去，是本项目最忌讳的"看着改了其实没生效"。
+    #: 只有把**实参**记下来才钉得住 —— 读常量本身是读不出这个错的。
+    last_interval = None
+
     def wait_for_mail(self, email, match, *, timeout=0.0, interval=0.0, since_ms=None):
+        type(self).last_interval = interval
         for m in type(self).pending:
             if m.recipient in (email, "*") and match(m):
                 return m
@@ -172,12 +179,30 @@ class _FakeTypeSafe:
                 "org_memberships": []}
 
     def complete_onboarding(self, display_name="x"):
+        type(self).onboarding_calls += 1
         if type(self).onboarding_ok:
             return Result(ok=True, stage="onboarding", data={"completed": []})
         return Result(ok=False, stage="onboarding",
                       error="遇到不认识的引导步骤 'console-survey'",
                       data={"completed": [], "gates": ["console-survey"],
                             "via": [], "stopped": "不认识的引导步骤"})
+
+    #: `onboarding_gate()` 的累计调用次数。
+    #: 🔴 A1（默认跳过门禁链）**仍要问一次**门禁状态当留痕 ⇒ 这个计数就是
+    #: "跳过时到底有没有留痕"的判据：跳过路径应为 **1**，走全链时更多。
+    #: 没有它就只能断言"没有 POST /setup/*"，而**漏掉留痕**这件事完全测不出来。
+    gate_calls = 0
+    #: `complete_onboarding()` 的累计调用次数 —— A1 跳过路径必须为 **0**。
+    onboarding_calls = 0
+
+    #: `onboarding_gate()` 的替身返回值。默认 `"tos"`（**非空**）——
+    #: 刻意不是 `""`：空值意味着"门禁本来就通过"，那样测出来的是
+    #: "没有门禁可跳"，而 A1 要证的恰恰是"**有**门禁也可以跳"。
+    gate_value = "tos"
+
+    def onboarding_gate(self):
+        type(self).gate_calls += 1
+        return type(self).gate_value
 
     def create_api_key(self, name="1"):
         if type(self).fail_key:
@@ -228,6 +253,9 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
     _FakeTypeSafe.fail_key = fail_key
     _FakeTypeSafe.onboarding_ok = onboarding_ok
     _FakeTypeSafe.send_calls = 0
+    _FakeTypeSafe.gate_calls = 0
+    _FakeTypeSafe.onboarding_calls = 0
+    _FakeTypeSafe.gate_value = "tos"
     fake = {
         "TypeSafeClient": _FakeTypeSafe,
         "TempMailClient": _FakeTempMailClient,
@@ -244,16 +272,21 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
         _FakeRemailClient.created = []
 
 
-def _make_pipe(P, ledger: Ledger, success: Ledger | None = None):
+def _make_pipe(P, ledger: Ledger, success: Ledger | None = None, *,
+               strict_onboarding: bool = False):
     """造一个**全离线**的 Pipeline。
 
     🔴 `success_ledger` 必须显式传临时台账。它的默认值是
     `config.SUCCESS_LEDGER_PATH` —— 那是**交付物**（`result/success.jsonl`）。
     不传就等于让自测往交付物里写 `apikey_FAKE_*`：实测灌进去 9 条假记录，
     而 `verify_keys` 读的是**主台账**，所以一路没人发现。
+
+    `strict_onboarding` 默认 `False` = 走 A1（跳过门禁链），与生产默认一致 ——
+    要测门禁链本身的用例必须**显式**传 `True`。
     """
     return P.Pipeline(mail=P.TempMailClient(), ledger=ledger,
-                      success_ledger=success or _tmp_ledger(), verbose=False)
+                      success_ledger=success or _tmp_ledger(), verbose=False,
+                      strict_onboarding=strict_onboarding)
 
 
 def _otp_mail(to: str, code: str = "123456") -> Mail:

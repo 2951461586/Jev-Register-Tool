@@ -218,6 +218,15 @@ def main() -> int:
                          "邮箱客户端，只共享台账。站点对'短时间大量发信'的容忍度未知，"
                          "建议先小批串行试跑")
     ap.add_argument("--key-name", default="1", help="API Key 名称")
+    ap.add_argument("--strict-onboarding", action="store_true",
+                    help="走**完整** onboarding 门禁链（/hook → /setup/tos → "
+                         "/setup/set-name）。默认**跳过** —— 前提探针实测"
+                         "（exports/_probe_skip_onboarding.py，两轮 **15/15** 建起会话的"
+                         "账号）：一步门禁都不提交（门禁停在 `tos`）也能建出**可用** key"
+                         "（真打接口 200 / model=jev-1.13.0）。实测 `create_key` 中位 "
+                         "4.80s → 0.82s（跨 10 批 371 个旧样本，区间不重叠）。"
+                         "⚠️ 两个用途：① 站点改门禁时拿完整门禁序列做诊断；"
+                         "② 做**同日对照臂**，验证跳过门禁的收益不是站点波动")
     ap.add_argument("--json", default="", help="把结果写到这个文件")
     ap.add_argument("--doctor", action="store_true", help="只做环境体检")
     args = ap.parse_args()
@@ -239,7 +248,8 @@ def main() -> int:
         return cmd_scan(args.mail_backend)
 
     pipe = Pipeline(backend=args.mail_backend, domain=args.domain or None,
-                    login_mode=args.login_mode)
+                    login_mode=args.login_mode,
+                    strict_onboarding=args.strict_onboarding)
     kw = {}
     if args.mail_timeout is not None:
         kw["mail_timeout"] = args.mail_timeout

@@ -111,6 +111,29 @@ RETRY_SEND_ON_TIMEOUT = True
 #: 而且真有第二次丢包时，让账号落到 `relogin_pending`（不设 `since_ms`，
 #: 能复用历史链接）比在批内死磕更有效。
 MAX_SEND_RETRIES = 1
+
+#: 等信轮询间隔（秒）。**2026-09-21 从 2.0 降到 0.5**（对照第三方注册机的 A2 项）。
+#:
+#: 🔴 为什么值得降 —— 依据是**实测延迟分布**与**单次轮询的成本**，不是"别人快我也快"：
+#:   · 邮件 3s 级必到（43 个成功账号实测 `mail_at − created_at`：
+#:     min 2.66 / P50 3.26 / P90 3.80 / max 4.57）；
+#:   · 而**轮询粒度会把"邮件已到"到"我们发现"之间的空等直接加上去**：
+#:     实测单轮周期 = `interval + RTT` ≈ **2.26s**（台账里 60s 超时账号报
+#:     "轮询 53 次"，而它是 60s+60s 两轮 ⇒ 120s/53 ≈ 2.26s）。
+#:     间隔 2.0 ⇒ P50 账号平均白等约 **1.5s**；间隔 0.5 ⇒ 白等降到 0.5s 以内。
+#:
+#: ⚠️ **不要学对照项目的 0.05s**：那是在 2.0→0.5 的基础上**再翻 10 倍请求量**，
+#:    换来的只是"再少等 0.4s"，纯属对自己的 Worker 放大请求。0.5s 是收益/成本拐点。
+#:
+#: 成本核算（为什么这个方向安全）：轮询打的是**我们自己的** CF Worker
+#: `GET /api/inbox?email=…`（走索引端点，读 0~2 行），**不碰站点**，
+#: 所以不存在"更快轮询会不会把站点惹毛"的问题。请求量约 ×3
+#: （同一 120s 窗口 53 → 约 158 次），远在免费额度之内。
+#:
+#: ⚠️ 对 **Remail** 后端这个值只是**下界**：它的实现是
+#: `wait = max(interval, 服务端 nextFetchAllowedAt)`，服务端节流更大时以服务端为准
+#: ⇒ 调小它对 Remail 是**无害的 no-op**，不会白打请求。
+MAIL_POLL_INTERVAL = 0.5
 # 本模块写入的 `status` 字面量（registered / keyed / partial / failed）必须在
 # `ledger.RANK` 里有登记 —— 台账的升级/降级判断依赖它。
 # 自测 `test_status_vocabulary` 会用 AST 扫本文件，漏登记新状态会直接失败。
@@ -216,7 +239,8 @@ class StageMixin:
         tries = 0
         while True:
             m = self.mail.wait_for_mail(rec.email, match, timeout=mail_timeout,
-                                        interval=2.0, since_ms=since_ms)
+                                        interval=MAIL_POLL_INTERVAL,
+                                        since_ms=since_ms)
             if m is not None:
                 break
             if (not allow_retry or not RETRY_SEND_ON_TIMEOUT
@@ -484,21 +508,56 @@ class StageMixin:
           · key 建出来 ⇒ `keyed`，并把 onboarding 的实况一并留在 `user` 里；
           · key 建不出来 ⇒ 才判失败，且把 onboarding 的实况附在错误里
             （否则"建 key 失败"会让人去查配额，而真因可能是门禁形态变了）。
+
+        🔴 **2026-09-21 晚：默认整条跳过门禁链（A1），`strict_onboarding=True` 才走全链**
+        ─────────────────────────────────────────────────────────────────────
+        上面那段证据只证明「**第三跳**（`console-survey`）可以不做」——
+        因为那种情形下 `tos` 与 `set-name` **都已经提交过**了。
+        拿它当"整条链都能跳过"的依据是**过度外推**，所以另做了 A1 前提探针
+        （`exports/_probe_skip_onboarding.py`）：新建账号、建起会话后
+        **一步门禁都不提交**，直接建 key 再**真打推理接口**。
+
+        实测（n=3 建起会话的账号，门禁均为 `'tos'` 即确实一步未提交）：
+            3/3 建出 key，且 3/3 真打 `HTTP 200 model=jev-1.13.0`
+        ⇒ 整条门禁链对"能否拿到**可用** key"**无影响**，可以跳过。
+
+        省下的是 1 次 `GET /hook` + 最多 2 次 `POST /setup/*`（约 0.5~1.5s/账号）。
+
+        ⚠️ 三条约束（缺一条就不要跳）：
+          1. **留痕不许省**：跳过时仍要问一次 `onboarding_gate()` 并把当时的门禁值
+             记进 `stages["onboarding"]="skipped"` 与 `user["onboarding_gates"]`
+             —— 否则"门禁形态变了"这件事在台账里会彻底消失。
+          2. **`--strict-onboarding` 必须留着**：站点改门禁时，只有它能给出
+             完整的门禁序列用于诊断。
+          3. **判据仍归建 key**：跳过 onboarding **不等于**放宽"成不成"的判定。
         """
         t0 = time.time()
-        ob = cl.complete_onboarding(display_name=rec.email.split("@")[0][:24])
-        rec.user["onboarding"] = ob.data.get("completed", [])
-        if ob.ok:
-            rec.stages["onboarding"] = "ok"
+        if self.strict_onboarding:
+            ob = cl.complete_onboarding(display_name=rec.email.split("@")[0][:24])
+            rec.user["onboarding"] = ob.data.get("completed", [])
+            if ob.ok:
+                rec.stages["onboarding"] = "ok"
+            else:
+                rec.stages["onboarding"] = "partial"
+                self.log(f"  [onboarding] ⚠ 门禁未归零：{ob.error}")
+                self.log(f"  [onboarding]   （门禁序列 {ob.data.get('gates')}；"
+                         f"仍继续建 key —— 门禁是引导，不是硬门槛）")
+            ob_ok, ob_err = ob.ok, ob.error
         else:
-            rec.stages["onboarding"] = "partial"
-            self.log(f"  [onboarding] ⚠ 门禁未归零：{ob.error}")
-            self.log(f"  [onboarding]   （门禁序列 {ob.data.get('gates')}；"
-                     f"仍继续建 key —— 门禁是引导，不是硬门槛）")
+            # A1：只**问一次**门禁状态当留痕，不提交任何一步。
+            # ⚠️ 必须仍问这一次 —— 门禁形态变化（例如站点新加一步）是重要信号，
+            #    跳过提交不等于可以不记录。
+            gate = cl.onboarding_gate()
+            rec.user["onboarding"] = []
+            rec.user["onboarding_gates"] = [gate or "(已通过)"]
+            rec.user["onboarding_skipped"] = True
+            rec.stages["onboarding"] = "skipped"
+            self.log(f"  [onboarding] 跳过门禁链（A1）；当前门禁 = {gate or '(已通过)'}")
+            ob_ok, ob_err = True, ""
         try:
             key = cl.create_api_key(name)
         except TypeSafeError as exc:
-            detail = "" if ob.ok else f"｜onboarding 未归零：{ob.error}"
+            detail = "" if ob_ok else f"｜onboarding 未归零：{ob_err}"
             return self._fail(rec, "api_key", f"建 key 失败: {exc}{detail}",
                               status="partial")
 

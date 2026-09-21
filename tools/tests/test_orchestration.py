@@ -26,8 +26,13 @@ def test_auth_error_triage() -> None:
         rec = _make_pipe(P, led).resume(["ok@example-mail.test"])[0]
     check("200 → status=keyed", rec.status == "keyed", rec.status)
     check("200 → 拿到 api_key", bool(rec.api_key), repr(rec.api_key))
-    check("200 → 三个阶段都记 ok",
-          all(rec.stages.get(k) == "ok" for k in ("login", "onboarding", "api_key")),
+    # ⚠️ `onboarding` 默认记 `"skipped"`（A1 跳过门禁链）而不是 `"ok"` ——
+    #    这是**刻意**的：跳过不等于"门禁通过了"，两者不能混成同一个值，
+    #    否则台账里就分不出"真的走完了门禁"和"压根没走"。
+    check("200 → login/api_key 记 ok，onboarding 记 skipped（A1 默认）",
+          rec.stages.get("login") == "ok"
+          and rec.stages.get("api_key") == "ok"
+          and rec.stages.get("onboarding") == "skipped",
           str(rec.stages))
 
     # 401 Code expired
@@ -208,9 +213,10 @@ def test_auth_callback_payload_shape() -> None:
 def test_onboarding_gate_drives_steps() -> None:
     """🔴 onboarding 的判据是**站点的重定向**，不是 `/api/me` 的字段。
 
-    2026-09-21 实测：站点把 onboarding 从三步缩成**两步**（删掉了 console-survey），
+    2026-09-21 实测：站点在 onboarding **步数上自己不稳定**（`console-survey`
+    时有时无；同日 100 批实测 28/68 账号走到它，另 34 个卡在 `set-name` 重复出现），
     而旧实现用 `/api/me` 的 `console_survey_completed_at` 判断"要不要跑 survey"
-    ⇒ 该字段永远为 `None` ⇒ 每次都多发一次 survey POST ⇒ 而那时页面渲染的是
+    ⇒ 该字段长期为 `None` ⇒ 每次都多发一次 survey POST ⇒ 而那时页面渲染的是
     欢迎页、**没有 `$ACTION_*` 隐藏域** ⇒ 退化到已作废的 fallback ⇒ 404
     ⇒ **账号明明已经完全 onboard，却被记成 `partial`**（实跑 25 个误报 19 个）。
 
@@ -229,7 +235,7 @@ def test_onboarding_gate_drives_steps() -> None:
           ob.data.get("completed") == ["tos", "set-name"],
           str(ob.data.get("completed")))
     check("确实 POST 了两次（每步一次）", len(ses.posts) == 2, str(len(ses.posts)))
-    check("★ 没有出现 console-survey（站点已删这一步）",
+    check("★ 门禁只报 tos/set-name 时不碰 console-survey（站点没让它出现）",
           not any("console-survey" in str(p["url"]) for p in ses.posts),
           str([p["url"] for p in ses.posts]))
 
@@ -480,6 +486,21 @@ def test_mail_timeout_headroom() -> None:
           st.RETRY_SEND_ON_TIMEOUT, "RETRY_SEND_ON_TIMEOUT=False")
     check("★ 重发次数有界（防死循环把站点打爆）",
           1 <= st.MAX_SEND_RETRIES <= 3, f"MAX_SEND_RETRIES={st.MAX_SEND_RETRIES}")
+
+    # ── A2：等信轮询间隔必须**真的**传下去 ──────────────────────────────
+    # 🔴 只改常量钉不住它：`_wait_with_retry` 里原本**写死** `interval=2.0`，
+    #    把常量改漂亮而不改调用点，跑批一点变化都不会有，且**不报任何错**。
+    #    ⇒ 唯一有效的判据是数**实参**（替身把收到的 interval 记下来了）。
+    check("★ A2 轮询间隔取自常量（单一真源，调用点不许写字面量）",
+          st.MAIL_POLL_INTERVAL == 0.5, f"MAIL_POLL_INTERVAL={st.MAIL_POLL_INTERVAL}")
+    check("★ A2 间隔有下限（别学对照项目的 0.05s —— 那只是放大自己的请求量）",
+          st.MAIL_POLL_INTERVAL >= 0.2, f"{st.MAIL_POLL_INTERVAL}")
+    with offline(mails=[_confirm_mail("iv@example-mail.test")]) as P:
+        _make_pipe(P, _tmp_ledger()).resume(["iv@example-mail.test"])[0]
+        seen = P.TempMailClient.last_interval
+    check("★★ A2 轮询间隔**真的**传到了 wait_for_mail（不是只改了常量）",
+          seen == st.MAIL_POLL_INTERVAL,
+          f"实参={seen!r} 常量={st.MAIL_POLL_INTERVAL!r}")
 
     # 超时文案必须点明"丢包 + 链接 7 天有效 ⇒ 重跑比改请求有效"。
     # 否则运维只会看到一句"没收到"，而它的正确处置（重跑）在假阴性场景下
@@ -805,10 +826,12 @@ def test_onboarding_gate_is_guidance_not_a_gate() -> None:
     check("★ 已提交过的步骤不会被重复 POST",
           len(ses2.posts) == 1, f"POST 次数={len(ses2.posts)}")
 
-    # 端到端：门禁卡住 + key 建得出来 ⇒ 必须记 keyed，且留痕说明门禁没归零
+    # 端到端：门禁卡住 + key 建得出来 ⇒ 必须记 keyed，且留痕说明门禁没归零。
+    # ⚠️ 必须 `strict_onboarding=True`：A1 之后默认**跳过**门禁链，
+    #    "门禁卡住"这个场景只有走全链（诊断模式）才会发生。
     with offline(mails=[_confirm_mail("g2@example-mail.test")],
                  onboarding_ok=False) as P:
-        pipe = _make_pipe(P, _tmp_ledger())
+        pipe = _make_pipe(P, _tmp_ledger(), strict_onboarding=True)
         rec = pl.AccountRecord(key="g2@example-mail.test",
                                email="g2@example-mail.test")
         cl3 = pipe.stage_login(rec, mail_timeout=1.0)
@@ -821,6 +844,80 @@ def test_onboarding_gate_is_guidance_not_a_gate() -> None:
           rec.stages.get("onboarding") == "partial",
           str(rec.stages))
     check("★ 成功路径不往 error 里写东西", rec.error == "", repr(rec.error))
+
+
+def test_skip_onboarding_a1() -> None:
+    """🔴 A1：默认**跳过** onboarding 门禁链，但仍要留痕；`--strict-onboarding` 才走全链。
+
+    前提是**实测过**的，不是推断：`exports/_probe_skip_onboarding.py`
+    （2026-09-21 晚，n=7 建起会话的账号）—— 一步门禁都不提交（门禁实测停在 `'tos'`），
+    7/7 建出 key，且 7/7 真打推理接口返回 `HTTP 200 model=jev-1.13.0`。
+
+    ⚠️ 为什么单独立一个用例（而不是改改上一个）：这里钉的是**接线**，
+    不是站点语义。三条接线漏任何一条，跑批都会静默退化：
+      ① 默认路径真的不提交（`complete_onboarding` 调用数 = 0）；
+      ② 默认路径**仍然问一次门禁**并写进台账（`onboarding_gate` = 1、`stages` 记 `skipped`）；
+      ③ `_clone()` **透传** `strict_onboarding` —— 漏了它，并发跑批会静默回到全链，
+         而串行 `concurrency=1` 永远复现不出来（与 `_clone()` 漏传 `mail` 同一类坑）。
+    """
+    print("\n[编排：A1 跳过 onboarding（含 _clone 透传）]")
+
+    # ① + ② 默认路径
+    with offline(mails=[_confirm_mail("a1@example-mail.test")]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        check("★ 默认 strict_onboarding=False（A1 生效）",
+              pipe.strict_onboarding is False, str(pipe.strict_onboarding))
+        rec = pl.AccountRecord(key="a1@example-mail.test",
+                               email="a1@example-mail.test")
+        cl = pipe.stage_login(rec, mail_timeout=1.0)
+        pipe.stage_create_key(rec, cl, name="1")
+        # ⚠️ 计数读 `st`（src.stages）**不是** `P`（src.runner）：
+        #    `TypeSafeClient` 的 patch 接缝只在 `src.stages` 里
+        #    （`runner` 不 import 它）—— 读错模块会 AttributeError。
+        ob_calls = st.TypeSafeClient.onboarding_calls
+        gate_calls = st.TypeSafeClient.gate_calls
+    check("★★ 跳过路径**不提交**门禁链（complete_onboarding 调用数 = 0）",
+          ob_calls == 0, f"complete_onboarding 调用数={ob_calls}")
+    check("★★ 但**仍然问一次**门禁（留痕不许省）",
+          gate_calls == 1, f"onboarding_gate 调用数={gate_calls}")
+    check("★ 留痕：stages 记 skipped（不是 ok —— 跳过 ≠ 通过）",
+          rec.stages.get("onboarding") == "skipped", str(rec.stages))
+    check("★ 留痕：把当时的门禁值写进 user（门禁形态变化时查得到）",
+          rec.user.get("onboarding_gates") == ["tos"]
+          and rec.user.get("onboarding_skipped") is True,
+          str(rec.user))
+    check("★★ 跳过 onboarding **不放宽**判据：key 照建，status=keyed",
+          rec.status == "keyed" and bool(rec.api_key),
+          f"status={rec.status} key={rec.api_key!r}")
+
+    # ③ strict 模式走全链
+    with offline(mails=[_confirm_mail("a2@example-mail.test")]) as P:
+        pipe2 = _make_pipe(P, _tmp_ledger(), strict_onboarding=True)
+        rec2 = pl.AccountRecord(key="a2@example-mail.test",
+                                email="a2@example-mail.test")
+        cl2 = pipe2.stage_login(rec2, mail_timeout=1.0)
+        pipe2.stage_create_key(rec2, cl2, name="1")
+        ob_calls2 = st.TypeSafeClient.onboarding_calls
+    check("★ strict 模式**走**全链（complete_onboarding 调用数 = 1）",
+          ob_calls2 == 1, f"complete_onboarding 调用数={ob_calls2}")
+    check("★ strict 模式留痕是 ok（门禁归零）",
+          rec2.stages.get("onboarding") == "ok", str(rec2.stages))
+
+    # ③' `_clone()` 透传。
+    # ⚠️ **只有 `True` 那个方向是真检测**：漏传时 `False` 会被默认值掩盖
+    #    （父子都是 False，断言照样过）。所以断言必须用 `True`，
+    #    并把这个不对称性写出来 —— 否则下一个人会以为两边都测到了。
+    with offline() as P:
+        p_true = _make_pipe(P, _tmp_ledger(), strict_onboarding=True)
+        c_true = p_true._clone()
+        check("★★ _clone() 透传 strict_onboarding=True（漏传会静默退回 A1）",
+              c_true.strict_onboarding is True,
+              f"父={p_true.strict_onboarding} 子={c_true.strict_onboarding}")
+        p_false = _make_pipe(P, _tmp_ledger(), strict_onboarding=False)
+        c_false = p_false._clone()
+        check("  [记录] False 方向被默认值掩盖，不构成检测（仍然断言一下）",
+              c_false.strict_onboarding is False,
+              f"父={p_false.strict_onboarding} 子={c_false.strict_onboarding}")
 
 
 def test_mail_backend_selection() -> None:

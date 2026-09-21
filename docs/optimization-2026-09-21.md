@@ -382,7 +382,7 @@ Remail（`remail.aishop6.com`）是聚合接码服务，接口形态与 CF **完
 
 ⇒ **`=D8` 是 token 的字面字符，不是 quoted-printable 转义；不能靠"还原转义"修，只能换候选。**
 
-**修复**（`src/parsing.py` 160 → **206** 行、`src/stages.py` 503 → **516** 行）：
+**修复**（`src/parsing.py` 160 → **205** 行、`src/stages.py` 503 → **516** 行）：
 - `extract_magic_links()` 返回**全部去重候选、完整优先**（`_looks_complete()` 用 `[?&]token=`
   **锚定参数名起点** —— 否则会被 `stytch_token_type=magic_links` 里的 `token=` 子串骗）
 - `_exchange_link()` **按序试到拿到会话**（判据是**终态**，不是"URL 长得对不对"）。

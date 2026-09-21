@@ -118,7 +118,7 @@ Jev-Register-Tool/
 | `config.py` | 176 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` / `validate_remail()` 启动校验 | 无 |
 | `mailrules.py` | 288 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
 | `ledger.py` | 244 | 台账读写、并集合并、等级语义 | 无 |
-| `parsing.py` | 206 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
+| `parsing.py` | 205 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
 | `tempemail.py` | 183 | CF Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `remail.py` | 385 | Remail 聚合收信（**第二个后端**：下单 / 取件 / 取全文 / 凭证落盘） | `config` `tempemail`（复用 `Mail` `Stats`） |
 | `typesafe.py` | 551 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |

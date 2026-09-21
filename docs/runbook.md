@@ -213,7 +213,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 161 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 172 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -240,8 +240,10 @@ $PY tools/selftest.py      # 161 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
+| `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
+| `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **161 项**（20 段）。
+> 合计 **172 项**（21 段 + 1 项入口元检查）。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >
@@ -377,8 +379,22 @@ $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路
 判读：`A. 渐进增强` 通路 200 而 `B. 降级` 通路 404 ⇒ **解析器的问题，不是站点挂了**。
 
 **已修**：`_actions_from_html` 改成扫**任意** `<n>`、只要求 `:0` 存在，
-`:1`/`:2` 有就收没有就不发，并带出 `$ACTION_KEY`。
+`:1`/`:2` 有就收没有就不发，并带出 `$ACTION_KEY`
+（该函数现已挪到 `src/parsing.py`，公开名 `actions_from_html`）。
 自测 `[Server Action 渲染形态]` 12 项钉住（含"旧实现在新形态上必须返回空"的负对照）。
+
+**2026-09-21 补修 —— 上面"为什么难定位"的结构性成因**：`post_setup()` 里的
+`except TypeSafeError: acts = {}` 是**静默**的。它把"没抓到隐藏域"吞掉，
+再退化到一张**已知全部作废**的 action id 表，最终只留下一句 `HTTP 404`。
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 降级时 | 静默，日志里看不出走过降级 | `⚠ post_setup(...) 未抓到 $ACTION_* 隐藏域 —— 退化到降级通路…` |
+| 失败时 `error` | `HTTP 404` | `HTTP 404 —— 且本次走的是**降级通路**（未抓到 $ACTION_* 隐藏域：…）；该通路的 action id 为录制值，站点改版后必失效。下一步：跑 tools/probes/probe_onboarding.py 看页面实际渲染形态` |
+
+⇒ **再看到 `onboarding 失败` 时，先看 `error` 里有没有"降级通路"四个字**：
+有 ⇒ 就是本节这类问题（解析器 / 站点改版）；没有 ⇒ 才是别的失败。
+自测 `[编排：setup 降级通路可观测]` 10 项钉住（含"正常路径不许打降级告警"的负对照）。
 
 ### 4.7 长等待被前台超时杀掉
 
@@ -401,5 +417,7 @@ $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路
 - ❌ 别把会话 client 挂成 `Pipeline` 的实例字段（并发会串号）
 - ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）
 - ❌ 别把 `$ACTION_<n>` 的索引集合写死（`/login` 用 2/3/4，`/setup/*` 用 1）
-- ❌ 别信 `FALLBACK_SETUP_ACTIONS` 里的 action id 长期有效（部署一变就作废）
+- ❌ 别信 `FALLBACK_SETUP_ACTIONS` 里的 action id 长期有效（部署一变就作废）。
+  它是**最后手段**不是可用通路 —— 走它必定打告警（2026-09-21 起），
+  看到告警就去查页面实际渲染形态，别指望它自己能成功
 - ❌ 别看到 `confirm` 超时就直接重投申请（先回查收件箱，迟到 ≠ 未发）

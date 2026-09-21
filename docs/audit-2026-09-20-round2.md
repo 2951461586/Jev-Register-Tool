@@ -898,7 +898,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 #       修复后改为**验证不变量**，全绿才算过。
 "$PY" .workbuddy-ai/audit/repro_fanout.py
 
-# 4) 自测（应为 161 项通过）
+# 4) 自测（应为 172 项通过；round2 当时是 161，09-21 第三轮 +11）
 "$PY" tools/selftest.py
 
 # 5) 活文档的数字有没有漂（批次 B 新增）
@@ -936,9 +936,9 @@ print('stages → runner :', 'runner' in edges['stages'], '(应为 False)')
 PY
 
 # 8) 批次 C 新增：自测可从任意 CWD 跑（验证 tests/support.py 的 path 引导）
-cd /tmp && "$PY" <仓库根>/tools/selftest.py | tail -3   # 末行仍应为 "通过 161 / 失败 0"
+cd /tmp && "$PY" <仓库根>/tools/selftest.py | tail -3   # 末行应为 "通过 172 / 失败 0"（round2 当时 161）
 
-# 9) 批次 C 新增：check() 调用点总数（文档里的 161 是**执行**项数，以运行输出为准）
+# 9) 批次 C 新增：check() 调用点总数（文档里的 172 是**执行**项数，以运行输出为准）
 grep -c "^[[:space:]]*check(" tools/tests/test_*.py
 ```
 

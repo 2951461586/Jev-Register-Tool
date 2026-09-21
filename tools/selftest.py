@@ -23,6 +23,11 @@
 魔法链接有多份、**只有一部分完整**时，必须挑完整的用（旧实现取第一个 ⇒
 取到残缺那条就必失败，实测 4/100 账号栽在这里）。
 
+同日新增两个**工具护栏**（判据是**调用点**不是关键词，且都含负对照）：
+`test_remail_probe_is_readonly`（付费后端上的探针绝不许下单）与
+`test_check_deliverables_is_readonly_and_loose`（交付物复核工具只读 +
+正则不许写死 key 的 hex 长度 —— 写死长度会造出"459 条全畸形"的假警报）。
+
 ⚠️ **仍然不是 pytest**（刻意不引）：本项目零第三方依赖，跑法不变 ——
     $PY tools/selftest.py
 共享夹具见 `tests/support.py`。
@@ -43,6 +48,7 @@ from tests.test_mailrules import test_mailrules, test_otp_extraction  # noqa: E4
 from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa: E402
                                       test_auth_error_triage,
                                       test_chain_has_no_external_gate,
+                                      test_check_deliverables_is_readonly_and_loose,
                                       test_code_mode_falls_back_to_magic_link,
                                       test_concurrency_no_crosstalk,
                                       test_fan_out_worker_crash_is_recorded,
@@ -121,6 +127,7 @@ def main() -> int:
     test_mail_backend_selection()
     test_magic_link_tries_all_candidates()
     test_remail_probe_is_readonly()
+    test_check_deliverables_is_readonly_and_loose()
 
     # 元检查：登记完整性。放在最后跑，因为它扫的是本文件自己。
     gap, ghost = _registry_gap()

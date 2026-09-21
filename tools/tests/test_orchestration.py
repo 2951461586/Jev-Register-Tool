@@ -1154,3 +1154,51 @@ def test_remail_probe_is_readonly() -> None:
         check(f"★ 退出码契约含 `{code}`", code in src, code)
 
 
+def test_check_deliverables_is_readonly_and_loose() -> None:
+    """`tools/check_deliverables.py` 必须**只读**，且**不许写死 key 的 hex 长度**。
+
+    🔴 为什么需要（2026-09-21 实测，两个都会静默误导）：
+
+    ① **它跑在交付物上**。这是验收链路的最后一环，工具自己写坏 `result/` 是最贵的失效 ——
+       而且 `verify_keys.py` 已经把 `keys.txt` 覆盖写一遍了，再来一个写手就没人能分清
+       是哪一步改的。判据是**调用点**（`open(..., "w")` / `.write_text` / `os.remove` …），
+       不是关键词 —— 模块 docstring 里**必须**能提"不写任何文件"。
+
+    ② **写死 key 的 hex 长度就是假警报的源头**。第一版把形态写成
+       `apikey_<32hex>_<64hex>` ⇒ 459 条全被判"畸形"、`apikeys.txt` 与 `keys.txt` 的差集
+       凭空出现 **918**（459+459），看起来像"两份交付物严重不一致"，其实**只是我的正则错了**。
+       实测形态是 `apikey_<35 hex>_<64 hex>`。
+       ⇒ 护栏：①源码里不许出现 `{32}`/`{35}`/`{64}` 这类**写死的长度量词**；
+               ②拿真实形态喂给它，必须能匹配；③负对照证明它**确实在匹配**而不是恒真。
+    """
+    print("\n[工具：交付物复核必须只读 + 正则不许写死长度]")
+    path = Path(__file__).resolve().parent.parent / "check_deliverables.py"
+    check("★ 复核工具存在", path.is_file(), str(path))
+    src = path.read_text(encoding="utf-8")
+
+    # 1. 没有任何写盘调用点
+    writers = re.findall(
+        r'(open\([^)]*["\'](?:w|a|x)b?["\']|\.write_text\s*\(|\.write_bytes\s*\(|'
+        r'os\.remove\s*\(|os\.rename\s*\(|os\.replace\s*\(|shutil\.)', src)
+    check("★★ 没有写盘调用点（open w/a/x · write_text · os.remove/rename · shutil）",
+          not writers, f"发现 {writers}")
+
+    # 2. 退出码契约：0 全绿 / 1 有不一致
+    check("★ 退出码契约含 `return 0`", "return 0" in src, "0")
+    check("★ 退出码契约含 `return 1`", "return 1" in src, "1")
+
+    # 3. 🔴 不许写死 hex 长度（本次假警报的源头）
+    hard = re.findall(r"apikey_\[0-9a-f\]\{(\d+)\}", src)
+    check("★★ 正则里没有写死的 hex 长度量词（`apikey_[0-9a-f]{N}`）",
+          not hard, f"发现写死长度 {hard}")
+
+    # 4. 宽松正则必须真能匹配实测形态，且**不是恒真**
+    real = ("apikey_" + "a" * 35 + "_" + "b" * 64)
+    m = re.search(r"apikey_[0-9a-f_]{20,}", real)
+    check("★ 宽松正则可匹配实测形态 `apikey_<35hex>_<64hex>`",
+          bool(m) and m.group(0) == real, str(m.group(0) if m else None)[:40])
+    check("[负对照] 同一正则对不含 apikey_ 的串返回 None（证明它在真匹配）",
+          re.search(r"apikey_[0-9a-f_]{20,}", "oai-2de1e64293f748d7@x.cloud") is None,
+          "恒真正则会误报")
+
+

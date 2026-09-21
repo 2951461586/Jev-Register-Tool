@@ -81,13 +81,14 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
 $PY tools/run_e2e.py --doctor --mail-backend remail   # Remail 体检：只读，**不下单**
-$PY tools/selftest.py                  # 自测 262 项，离线可跑
+$PY tools/selftest.py                  # 自测 269 项，离线可跑
 $PY tools/run_e2e.py --count 5         # ★ 全链路：建邮箱 → 发信 → 登录 → 建 key
 $PY tools/run_e2e.py --count 10 --concurrency 4   # 并发
 $PY tools/run_e2e.py --count 1 --mail-backend remail  # ★ 换 Remail 后端（**每单扣积分**）
 $PY tools/run_e2e.py --mode resume --email a@b.com --email c@d.com   # 对已知邮箱补跑
 $PY tools/run_e2e.py --mode scan       # 诊断：列出窗口内全部邮件并按规则分桶（**仅 cf**）
 $PY tools/verify_keys.py               # ★ 验收：真打推理接口 + 导出 result/ 下 4 份交付物
+$PY tools/check_deliverables.py        # ★ 独立复核那 4 份（只读；退出码 0/1，可当门禁）
 ```
 
 > `--concurrency` 对整条链路有效（每个 worker 一个独立会话 + 独立收件箱索引端点，
@@ -166,8 +167,8 @@ tools/                     入口脚本
   resume_pending.py        ★ 补跑台账里还没拿到 key 的账号（幂等，可反复跑）。
                            进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
   normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-  selftest.py              自测**入口**：只做聚合与调度（26 个用例段在 `tests/`）
-  tests/                   自测本体（6 个文件 2053 行，262 项，含负对照，**全程离线**）
+  selftest.py              自测**入口**：只做聚合与调度（27 个用例段在 `tests/`）
+  tests/                   自测本体（6 个文件 2101 行，269 项，含负对照，**全程离线**）
     __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
     support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
     test_parsing.py          解析层（紧凑 JSON / Server Action / JS 字面量 / HTML 实体）
@@ -175,6 +176,8 @@ tools/                     入口脚本
     test_mailrules.py        收件规则 + OTP 抽取
     test_orchestration.py    编排层（错误码分流 / 登录 / 门禁 / 并发 / 邮箱后端选择）
   verify_keys.py           ★ 验收 + 导出可用凭据
+  check_deliverables.py    ★ 独立复核四份交付物（只读）：CR 污染 / apikeys≡keys 集合恒等 /
+                           与 .bak 的差集。**别只信 verify_keys 自己的汇总** —— 它是同一进程的自述
   probes/                  一次性诊断探针（只读，除注明外都不写台账）
     probe_gate_chain.py          ★ 逐跳走 onboarding 门禁 + 最后试建 key
     audit_keys_against_site.py   站点侧对账：`GET /api/api-keys` vs 我们的交付物

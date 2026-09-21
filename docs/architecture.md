@@ -45,8 +45,8 @@ Jev-Register-Tool/
 │   │                          **只信它** —— 走 `Ledger.load()` 合并视图，
 │   │                          不是"末行胜出"（那会让重跑失败把计数压低）
 │   ├── normalize_ledger.py    修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-│   ├── selftest.py            自测**入口**（126 行）：只做聚合与调度 + 登记完整性元检查
-│   ├── tests/                 自测本体（6 个文件 2053 行，262 项，按被测对象分）
+│   ├── selftest.py            自测**入口**（143 行）：只做聚合与调度 + 登记完整性元检查
+│   ├── tests/                 自测本体（6 个文件 2101 行，269 项，按被测对象分）
 │   │   ├── __init__.py        仅为让 `tests` 可当包导入（**不是** pytest 测试包）
 │   │   ├── support.py         共享夹具：`check()` 计数 + 离线替身 + 模块别名转手
 │   │   ├── test_parsing.py    解析层：紧凑 JSON / Server Action / JS 字面量 / HTML 实体
@@ -54,6 +54,7 @@ Jev-Register-Tool/
 │   │   ├── test_mailrules.py  收件规则 + OTP 抽取
 │   │   └── test_orchestration.py  编排层：错误码分流 / 登录 / 门禁 / 并发 / 邮箱后端选择
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出 4 份交付物
+│   ├── check_deliverables.py  ★ **独立复核**那 4 份（只读，退出码 0/1 可当门禁）
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── audit_keys_against_site.py  站点侧对账：`GET /api/api-keys` vs 交付物
 │       ├── probe_gate_chain.py       ★ 逐跳走 onboarding 门禁，打完整链路 + 试建 key
@@ -124,12 +125,12 @@ Jev-Register-Tool/
 | `stages.py` | 516 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
 | `runner.py` | 332 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 + 邮箱后端工厂 | `config` `ledger` `remail` `stages` `tempemail` |
 | `run_e2e.py` | 261 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` `tempemail` |
-| `selftest.py` | 136 | 自测**入口**：按顺序调用 `tests/` 下 26 个 `test_*` + 登记完整性元检查 | `tests.*` |
+| `selftest.py` | 143 | 自测**入口**：按顺序调用 `tests/` 下 27 个 `test_*` + 登记完整性元检查 | `tests.*` |
 | `tests/support.py` | 299 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
 | `tests/test_parsing.py` | 225 | 解析层 5 组（紧凑 JSON / Server Action / JS 字面量 / HTML 实体 / 残缺候选） | `support` |
 | `tests/test_ledger.py` | 263 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化 + 交付物自证） | `support` |
 | `tests/test_mailrules.py` | 105 | 收件规则 + OTP 抽取 | `support` |
-| `tests/test_orchestration.py` | 1156 | 编排层 17 组（错误码分流 / 登录 / 链接候选 / 门禁 / setup 降级 / 并发 / 邮箱后端…） | `support` |
+| `tests/test_orchestration.py` | 1204 | 编排层 18 组（错误码分流 / 登录 / 链接候选 / 门禁 / setup 降级 / 并发 / 邮箱后端 / 工具只读护栏…） | `support` |
 | `verify_keys.py` | 205 | 验收 + 导出（`keys.txt` / `apikeys.txt` / `keys_verified.json`） | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
@@ -374,7 +375,7 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 262 项」，本文 §6 写「已补 192 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 269 项」，本文 §6 写「已补 192 项自测」。
 #    ⚠️ 两者数字**本来就不同**：README 是现状，§6 那条是**历史快照**（审计当时 96 项）。
 #       不要为了"对齐"去改 §6 —— 那会把历史记录改成假的。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。

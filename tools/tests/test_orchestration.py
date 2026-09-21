@@ -97,23 +97,35 @@ def test_apply_and_approval() -> None:
 
 
 class _FakeResp:
-    def __init__(self, text: str, status: int = 200):
+    def __init__(self, text: str, status: int = 200, headers: dict | None = None):
         self.text = text
         self.status_code = status
+        self.headers = headers or {}
 
 
 class _FakeSession:
-    """按序吐出预置页面，并记录 GET 次数（用来断言重试次数）。"""
+    """按序吐出预置页面，并记录 GET 次数（用来断言重试次数）。
 
-    def __init__(self, pages: list[str]):
+    `post_resp` 用于测 `post_setup()` 的提交结果 —— 默认 404，即降级通路的
+    典型响应（该通路的 action id 已作废）。`posts` 记录每次 POST 的入参，
+    用来断言"走的是哪条通路"。
+    """
+
+    def __init__(self, pages: list[str], post_resp: _FakeResp | None = None):
         self.pages = list(pages)
         self.headers: dict = {}
         self.calls = 0
+        self.posts: list[dict] = []
+        self.post_resp = post_resp if post_resp is not None else _FakeResp("", 200)
 
     def get(self, url, params=None, timeout=None):
         i = min(self.calls, len(self.pages) - 1)
         self.calls += 1
         return _FakeResp(self.pages[i])
+
+    def post(self, url, files=None, headers=None, timeout=None):
+        self.posts.append({"url": url, "files": files or {}, "headers": headers or {}})
+        return self.post_resp
 
 
 def _login_html(nums) -> str:
@@ -212,6 +224,71 @@ def test_code_mode_falls_back_to_magic_link() -> None:
     # 护栏：回捞窗口不能设太大，否则未获批账号每次重跑都要多白等
     check("★ 回捞窗口 <= 60s（不给未获批账号拖长重跑）",
           0 < st.LINK_FALLBACK_TIMEOUT <= 60.0, str(st.LINK_FALLBACK_TIMEOUT))
+
+
+def _setup_page(*, with_action: bool) -> str:
+    """造一个 `/setup/*` 页面。
+
+    新形态（2026-09-20 起）是索引 **1**、**只有 `:0` `:1`**、另加 `$ACTION_KEY`
+    —— 旧代码枚举 `("2","3","4")` 且要求 `:2` 同时存在，在新形态上一条都抓不到。
+    这里刻意用新形态，测的就是"抓不到时怎么办"。
+    """
+    if not with_action:
+        return "<html><body>onboarding already done</body></html>"
+    ref = json.dumps({"id": "60ec39e20e3115ab", "bound": "$@1"}).replace('"', "&quot;")
+    return (f'<form><input type="hidden" name="$ACTION_1:0" value="{ref}">'
+            f'<input type="hidden" name="$ACTION_1:1" value="v1">'
+            f'<input type="hidden" name="$ACTION_KEY" value="KEY1"></form>')
+
+
+def test_post_setup_degrade_is_observable() -> None:
+    """🔴 降级通路必须**可观测**，失败时 error 要指向真因 —— 不许静默退化。
+
+    2026-09-21 第三轮扫描发现的洞：`post_setup()` 里
+    `except TypeSafeError: acts = {}` 是**静默**的，然后退化到
+    `FALLBACK_SETUP_ACTIONS`；而那张表的 id 三处文档都写明**已全部作废**
+    （POST 回 `404 Server action not found.`）。于是"站点改版"最终只表现为
+    `onboarding 失败: HTTP 404` —— 与真因毫无字面关联，这正是 runbook §4.6
+    那段"为什么难定位"复盘的结构性成因。
+
+    对照：`stages.stage_login` 的 OTP 降级（`how != "anchored"`）是**打告警**的。
+    同一模式两处处置必须一致 —— 这条测试把它钉住。
+    """
+    print("\n[编排：setup 降级通路可观测]")
+
+    # A. 抓不到隐藏域 ⇒ 走降级通路：必须有告警 + error 指向真因 + 给下一步
+    sess = _FakeSession([_setup_page(with_action=False)],
+                        post_resp=_FakeResp("Server action not found.", 404))
+    cl = ts.TypeSafeClient(session=sess)
+    r = cl.post_setup("/setup/tos?returnTo=%2Fhook", {"legalAcknowledged": "true"})
+
+    check("[负对照] 降级通路确实失败了（该表 id 已作废）", not r.ok, str(r.ok))
+    check("★ 确实走了降级通路（via 标出 next-action）",
+          str(r.data.get("via", "")).startswith("next-action"), str(r.data.get("via")))
+    check("★ 降级**不是静默**的：self.log 里有可辨识告警",
+          any("未抓到" in line for line in cl.log), str(cl.log))
+    check("★ error 点出真因（未抓到隐藏域），而不只是 HTTP 404",
+          "未抓到" in r.error and "降级" in r.error, r.error)
+    check("★ error 给了下一步动作（跑探针看页面实际形态）",
+          "probe_onboarding" in r.error, r.error)
+    check("★ fetch 的失败原因也带进了 data（可程序化取用）",
+          "未渲染出 Server Action" in str(r.data.get("fetch_error", "")),
+          str(r.data.get("fetch_error"))[:80])
+
+    # B. 正对照：页面渲染了隐藏域 ⇒ 走 nojs 通路，且**不**打降级告警
+    sess2 = _FakeSession([_setup_page(with_action=True)], post_resp=_FakeResp("", 200))
+    cl2 = ts.TypeSafeClient(session=sess2)
+    r2 = cl2.post_setup("/setup/tos?returnTo=%2Fhook", {"legalAcknowledged": "true"})
+    check("[正对照] 抓到隐藏域 → 走 nojs 通路且成功",
+          r2.ok and str(r2.data.get("via", "")).startswith("nojs"), str(r2.data.get("via")))
+    check("[正对照] 正常路径**不**打降级告警（告警是有选择性的）",
+          not any("未抓到" in line for line in cl2.log), str(cl2.log))
+    check("[正对照] 提交用 $ACTION_* 隐藏域，不带 next-action 头",
+          "next-action" not in sess2.posts[0]["headers"],
+          str(sorted(sess2.posts[0]["headers"])))
+    check("[正对照] 提交确实回填了 $ACTION_KEY（新形态必需）",
+          "$ACTION_KEY" in sess2.posts[0]["files"],
+          str(sorted(sess2.posts[0]["files"])))
 
 
 def test_confirm_timeout_headroom() -> None:

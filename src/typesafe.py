@@ -53,7 +53,14 @@ MODE_CODE = "code"
 
 
 # /setup/* 页面的 Server Action ID，取自录制 HAR（部署 id 787c0047… 与当时一致）。
-# 仅作为**降级**用：首选仍是运行时从页面 HTML 抓 `$ACTION_*` 隐藏域。
+#
+# 🔴 **这些 id 已知会随部署失效，不是可用通路**（2026-09-20 实测全部作废：
+#    POST 回 `404 Server action not found.`）。三处文档都写明了这一点
+#    （`architecture.md` §5 · `runbook.md` §4.6 · `runbook.md` §5）。
+#    保留它只是为了"页面跳过了隐藏域"这类边缘场景留一条最后手段 ——
+#    首选**永远**是运行时抓 `$ACTION_*` 隐藏域。
+#    ⇒ 走这条路必须留痕：`post_setup()` 会打显式告警，失败时 error 指向真因。
+#    重新录制 HAR 拿到新 id 后，记得同步这条注释与 runbook §4.6。
 FALLBACK_SETUP_ACTIONS = {
     "/setup/tos": "6016020c2c1d719d5d6a7c8f6ab594c8de691556c2",
     "/setup/set-name": "60ec39e20e3115ab87f21a60e7f7cfe7169dada4ef",
@@ -242,17 +249,36 @@ class TypeSafeClient:
 
         两条通路，按页面实际渲染的内容自动选：
 
-        A. **渐进增强形态**：页面里带 `$ACTION_*` 隐藏域 → 用无 JS 表单提交。
+        A. **渐进增强形态**（首选）：页面里带 `$ACTION_*` 隐藏域 → 用无 JS 表单提交。
            与 /login 完全同构，已被实测验证。
-        B. **带 JS 形态**（降级）：`next-action: <id>` 头 + multipart，
+        B. **带 JS 形态**（降级 / 最后手段）：`next-action: <id>` 头 + multipart，
            字段名加 `_1_` 前缀，另带 `0 = [{},"$K1"]`。action id 取
-           `FALLBACK_SETUP_ACTIONS`（来自录制 HAR，部署 id 相同）。
+           `FALLBACK_SETUP_ACTIONS`。
+
+        🔴 **降级通路必须留痕**（2026-09-21 第三轮扫描修的洞）。
+        抓不到隐藏域只有两种可能：① 页面跳过了（onboarding 已完成）；
+        ② 站点改版。B 通路用的 action id 是**录制值，实测已全部作废**
+        （POST 回 `404 Server action not found.`）⇒ 它对②根本救不了。
+
+        以前这里 `except TypeSafeError: acts = {}` 是**静默**的，于是②最终只表现为
+        `onboarding 失败: HTTP 404` —— 与真因（没抓到隐藏域）毫无字面关联，
+        正是 runbook §4.6 那段"为什么难定位"复盘的结构性成因。现在：
+          · 降级时往 `self.log` 写一条**可辨识的告警**；
+          · 失败时 `Result.error` 点出真因 + 下一步动作，不再只回 `HTTP 404`。
+
+        判据对照 `stages.stage_login` 的 OTP 降级（`how != "anchored"` 必打告警）——
+        同一模式，两处处置必须一致。自测 `test_post_setup_degrade_is_observable` 钉住。
         """
         base = path.split("?", 1)[0]
+        fetch_err = ""
         try:
             acts = self.fetch_setup_actions(path)
-        except TypeSafeError:
-            acts = {}
+        except TypeSafeError as exc:
+            acts, fetch_err = {}, str(exc)
+            self.log.append(
+                f"⚠ post_setup({path}) 未抓到 $ACTION_* 隐藏域 —— 退化到降级通路；"
+                f"该通路的 action id 是录制值，**已知会随部署失效**（runbook §4.6）"
+                f"｜原因：{exc}")
 
         if acts:
             n = action_n or next(iter(acts))
@@ -280,9 +306,16 @@ class TypeSafeClient:
         redirect = r.headers.get("x-action-redirect", "")
         ok = r.status_code == 200 and "Internal Server Error" not in r.text[:200]
         self.log.append(f"post_setup({path}) via {used} HTTP {r.status_code} -> {redirect}")
+        # 失败时把**真因**写进 error。只回 "HTTP 404" 会把排查引向"站点挂了"，
+        # 而真相通常是"页面没渲染出隐藏域 ⇒ 退化到已作废的 id"。
+        err = "" if ok else f"HTTP {r.status_code}"
+        if not ok and fetch_err:
+            err += (f" —— 且本次走的是**降级通路**（未抓到 $ACTION_* 隐藏域：{fetch_err}）；"
+                    f"该通路的 action id 为录制值，站点改版后必失效。"
+                    f"下一步：跑 tools/probes/probe_onboarding.py 看页面实际渲染形态")
         return Result(ok=ok, stage=f"setup:{base}", status=r.status_code,
-                      data={"redirect": redirect, "via": used},
-                      error="" if ok else f"HTTP {r.status_code}")
+                      data={"redirect": redirect, "via": used, "fetch_error": fetch_err},
+                      error=err)
 
     def complete_onboarding(self, display_name: str = "Auto User") -> Result:
         """按 /api/me 的缺口依次补 TOS / 姓名 / 问卷。"""

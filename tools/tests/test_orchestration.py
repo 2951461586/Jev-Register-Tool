@@ -6,10 +6,12 @@ resume 去重 / 重跑不丢 key / 并发不串号 / worker 崩溃不静默丢�
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import re
 import tempfile
+import textwrap
 from pathlib import Path
 
 from .support import (RANK, Mail, _FakeTypeSafe, _confirm_mail, _link_mail,
@@ -530,6 +532,63 @@ def test_mail_timeout_headroom() -> None:
           "mail_wait" in r2.timings and "login" in r2.timings, str(r2.timings))
     check("★ 重发后仍超时 ⇒ 判 failed（重发不是「无限续命」）",
           r2.status == "failed", r2.status)
+
+
+def test_per_account_total_timing() -> None:
+    """🔴 单号端到端耗时（`timings["total"]`）必须被**实测**记录，成功/失败都要有。
+
+    为什么这条判据不能省：算「单号注册取 key 的平均速率」时，**分母就是它**。
+    若 `total` 只写在成功路径上，或事后用 `login + create_key` 推导，那么
+    「建邮箱就抛异常」那类记录会**整条缺失** ⇒ 分母变小 ⇒ 速率虚高，**且不报错**。
+    与本项目其它「分母本身是错的」缺陷同源（CR 污染、快照陷阱、写死基线）。
+
+    变异方向（三档，**均已实测**，用来证明这条用例有牙）：
+      · 删掉 `finally` 里的赋值 ⇒ ①②③ 全红；
+      · 把赋值挪到函数末尾（`finally` 之外） ⇒ **② 与 ③ 红、① 绿**
+        （实测 `通过 284 / 失败 4`）—— ① 绿是因为正常路径照样走到函数末尾，
+        而失败账号在 `if cl is None: return rec` 处**提前返回**、拿不到 total。
+      · 把赋值补齐到**所有出口**（提前 return + try 末尾 + 两个 except 末尾），
+        再把 `finally` 体换成 `pass` ⇒ **只有 ③ 红**（实测 `通过 287 / 失败 1`）。
+        这一档是关键：**动态用例完全挡不住**，只有静态接线检查能拦住它 ——
+        这正是"判据不能只靠行为测试"的实证。
+    """
+    # ① 成功路径
+    with offline(mails=[_link_mail("t@example-mail.test")]) as P:
+        rec = _make_pipe(P, _tmp_ledger()).run_one(
+            email="t@example-mail.test", name="t")
+    tot = rec.timings.get("total")
+    check("★ 成功账号记录了 timings['total']",
+          isinstance(tot, float), str(rec.timings))
+    # ⚠️ 用 `.get` + `isinstance` 而不是 `rec.timings["total"]` —— 后者在缺失时
+    #    会抛 KeyError，把**后面的静态接线检查一起掩盖掉**（实测：变异注入后
+    #    只在崩溃栈里看到这一条，③ 根本没跑到）。判据要"失败得干净"。
+    check("★ total ≥ login + create_key（端到端必须覆盖分段之和）",
+          isinstance(tot, float) and tot >= (rec.timings.get("login", 0.0)
+                                             + rec.timings.get("create_key", 0.0)) - 1e-6,
+          str(rec.timings))
+
+    # ② 失败路径：收信超时 → 批内重发 → 仍失败
+    with offline(mails=[]) as P:
+        rec2 = _make_pipe(P, _tmp_ledger()).run_one(
+            email="u@example-mail.test", name="t", mail_timeout=0.2)
+    tot2 = rec2.timings.get("total")
+    check("★ 失败账号也记录 timings['total']（否则速率的分母会漏掉最慢的账号）",
+          isinstance(tot2, float), str(rec2.timings))
+    check("★ 失败账号 total ≥ mail_wait（端到端覆盖了等待）",
+          isinstance(tot2, float)
+          and tot2 >= rec2.timings.get("mail_wait", 0.0) - 1e-6,
+          str(rec2.timings))
+
+    # ③ 静态接线：赋值必须落在 `finally` 块内。
+    #    只靠动态用例挡不住 —— 把赋值挪到 `try` 末尾时，只要恰好没走到异常分支，
+    #    ② 照样绿，而失败账号的 total 已经在生产里静默缺失了。
+    tree = ast.parse(textwrap.dedent(inspect.getsource(pl.Pipeline.run_one)))
+    tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try)]
+    check("★★ run_one 里有 try/finally（有 finally 才谈得上失败路径留痕）",
+          bool(tries) and bool(tries[0].finalbody), f"{len(tries)} 个 Try")
+    fin = ast.unparse(ast.Module(body=tries[0].finalbody, type_ignores=[]))
+    check("★★ `timings['total']` 写在 `finally` 块里（失败路径也留痕）",
+          "timings['total']" in fin, fin[:120].replace("\n", " "))
 
 
 def test_resume_skips_keyed() -> None:
@@ -1299,3 +1358,70 @@ def test_check_deliverables_is_readonly_and_loose() -> None:
           "恒真正则会误报")
 
 
+def test_analyze_batch_threshold_wiring() -> None:
+    """🔴 批次分析脚本的**剔除阈值**必须来自源码常量，不许拍一个数。
+
+    为什么值得单独立一条：这个脚本是"单号速率"这类结论的**唯一出口**，
+    它算错了**不会报错**，只会让结论偏 —— 而且偏得很有迷惑性。
+    本批（100 账号 / cf100）实测两种写法的差：
+      · 旧写法 `x < 30`  ⇒ 剔除 14 个（把 3 个"正常但偏慢"的也剔了）
+        ⇒ 干净均值 **7.29s**；
+      · 正确 `x < MAIL_TIMEOUT(60)` ⇒ 剔除 11 个（与日志重发次数一致）
+        ⇒ 干净均值 **8.48s**。
+    差 1.19s（16%），全程零报错。而 30 这个数**没有任何来源** ——
+    重发路径的**下界就是首次超时阈值**（没等到 `MAIL_TIMEOUT` 就不会重发），
+    所以正确阈值不是"调参"，是**从源码读**。
+
+    ⚠️ 另一条更隐蔽：这里**只做静态接线检查**是刻意的。动态跑一遍脚本需要
+    构造日志 + 台账，成本高；而这类回归的形态就是"有人又抄了一个数进去"，
+    静态检查恰好能拦住。
+
+    ⚠️ **位置约束**：脚本必须在 `tools/` 下。它原本放在 `exports/`，
+    而 `exports/` 被 `.gitignore` **整体忽略** ⇒ 文件根本不进仓库 ⇒
+    **别人 clone 之后这条自测必然红**（`is_file()` 为假）。
+    凡是被自测依赖的文件，必须是被 git 跟踪的。
+    """
+    print("\n[工具：批次分析的剔除阈值必须来自源码常量]")
+    root = Path(__file__).resolve().parents[2]
+    # 位置检查要**同时看两处**才不是恒真：只看 `tools/` 的话，把文件挪回
+    # `exports/` 会让下面那条"存在"先红，这条照样绿 ⇒ 等于没牙。
+    in_tools = (root / "tools" / "_analyze_batch.py").is_file()
+    in_exports = (root / "exports" / "_analyze_batch.py").is_file()
+    check("★★ 分析脚本在 `tools/` 下且**不在**被忽略的 `exports/` 下"
+          "（放 exports/ ⇒ clone 后本用例必红）",
+          in_tools and not in_exports, f"tools={in_tools} exports={in_exports}")
+
+    path = root / "tools" / "_analyze_batch.py"
+    check("★ 分析脚本存在", path.is_file(), str(path))
+    if not path.is_file():
+        # 后面全是**读源码**的静态检查，文件不在就没得查。
+        # ⚠️ 必须在这里 `return`，不能硬跑 —— 否则 `read_text()` 抛
+        # `FileNotFoundError` 会把整段崩掉，连上面已经报红的结论都看不到。
+        # （这正是本项目"判据要失败得干净、别抛异常掩盖后续检查"那条。）
+        return
+    src = path.read_text(encoding="utf-8")
+
+    # ① 阈值必须 import 自源码。
+    #    本地再抄一份（`MAIL_TIMEOUT = 60.0`）看起来等价，实则**会过期** ——
+    #    有人调 `MAIL_TIMEOUT` 时脚本不跟着变，且不报错。
+    check("★★ 超时阈值 import 自 `src.stages`（不是本地抄一个数）",
+          "from src.stages import MAIL_TIMEOUT" in src,
+          "缺 `from src.stages import MAIL_TIMEOUT`")
+
+    # ② 与耗时比较的阈值不许是字面数字。
+    #    正则只匹配 `x < 数字` / `x >= 数字` 形态 ⇒ 不误伤 `x * 60` 之类的算式。
+    bare = re.findall(r"x\s*[<>]=?\s*(\d+(?:\.\d+)?)", src)
+    check("★★ 与耗时比较的阈值不是字面数字（`x < 30` 这类）",
+          not bare, f"发现裸阈值 {bare}")
+
+    # ③ 交叉验证必须存在：一边是**实测耗时**，一边是**日志文案**，
+    #    两个独立来源对得上才说明阈值没拍错、日志解析也没坏。
+    check("★ 有交叉验证：total≥阈值 的账号数 == 日志重发次数",
+          "交叉验证" in src and "批内重发第" in src, "缺互证")
+
+    # 负对照：证明 ② 的正则**真能抓到**裸阈值（否则它可能是恒真的空正则）。
+    # 这是本项目的一贯要求 —— 判据必须自证"它在真匹配"。
+    check("[负对照] 同一正则能抓到 `x < 30.0`（证明上面不是假绿）",
+          re.findall(r"x\s*[<>]=?\s*(\d+(?:\.\d+)?)",
+                     "clean = [x for x in tot if x < 30.0]") == ["30.0"],
+          "恒真空正则 ⇒ 拦不住回归")

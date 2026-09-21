@@ -49,6 +49,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
@@ -246,7 +247,15 @@ class Pipeline(StageMixin):
 
         `email` 为空时由 `stage_login` 现场建一个临时邮箱（这是默认用法，
         取代了旧链路里 `stage_apply` 的建邮箱职责）。
+
+        🔴 记录 `timings["total"]` = **单号端到端**耗时（进函数 → 出函数）。
+        为什么必须**实测**而不是事后用 `login + create_key` 推导：
+        `login` 只在 `stage_login` 内部被写，而 `create_mailbox` 抛异常时
+        根本走不到那里 ⇒ 推导值在那些记录上**直接缺失** ⇒ 统计平均速率时
+        会把最慢的账号静默排除掉（分母变小、速率虚高），且不报错。
+        这与本项目其它"分母本身是错的"缺陷同源。
         """
+        t_all = time.time()
         rec = AccountRecord(key=email, email=email)
         try:
             cl = self.stage_login(rec, mail_timeout=mail_timeout)
@@ -264,6 +273,9 @@ class Pipeline(StageMixin):
         except Exception as exc:  # noqa: BLE001 —— 兜底，保证台账一定写得进去
             rec.status = "failed"
             rec.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            # 放在 `finally`：失败路径同样要留痕（本项目铁律）。
+            rec.timings["total"] = time.time() - t_all
         return rec
 
     def run_batch(self, *, count: int = 1, name: str = "1",
@@ -312,11 +324,17 @@ class Pipeline(StageMixin):
             todo.append(e)
 
         def job(pipe: "Pipeline", email: str) -> AccountRecord:
+            t_all = time.time()
             rec = AccountRecord(key=email, email=email)
-            pipe.log(f"[resume] {email}")
-            cl = pipe.stage_login(rec, mail_timeout=mail_timeout)
-            if cl is not None:
-                pipe.stage_create_key(rec, cl, name=name)
+            try:
+                pipe.log(f"[resume] {email}")
+                cl = pipe.stage_login(rec, mail_timeout=mail_timeout)
+                if cl is not None:
+                    pipe.stage_create_key(rec, cl, name=name)
+            finally:
+                # 与 `run_one` 同口径：单号端到端耗时，**失败也留痕**
+                # （否则 resume 出来的记录没有 total，跨入口统计时会被静默漏掉）。
+                rec.timings["total"] = time.time() - t_all
             pipe.ledger.append(rec.to_dict())
             pipe.log(f"[resume] status={rec.status} {rec.error}")
             return rec

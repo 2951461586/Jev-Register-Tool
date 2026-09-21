@@ -45,7 +45,8 @@ from tests import support  # noqa: E402
 from tests.test_ledger import (test_identity_whitespace_normalization,  # noqa: E402
                                test_ledger_union, test_status_vocabulary)
 from tests.test_mailrules import test_mailrules, test_otp_extraction  # noqa: E402
-from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa: E402
+from tests.test_orchestration import (test_analyze_batch_threshold_wiring,  # noqa: E402
+                                      test_auth_callback_payload_shape,
                                       test_auth_error_triage,
                                       test_chain_has_no_external_gate,
                                       test_check_deliverables_is_readonly_and_loose,
@@ -59,6 +60,7 @@ from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa:
                                       test_mail_timeout_headroom,
                                       test_onboarding_gate_drives_steps,
                                       test_onboarding_gate_is_guidance_not_a_gate,
+                                      test_per_account_total_timing,
                                       test_skip_onboarding_a1,
                                       test_post_setup_degrade_is_observable,
                                       test_remail_probe_is_readonly,
@@ -120,6 +122,7 @@ def main() -> int:
     test_skip_onboarding_a1()
     test_code_mode_falls_back_to_magic_link()
     test_mail_timeout_headroom()
+    test_per_account_total_timing()
     test_resume_skips_keyed()
     test_post_setup_degrade_is_observable()
     test_key_survives_rerun_failure()
@@ -130,6 +133,7 @@ def main() -> int:
     test_magic_link_tries_all_candidates()
     test_remail_probe_is_readonly()
     test_check_deliverables_is_readonly_and_loose()
+    test_analyze_batch_threshold_wiring()
 
     # 元检查：登记完整性。放在最后跑，因为它扫的是本文件自己。
     gap, ghost = _registry_gap()

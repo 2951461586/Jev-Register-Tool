@@ -124,7 +124,7 @@ Jev-Register-Tool/
 | `typesafe.py` | 558 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
 | `stages.py` | 575 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
 | `runner.py` | 359 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 + 邮箱后端工厂 | `config` `ledger` `remail` `stages` `tempemail` |
-| `run_e2e.py` | 271 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` `tempemail` |
+| `run_e2e.py` | 271 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `mailrules` `runner` `stages` `tempemail` |
 | `selftest.py` | 151 | 自测**入口**：按顺序调用 `tests/` 下 32 个 `test_*` + 登记完整性元检查 | `tests.*` |
 | `tests/support.py` | 332 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
 | `tests/test_parsing.py` | 225 | 解析层 5 组（紧凑 JSON / Server Action / JS 字面量 / HTML 实体 / 残缺候选） | `support` |
@@ -132,6 +132,11 @@ Jev-Register-Tool/
 | `tests/test_mailrules.py` | 105 | 收件规则 + OTP 抽取 | `support` |
 | `tests/test_orchestration.py` | 1443 | 编排层 21 组（错误码分流 / 登录 / 链接候选 / 门禁 / setup 降级 / 并发 / 邮箱后端 / 工具只读护栏…） | `support` |
 | `verify_keys.py` | 236 | 验收 + 导出（`keys.txt` / `apikeys.txt` / `keys_verified.json`） | `config` `ledger` |
+| `_analyze_batch.py` | 274 | 批次分析（**通用版**）：日志 + 基线备份 → 五项判据一次算完 | `ledger` `stages` |
+| `check_deliverables.py` | 151 | 独立复核 `result/` 四份交付物（**只读，不写任何文件**） | 无 |
+| `normalize_ledger.py` | 143 | 归一化台账里被尾部空白 / CR 污染的 key（**不折叠行**） | `config` `ledger` |
+| `relogin_pending.py` | 217 | 对**无 key 的账号**重新发信 + 复用历史链接（带重试） | `parsing` `runner` `stages` `typesafe` |
+| `resume_pending.py` | 214 | 补跑台账里还没拿到 key 的账号（幂等，可反复跑） | `config` `ledger` `runner` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
 > **行数怎么算的**：`wc -l`（即文件里 `\n` 的个数）。复算：
@@ -143,6 +148,10 @@ Jev-Register-Tool/
 > ⚠️ 上一版这张表没有写明度量方式，于是同一个文件在不同文档里出现
 > **差 1 的两组数字**（`wc -l` vs `行数 = src.count("\n") + 1`）——
 > 又一个"没写清楚就没法复算"的例子。**以本命令的输出为准。**
+>
+> 🔴 **`tools/probes/`（12 个一次性探针）也不进表** —— 它们是排障用的临时脚本，没有稳定职责；
+> 上面的 `wc -l` 复算命令同样不含它们（两边口径一致）。⚠️ 但 §3 的「被依赖次数」**含**
+> `tools/probes/` ⇒ **两处口径不同，别混**。
 >
 > 🔴 `src/__init__.py`（40 行）与 `tests/__init__.py`（5 行）刻意**不进表**：
 > 它们是包声明与模块清单，没有"职责"可言，放进来只会稀释这张表的信号。
@@ -171,22 +180,27 @@ Jev-Register-Tool/
 
 并列叶子   remail ──(只复用 `Mail` / `Stats`)──▶ tempemail
            ⚠️ 两个邮箱客户端**互不引用**，只共享数据结构；异常类型也各自独立
+
+旁路工具   tools/{_analyze_batch, check_deliverables, normalize_ledger,
+           relogin_pending, resume_pending}.py
+           —— 直接依赖 `src.*`，**不参与主链路**（`check_deliverables` 连 `src` 都不 import，
+              是纯粹的交付物字节级复核）
 ```
 
 **被依赖次数**（越大越底层，改动越要谨慎）：
 
 | 模块 | 被依赖 | 说明 |
 |---|---:|---|
-| `config` | 19 | 常量集中地。改它要跑全量自测 |
+| `config` | 20 | 常量集中地。改它要跑全量自测 |
 | `parsing` | 12 | 解析层。**纯函数、不依赖 `requests`** ⇒ 可以脱离网络单测 |
 | `tempemail` | 11 | CF 收信唯一入口（`remail` 也复用它的 `Mail` / `Stats`） |
 | `typesafe` | 11 | 登录链路（阶段层与 4 个探针都直引） |
-| `ledger` | 7 | 台账唯一写入口 |
+| `ledger` | 9 | 台账唯一写入口 |
 | `runner` | 7 | CLI + 自测 + 探针（原 `pipeline` 的调度半边） |
-| `stages` | 5 | 阶段层；被 `runner` + CLI + 探针引用 |
+| `stages` | 6 | 阶段层；被 `runner` + CLI + 探针引用 |
 | `mailrules` | 5 | 规则表 + OTP 抽取；**纯叶子**，可离线测 |
 | `tests/support.py` | 5 | 自测共享夹具（5 个 `test_*` 模块都从这里取） |
-| `remail` | 3 | **第二个邮箱后端**；被 `runner` + 自测引用 |
+| `remail` | 4 | **第二个邮箱后端**；被 `runner` + 自测引用 |
 
 > 复算命令见文末附录（`from src import X` 那种写法必须单独计 —— 旧版脚本就漏在这里）。
 > ⚠️ 该表是**脚本输出**，加/删任何 `.py` 文件后**必须重跑**，否则立刻过期。
@@ -198,6 +212,13 @@ Jev-Register-Tool/
 > 现在两边都含 `tools/tests/`，命令与表**逐项对齐**（实测
 > `config 19 / parsing 12 / tempemail 11 / typesafe 11 / ledger 7 / runner 7 /
 > stages 5 / mailrules 5 / support 5 / remail 3`）。
+>
+> 🔴 **2026-09-22 复算**（实测 `config 20 / parsing 12 / tempemail 11 / typesafe 11 /
+> ledger 9 / runner 7 / stages 6 / mailrules 5 / support 5 / remail 4`）：
+> `config 19→20`、`ledger 7→9`、`stages 5→6`、`remail 3→4`。其中 `ledger`/`stages` 各 +1
+> 来自 `tools/_analyze_batch.py` **从 `exports/` 移入 `tools/`** —— 该目录不在扫描面里，
+> 移进来才开始计数。⇒ **文件换个目录就会改这张表**：
+> 「加/删任何 `.py` 都要重跑」这条必须连**移动**一起算。
 >
 > 历史沿革（数字都是当时实测的）：旧版表格（`config=4 / typesafe=3 / framer=2 /
 > mailrules=2`）是错的 —— 附录脚本用 `startswith('src.')` 判断，而

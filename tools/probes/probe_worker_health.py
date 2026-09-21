@@ -98,7 +98,14 @@ def main() -> int:
             # 定时清理与邮件事件都跑不起来
             hs = res.get("handlers") or []
             print("   handlers:", hs)
-            if hs and "scheduled" not in hs:
+            if not hs:
+                # ⚠️ 空数组 ≠ 缺 scheduled：这是"CF API 本次没返回该字段"，
+                # 不是"Worker 没有 scheduled handler"。别把"没拿到"当成"没有"
+                # （2026-09-21 实测：看到 `handlers: []` 一度误判为 09-17 事故形态，
+                #  实际 D1 正在正常入库）。判据请以第 2 节的 D1 直查为准。
+                print("   ⚠️ handlers 为空 —— CF API 本次未返回该字段，**不能**据此判断；"
+                      "请看第 2 节 D1 直查")
+            elif "scheduled" not in hs:
                 print("   🔴 handlers 缺 scheduled —— 与 09-17 事故同形态")
         else:
             d = (res.get("deployments") or [{}])[0]
@@ -123,14 +130,21 @@ def main() -> int:
             print("   ✗", out.get("http"), str(out.get("body"))[:300])
         print()
 
-    out = d1_query("SELECT received_at, recipient, subject FROM emails "
+    # 🔴 列名必须是 `to_address`，**不是** `recipient`。
+    # `emails` 表的真实列（`PRAGMA table_info` 实测）：
+    #   id / message_id / from_address / to_address / subject /
+    #   extracted_json / received_at / raw_text / raw_html
+    # 这里曾写 `recipient` ⇒ D1 回 `no such column: recipient`，
+    # 而本探针第 3 节自己就写着「确认列名，避免把'没这列'当成'没数据'」——
+    # 规则没用到自己的代码上（2026-09-21 修）。
+    out = d1_query("SELECT received_at, to_address, subject FROM emails "
                    "ORDER BY received_at DESC LIMIT 5")
     print("  最新 5 行：")
     if out.get("success"):
         rows = (out["result"][0].get("results") if isinstance(out["result"], list)
                 else out["result"].get("results")) or []
         for r in rows:
-            print("   ", r.get("received_at"), r.get("recipient"), "|", str(r.get("subject"))[:60])
+            print("   ", r.get("received_at"), r.get("to_address"), "|", str(r.get("subject"))[:60])
     else:
         print("   ✗", out.get("http"), str(out.get("body"))[:300])
 

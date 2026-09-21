@@ -39,8 +39,9 @@ TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onb
 > 详见 `src/remail.py` 头注与 `docs/optimization-2026-09-21.md` §7.4。
 
 > ⚠️ 两套口径**行数天然不等**，别拿它们相等当对账判据：
-> `result/success.jsonl` 是**账号级**（按邮箱去重 ⇒ 388 行）；
-> `result/keys.txt` 是**凭据级**（同账号重跑会拿到第二把 key ⇒ 453 条）。
+> `result/success.jsonl` 是**账号级**（按邮箱去重）；
+> `result/keys.txt` 是**凭据级**（同账号重跑会拿到第二把 key）。
+> ⇒ 两边的具体数字**刻意不写死**（每批都会变，写死了自己就会变假）。
 > 交付凭据以 `keys.txt` 为准。
 
 > **凭据与基础设施标识一律不进仓库。** 代码里没有任何真实默认值 ——
@@ -81,7 +82,7 @@ PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
 $PY tools/run_e2e.py --doctor --mail-backend remail   # Remail 体检：只读，**不下单**
-$PY tools/selftest.py                  # 自测 294 项，离线可跑
+$PY tools/selftest.py                  # 自测 303 项，离线可跑
 $PY tools/run_e2e.py --count 5         # ★ 全链路：建邮箱 → 发信 → 登录 → 建 key
 $PY tools/run_e2e.py --count 10 --concurrency 4   # 并发
 $PY tools/run_e2e.py --count 1 --mail-backend remail  # ★ 换 Remail 后端（**每单扣积分**）
@@ -167,8 +168,8 @@ tools/                     入口脚本
   resume_pending.py        ★ 补跑台账里还没拿到 key 的账号（幂等，可反复跑）。
                            进度/计数**只信它** —— 走 `Ledger.load()` 合并视图
   normalize_ledger.py      修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-  selftest.py              自测**入口**：只做聚合与调度（27 个用例段在 `tests/`）
-  tests/                   自测本体（6 个文件 2360 行，294 项，含负对照，**全程离线**）
+  selftest.py              自测**入口**：只做聚合与调度（32 个用例段在 `tests/`）
+  tests/                   自测本体（6 个文件 2463 行，303 项，含负对照，**全程离线**）
     __init__.py              只为让 `tests` 可当包导入；**不是** pytest 测试包
     support.py               共享夹具：`check()` 计数 + 离线替身 + 模块别名
     test_parsing.py          解析层（紧凑 JSON / Server Action / JS 字面量 / HTML 实体）

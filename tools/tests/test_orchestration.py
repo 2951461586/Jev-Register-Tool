@@ -1419,6 +1419,22 @@ def test_analyze_batch_threshold_wiring() -> None:
     check("★ 有交叉验证：total≥阈值 的账号数 == 日志重发次数",
           "交叉验证" in src and "批内重发第" in src, "缺互证")
 
+    # ④ 🔴 交叉验证的**两侧口径必须一致**：右侧数的是**全批**日志里的重发次数，
+    #    左侧也就必须覆盖全批（keyed + failed），不能只数 keyed。
+    #    实测（2026-09-22 第 3 批，failed=2）：只数 keyed 得 **5**，全批得 **7**，
+    #    日志也是 7 ⇒ 只数 keyed 会**误报**不一致。
+    #    ⚠️ 上一批 failed=0 时 keyed == 全批，这个口径错误被**完全掩盖**
+    #    —— 典型的「判据只在特定数据下成立」，靠换一批数据才暴露。
+    slow_line = next((l for l in src.splitlines() if l.strip().startswith("slow =")), "")
+    check("★★ 交叉验证左侧含 `tot_fail`（否则有失败账号时会误报）",
+          "tot_fail" in slow_line, slow_line.strip() or "找不到 `slow =` 那一行")
+    # 负对照：证明上一条**锁的是 `slow` 那一行**，不是拿整个源码做包含判断
+    # （后者恒真：源码别处本来就有 `tot_fail`）。
+    check("[负对照] 判据锁定的是 `slow` 行而非全文（全文包含是恒真的）",
+          "tot_fail" in src
+          and "tot_fail" not in "slow = [x for x in tot if x >= MAIL_TIMEOUT]",
+          "判据若退化成全文包含 ⇒ 恒真 ⇒ 拦不住回归")
+
     # 负对照：证明 ② 的正则**真能抓到**裸阈值（否则它可能是恒真的空正则）。
     # 这是本项目的一贯要求 —— 判据必须自证"它在真匹配"。
     check("[负对照] 同一正则能抓到 `x < 30.0`（证明上面不是假绿）",

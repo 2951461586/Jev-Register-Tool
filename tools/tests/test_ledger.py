@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import re
 
 from .support import ROOT, RANK, _tmp_ledger, check, pl
 
@@ -261,3 +262,92 @@ def test_identity_whitespace_normalization() -> None:
            if ln.strip() and not ln.lstrip().startswith("#")}
     check("★ .gitignore 显式列出 result/（不靠通配符兜底）",
           "result/" in _gi, f"result/ 不在规则里，现有规则 {sorted(_gi)[:8]}")
+
+
+def test_verify_key_retries_network_errors() -> None:
+    """🔴 `verify()` 对**网络层失败**必须重试 —— 否则交付清单会静默缩水。
+
+    `status == 0`（**没拿到 HTTP 响应**：SSL 抖动 / DNS / 连接被拒）与
+    `status == 401`（站点**明确拒绝**）是两类完全不同的失败。混在一起判 `ok=False`
+    的后果：本工具**只把 `ok` 的行写进** `keys.txt` / `apikeys.txt`
+    ⇒ **一次瞬时抖动就让一把可用的 key 从交付物里消失**，
+    而屏幕只打印「可用 880 / 不可用 1」、退出码 1 —— 看起来只是"有一把坏了"。
+
+    实测（2026-09-22 第 3 批验收）：报 1 把不可用，`SSLError` 且 `elapsed = 0.096s`
+    （⇒ 连接**立即失败**，不是超时）⇒ 手工复验**第 1 次就 200**，那把 key 完全可用。
+
+    ⇒ 判据是「**有没有拿到 HTTP 响应**」：没拿到 ⇒ 可重试；
+      拿到了 ⇒ 确定性结论，重试一万次也一样（401 不会变成 200）。
+    """
+    print("\n[交付物：验收的网络层失败必须重试]")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_vk_probe",
+                                                  ROOT / "tools" / "verify_keys.py")
+    vk = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vk)
+
+    class _Resp:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._b = body
+            self.text = str(body)
+
+        def json(self):
+            return self._b
+
+    orig_post, orig_sleep = vk.requests.post, vk.time.sleep
+    vk.time.sleep = lambda _s: None          # 别真睡，否则自测白等 3 秒
+    try:
+        # ① 网络层失败 ⇒ 必须重试满（1 次 + 2 次重试 = 3）
+        n1 = {"c": 0}
+
+        def boom(*a, **k):
+            n1["c"] += 1
+            raise vk.requests.RequestException("SSLError: boom")
+
+        vk.requests.post = boom
+        r1 = vk.verify("apikey_probe", retries=2)
+        check("★★ 网络层失败会重试（status=0 ≠ key 失效）",
+              n1["c"] == 3, f"调用 {n1['c']} 次（期望 3 = 首次 + 2 次重试）")
+        check("★ 重试耗尽后仍返回 status=0 且带 attempts",
+              r1["status"] == 0 and r1.get("attempts") == 3, str(r1)[:90])
+
+        # ② 拿到了 HTTP 响应 ⇒ **不许重试**（401 重试一万次还是 401）
+        n2 = {"c": 0}
+
+        def resp401(*a, **k):
+            n2["c"] += 1
+            return _Resp(401, {"error": "Authentication failed"})
+
+        vk.requests.post = resp401
+        r2 = vk.verify("apikey_probe", retries=2)
+        check("★★ 401 不重试（拿到响应 = 确定性结论）",
+              n2["c"] == 1 and r2["status"] == 401 and not r2["ok"],
+              f"调用 {n2['c']} 次, status={r2['status']}")
+        check("[负对照] 401 的调用次数 ≠ 网络失败的次数（证明计数判据在真区分）",
+              n2["c"] != n1["c"], f"401={n2['c']} vs 网络={n1['c']}")
+
+        # ③ 成功路径也不重试
+        n3 = {"c": 0}
+
+        def resp200(*a, **k):
+            n3["c"] += 1
+            return _Resp(200, {"answers": {"is_urgent": {"noul": 0.98}},
+                               "model": "jev", "usage": {}})
+
+        vk.requests.post = resp200
+        r3 = vk.verify("apikey_probe", retries=2)
+        check("★ 成功路径不重试且 ok=True",
+              n3["c"] == 1 and r3["ok"] and r3["status"] == 200,
+              f"调用 {n3['c']} 次, ok={r3['ok']}")
+    finally:
+        vk.requests.post, vk.time.sleep = orig_post, orig_sleep
+
+    # ④ 静态接线：重试必须**只**挂在网络层那个 except 里
+    src = (ROOT / "tools" / "verify_keys.py").read_text(encoding="utf-8")
+    check("★★ `verify()` 签名带 `retries` 参数",
+          re.search(r"def verify\([^)]*retries", src, re.S) is not None,
+          "缺 retries 参数")
+    check("★ 重试循环存在且只包住网络层（`retries + 1` + `RequestException`）",
+          "retries + 1" in src and "except requests.RequestException" in src,
+          "重试循环或 except 分支不见了")

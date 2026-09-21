@@ -43,7 +43,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))              # tools/
 
 from tests import support  # noqa: E402
 from tests.test_ledger import (test_identity_whitespace_normalization,  # noqa: E402
-                               test_ledger_union, test_status_vocabulary)
+                               test_ledger_union, test_status_vocabulary,
+                               test_verify_key_retries_network_errors)
 from tests.test_mailrules import test_mailrules, test_otp_extraction  # noqa: E402
 from tests.test_orchestration import (test_analyze_batch_threshold_wiring,  # noqa: E402
                                       test_auth_callback_payload_shape,
@@ -111,6 +112,7 @@ def main() -> int:
     test_ledger_union()
     test_status_vocabulary()
     test_identity_whitespace_normalization()
+    test_verify_key_retries_network_errors()
     test_mailrules()
     test_otp_extraction()
     test_auth_error_triage()

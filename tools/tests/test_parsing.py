@@ -163,3 +163,63 @@ def test_magic_link_html_entity() -> None:
     check("空输入返回空串（不抛异常）", ps.extract_magic_link("") == "")
     check("正文里没有链接时返回空串",
           ps.extract_magic_link("hello, no link here") == "")
+
+
+def test_magic_link_truncated_variant() -> None:
+    """正文里**同一 URL 有多份、只有一部分完整**时，必须挑完整的用。
+
+    2026-09-21 补跑实测（4/100 账号必失败的根因）：CF Worker 存下来的正文里
+    同一个 URL 出现 **12 次**，其中 **8 次被截断了 4 个字符**：
+
+        完整：`…&stytch_token_type=magic_links&token=D8SZNL…`
+        残缺：`…&stytch_token_type=magic_links&tokenSZNL…`   ← `=D8` 整个没了
+
+    残缺形态等于**根本没传 `token`**，Stytch 回 `400 invalid_public_token_id`
+    （报的是 `public_token` 的格式问题，与"少了个参数"毫无字面关联），外层把它
+    读成"链接可能已被使用/过期" ⇒ 排查被引向"重新发信"，白烧账号。
+
+    ⚠️ `=D8` 是 token 的**字面字符**，不是 quoted-printable 转义。受控实验
+    （四种形态各 GET 一次，见 `_looks_complete` docstring）：只有
+    `&token=D8SZNL…` 回 **200 + dfp payload**，补 `=` 或解成 0xD8 都是 400。
+    所以**不能靠"还原转义"修**，只能靠"换一条候选"。
+
+    样本用的是**实测抓到的原文形态**（真实 token 前后段），不是编的。
+    """
+    print("\n[魔法链接：残缺候选必须排在完整候选之后]")
+    head = ("https://login.typesafe.ai/v1/magic_links/redirect"
+            "?public_token=public-token-live-620c0996-4644-4af3-b592-31cb05006523"
+            "&stytch_token_type=magic_links&token")
+    complete = head + "=D8SZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ"
+    truncated = head + "SZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ"
+    # 实测正文顺序：**残缺的在前面**（所以"取第一个"必然踩坑）
+    body = f"Continue:\n{truncated}\n\nIf you're having trouble:\n{complete}\n"
+
+    cands = ps.extract_magic_links(body)
+    check("★ 两条候选都被收下（不丢）", len(cands) == 2, cands)
+    check("★ 完整候选排在第一位", cands and cands[0] == complete, cands[:1])
+    check("★ extract_magic_link 取到的是完整那条",
+          ps.extract_magic_link(body) == complete, ps.extract_magic_link(body))
+    check("★ 完整那条能抽出 token（不带 `D8` 截断）",
+          ts.TypeSafeClient.token_from_redirect_url(complete).startswith("D8SZNL"),
+          complete[-50:])
+    check("残缺那条被判为不完整",
+          not ps._looks_complete(truncated), truncated[-50:])
+    check("完整那条被判为完整", ps._looks_complete(complete), complete[-50:])
+
+    # 负对照 1：正文里**只有**残缺那条时，仍然返回它（不返回空串）——
+    #   让调用方"试一次然后失败"，比"直接说没找到链接"更接近真相。
+    only_bad = ps.extract_magic_links(truncated)
+    check("[负对照] 只有残缺候选时仍返回它（不返回空）",
+          len(only_bad) == 1 and only_bad[0] == truncated, only_bad)
+
+    # 负对照 2：`public_token=` 的存在与否不能靠子串误判 ——
+    #   `stytch_token_type=magic_links` 里也含 `token=` 子串，必须用 `[?&]token=` 锚定。
+    no_pub = head.replace("?public_token=public-token-live-620c0996-4644-4af3-b592-"
+                          "31cb05006523&", "?") + "=D8SZNL"
+    check("[负对照] 缺 public_token 时不算完整（`&token=` 锚定正确）",
+          not ps._looks_complete(no_pub), no_pub[-60:])
+    check("[负对照] 仅有 `stytch_token_type=magic_links` 不被当成完整",
+          not ps._looks_complete("https://login.typesafe.ai/v1/magic_links/redirect"
+                                 "?stytch_token_type=magic_links"),
+          "stytch_token_type=magic_links")
+

@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import tempfile
 from pathlib import Path
 
 from .support import (RANK, Mail, _FakeTypeSafe, _confirm_mail, _link_mail,
                       _make_pipe, _otp_mail, _tmp_ledger, check, offline,
-                      pl, st, ts)
+                      pl, ps, st, ts)
 
 def test_auth_error_triage() -> None:
     """🔴 三个错误码的分流 —— 业务核心。混掉的代价是把排查引向相反方向。"""
@@ -989,12 +990,12 @@ def test_mail_backend_selection() -> None:
     if _got is not None:
         check("★★ wait_for_mail 返回的是**全文**（预览里没有链接）",
               "token=FULLTOK" in _got.body, _got.body[:90])
-        check("★ 因此 extract_magic_link 拿得到链接",
-              st.extract_magic_link(_got.body).endswith("token=FULLTOK"),
-              st.extract_magic_link(_got.body))
+        _links = st.extract_magic_links(_got.body)
+        check("★ 因此取链接拿得到（阶段层用的是复数版，按序试候选）",
+              bool(_links) and _links[0].endswith("token=FULLTOK"), _links)
     check("[负对照] 直接拿预览提取**确实为空**（证明这个坑真实存在）",
-          st.extract_magic_link("Confirm your email to finish setting up "
-                                "TypeSafe.") == "")
+          st.extract_magic_links("Confirm your email to finish setting up "
+                                 "TypeSafe.") == [])
 
     _rsrc = inspect.getsource(RemailClient.wait_for_mail)
     check("★ 取全文发生在**匹配成功后**（轮询里逐封取会打爆取件配额）",
@@ -1002,3 +1003,154 @@ def test_mail_backend_selection() -> None:
     check("★ list_mails 保持轻量（不在里面逐封取全文）",
           "_hydrate" not in inspect.getsource(RemailClient.list_mails),
           "list_mails 里调了取全文")
+
+
+def test_magic_link_tries_all_candidates() -> None:
+    """魔法链接候选：**完整的排第一**，失败则**按序继续试**下一条。
+
+    2026-09-21 补跑实测（4/100 账号被误判死的根因）：正文里同一个魔法链接有
+    12 份，**8 份被截断了 4 个字符**（`&token=D8SZNL…` → `&tokenSZNL…`）。
+    残缺那条 GET 回 `400 invalid_public_token_id`，外层把它读成
+    "链接可能已被使用/过期" ⇒ 账号被误判死 —— 而**完整那条就在同一封邮件里**。
+
+    两种形态都要覆盖，缺一个就是假绿：
+      A. 正文里同时有残缺与完整 ⇒ 完整的**第一个**被试（不浪费请求）；
+      B. 完整的也可能因"已被消费"失败 ⇒ 必须**继续试**下一条完整候选。
+    判据是**终态**（`auth_callback` 被调用、URL 顺序正确），不是报错文案好不好看。
+
+    ⚠️ 安全性依据：残缺那条只会拿回 400、**不消耗**一次性 token，
+    所以逐条试不会把好链接试坏（`_exchange_link` 一拿到 redirect 就立刻返回）。
+    """
+    print("\n[编排：魔法链接候选 —— 完整优先 + 失败继续试]")
+    head = ("https://login.typesafe.ai/v1/magic_links/redirect"
+            "?public_token=public-token-live-620c0996-4644-4af3-b592-31cb05006523"
+            "&stytch_token_type=magic_links&token")
+    bad = head + "SZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ"
+    good = head + "=D8SZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ"
+    good2 = head + "=OTHERSECONDVARIANT"
+
+    tried: list[str] = []
+    called: list[tuple] = []
+
+    class _Cli:
+        def exchange_magic_link(self, url):
+            tried.append(url)
+            # 判据用"这条 URL 带不带 `&token=`" —— 与 `_looks_complete` 同源，
+            # 但这里是**独立的第二实现**，避免"用被测代码验证被测代码"。
+            if not any(p.startswith("token=") for p in url.split("&")[1:]):
+                raise ts.TypeSafeError("魔法链接页面未找到 dfp 交换参数"
+                                       "（链接可能已被使用/过期，页面长度 256）")
+            return ("https://console.typesafe.ai/?stytch_token_type=magic_links"
+                    "&token=OK")
+
+        def token_from_redirect_url(self, url):
+            return "OK"
+
+        def auth_callback(self, token, token_type, email):
+            called.append((token, token_type, email))
+            return ts.Result(ok=True, status=200, stage="auth_callback", data={})
+
+    def _mail(body: str, i: str = "m1"):
+        return Mail(id=i, to="a@b.test", sender="s@x.test",
+                    subject="Welcome to TypeSafe \u2014 confirm your email",
+                    body=body, received_at=1)
+
+    # ── 形态 A：正文里**残缺在前、完整在后**（实测就是这个顺序）──
+    with offline():
+        pipe = _make_pipe(pl, _tmp_ledger())
+        rec = st.AccountRecord(key="a@b.test", email="a@b.test")
+        res = pipe._exchange_link(rec, _mail(f"Continue:\n{bad}\n\nTrouble:\n{good}\n"),
+                                  _Cli())
+    check("★★ 完整的候选排第一，只发**一次**请求（不浪费往返）",
+          tried == [good], [u[-26:] for u in tried])
+    check("★ 最终交换成功并回调（终态）",
+          res is not None and res.ok and called == [("OK", "magic_links", "a@b.test")],
+          f"res={res!r} called={called}")
+    check("★ 没被记成失败", not rec.error, repr(rec.error))
+
+    # ── 形态 B：完整候选也可能已失效 ⇒ 必须继续试下一条 ──
+    class _CliFirstCompleteDead(_Cli):
+        def exchange_magic_link(self, url):
+            tried.append(url)
+            if "D8SZNL" in url or not any(p.startswith("token=")
+                                          for p in url.split("&")[1:]):
+                raise ts.TypeSafeError("魔法链接页面未找到 dfp 交换参数"
+                                       "（链接可能已被使用/过期，页面长度 256）")
+            return ("https://console.typesafe.ai/?stytch_token_type=magic_links"
+                    "&token=OK2")
+
+    tried.clear(); called.clear()
+    with offline():
+        pipe2 = _make_pipe(pl, _tmp_ledger())
+        rec2 = st.AccountRecord(key="a@b.test", email="a@b.test")
+        res2 = pipe2._exchange_link(
+            rec2, _mail(f"{bad}\n{good}\n{good2}\n", "m2"), _CliFirstCompleteDead())
+    check("★★ 第一条完整候选失效后**继续试**下一条，共 2 次请求",
+          tried == [good, good2], [u[-26:] for u in tried])
+    check("★ 第二条成功 ⇒ 终态成功", res2 is not None and res2.ok, repr(res2))
+
+    # ── 负对照 ──
+    check("[负对照] 残缺形态 `_looks_complete` 为假",
+          not ps._looks_complete(bad), bad[-40:])
+    check("[负对照] 完整形态 `_looks_complete` 为真",
+          ps._looks_complete(good), good[-40:])
+
+    class _CliAlwaysFail(_Cli):
+        def exchange_magic_link(self, url):
+            tried.append(url)
+            raise ts.TypeSafeError("魔法链接页面未找到 dfp 交换参数"
+                                   "（链接可能已被使用/过期，页面长度 256）")
+
+    tried.clear()
+    with offline():
+        pipe3 = _make_pipe(pl, _tmp_ledger())
+        rec3 = st.AccountRecord(key="c@d.test", email="c@d.test")
+        res3 = pipe3._exchange_link(rec3, _mail(f"Continue:\n{bad}\n", "m3"),
+                                    _CliAlwaysFail())
+    check("[负对照] 全部候选都失败时返回 None（不假装成功）", res3 is None, repr(res3))
+    check("[负对照] 错误里带候选条数（1 条时不写，避免噪声）",
+          "魔法链接交换失败" in rec3.error and "已试" not in rec3.error, rec3.error)
+    check("[负对照] 失败落在 login 阶段", rec3.stages.get("login") == "failed",
+          str(rec3.stages))
+
+
+def test_remail_probe_is_readonly() -> None:
+    """`tools/probes/probe_remail.py` 必须**只读** —— 它跑在**付费**后端上。
+
+    🔴 为什么值得一条源码级护栏：这个探针的**全部价值**是"花钱之前先看一眼"。
+    哪天有人为了"顺便验证下单能不能通"在里面加一行 `cl.create_mailbox(...)`，
+    它就变成"每次体检都真实扣积分"，而且**不报错**、只是账户余额悄悄变少 ——
+    与本项目已发生过的"自测替身漏覆盖会花钱的方法"是同一类失效。
+
+    判据是**调用点**而不是关键词：模块 docstring 里**必须**能提到
+    `create_mailbox`（用来解释"为什么这里不做这件事"），所以不能简单地
+    `"create_mailbox" not in src` —— 那是把文档也一起禁掉。
+    """
+    print("\n[工具：Remail 探针必须只读]")
+    path = Path(__file__).resolve().parent.parent / "probes" / "probe_remail.py"
+    check("★ 探针文件存在", path.is_file(), str(path))
+    src = path.read_text(encoding="utf-8")
+
+    # 1. 没有任何"付费动作"的调用点
+    paid = re.findall(r"\.(create_mailbox|order|purchase)\s*\(", src)
+    check("★★ 没有付费动作的调用点（create_mailbox / order / purchase）",
+          not paid, f"发现 {paid}")
+
+    # 2. 所有 HTTP 调用都是 GET
+    methods = re.findall(r'_request\(\s*"([A-Z]+)"', src)
+    check("★★ 所有 _request 调用都是 GET",
+          bool(methods) and set(methods) == {"GET"}, f"实际 {methods}")
+    check("★ 没有裸 POST/PUT/DELETE 调用",
+          not re.search(r"\.(post|put|delete)\s*\(", src), "出现了写方法调用")
+
+    # 3. 负对照：正则本身要能判负 —— 否则"全绿"可能只是它不会判红
+    fake = 'cl.create_mailbox("x")\ncl.s.post("/v1/open/orders")\n'
+    check("[负对照] 正则能识别出付费调用（证明上面不是假绿）",
+          bool(re.findall(r"\.(create_mailbox|order|purchase)\s*\(", fake))
+          and bool(re.search(r"\.(post|put|delete)\s*\(", fake)), fake)
+
+    # 4. 退出码契约：凭据缺失 2 / 接口不可用 3 / 有告警 1 / 全绿 0
+    for code in ("return 2", "return 3", "return 1 if WARN else 0"):
+        check(f"★ 退出码契约含 `{code}`", code in src, code)
+
+

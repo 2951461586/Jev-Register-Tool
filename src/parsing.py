@@ -62,26 +62,71 @@ MAGIC_LINK_RE = re.compile(
     re.escape(config.STYTCH_LOGIN_HOST) + r"/v1/magic_links/redirect\?[^\s\"<>\)\]]+"
 )
 
+#: 一次性 token 的参数名。判"这条链接完不完整"就看它（**必须带 `=`**）。
+#: 用 `[?&]` 锚定参数名起点，避免被 `public_token=` 里的子串误命中。
+MAGIC_LINK_TOKEN_PARAM_RE = re.compile(r"[?&]token=")
+
+
+def _looks_complete(url: str) -> bool:
+    """这条链接是否**同时**带齐 `public_token=` 与 `token=` 两个参数。
+
+    🔴 为什么需要（2026-09-21 补跑实测，4/100 账号必失败的根因）：
+    正文里**同一个 URL 会出现 12 次，其中一部分被截断了 4 个字符** ——
+        完整：`…&stytch_token_type=magic_links&token=D8SZNL…`
+        残缺：`…&stytch_token_type=magic_links&tokenSZNL…`   ← `=D8` 整个没了
+    残缺形态等于**根本没传 `token`**，Stytch 回 `400 invalid_public_token_id`
+    （报的是 `public_token` 的格式问题，跟"少了个参数"毫无字面关联），
+    外层于是把它读成"链接可能已被使用/过期"，把排查引向"重新发信"，白烧账号。
+
+    ⚠️ `=D8` 是 token 的**字面字符**，不是 quoted-printable 转义 —— 受控实验：
+    `&token=D8SZNL…` → **200 + dfp payload**；补成 `&token=SZNL…` → 400；
+    把 `=D8` 解成字节 0xD8 → 400。所以**不能靠"还原转义"修**，只能靠"换一条候选"。
+
+    旧实现取**第一个**匹配，恰好取到残缺那条 ⇒ 该账号必失败。
+    """
+    return "public_token=" in url and bool(MAGIC_LINK_TOKEN_PARAM_RE.search(url))
+
+
+def extract_magic_links(text: str) -> list[str]:
+    """取出正文里**所有**魔法链接候选：去重，**完整的排在前面**。
+
+    刻意返回列表而不是单个 —— 正文里同一 URL 可能有多份、且只有一部分是完整的，
+    "取第一个"不可靠。调用方应当**按序逐个试**，直到某一条真的换到会话为止：
+    判据是终态（拿到会话），不是"URL 长得对不对"。
+
+    去重按**反转义后**的字符串做（同一 URL 在 HTML 里可能一处 `&`、一处 `&amp;`）。
+    """
+    if not text:
+        return []
+    seen: dict[str, None] = {}
+    for m in MAGIC_LINK_RE.finditer(text):
+        # 🔴 **必须做 HTML 实体反转义**（2026-09-21 接入 Remail 时实测踩到）：
+        #    不同后端给的正文形态不同 —— CF Worker 是纯文本，Remail 是 **HTML**，
+        #    后者的链接里 `&` 被转义成 `&amp;`。不还原的话，提取出来的查询串是
+        #        ?public_token=X&amp;stytch_token_type=magic_links&amp;token=Y
+        #    解析方（Stytch）看到的参数名是 `amp;stytch_token_type` / `amp;token`
+        #    ⇒ **等于根本没传 token**，交换必然失败，而报错读起来像"链接无效/过期"，
+        #    会把排查引向"重新发信"，白烧账号。
+        #    `unescape` 对纯文本是无操作 ⇒ 对 CF 后端零影响（已由自测钉住）。
+        seen.setdefault(html_mod.unescape(m.group(0)), None)
+    cands = list(seen)
+    # 稳定分区：完整的一律排在残缺的前面（各自保持正文里的出现顺序）。
+    return ([u for u in cands if _looks_complete(u)]
+            + [u for u in cands if not _looks_complete(u)])
+
 
 def extract_magic_link(text: str) -> str:
-    """从邮件正文里取出魔法链接 URL；没有则返回空串。
+    """从邮件正文里取出**最优**魔法链接 URL；一条都没有则返回空串。
 
     放在解析层而不是调用方，是因为这个 URL 的**域名属于 Stytch**，
     与 `typesafe.exchange_magic_link()` 是同一个知识（改一处就该一起改）；
     域名本身又来自 `config.STYTCH_LOGIN_HOST`，所以三处不会各写一份。
+
+    ⚠️ 只返回一条时**不保证可用**（正文里可能压根没有完整的那条）。
+    需要"换一条再试"的调用方应当直接用 `extract_magic_links()`。
     """
-    m = MAGIC_LINK_RE.search(text or "")
-    if not m:
-        return ""
-    # 🔴 **必须做 HTML 实体反转义**（2026-09-21 接入 Remail 时实测踩到）：
-    #    不同后端给的正文形态不同 —— CF Worker 是纯文本，Remail 是 **HTML**，
-    #    后者的链接里 `&` 被转义成 `&amp;`。不还原的话，提取出来的查询串是
-    #        ?public_token=X&amp;stytch_token_type=magic_links&amp;token=Y
-    #    解析方（Stytch）看到的参数名是 `amp;stytch_token_type` / `amp;token`
-    #    ⇒ **等于根本没传 token**，交换必然失败，而报错读起来像"链接无效/过期"，
-    #    会把排查引向"重新发信"，白烧账号。
-    #    `unescape` 对纯文本是无操作 ⇒ 对 CF 后端零影响（已由自测钉住）。
-    return html_mod.unescape(m.group(0))
+    links = extract_magic_links(text)
+    return links[0] if links else ""
 
 
 def actions_from_html(page: str) -> dict[str, dict[str, Any]]:

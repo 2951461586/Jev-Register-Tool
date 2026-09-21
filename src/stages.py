@@ -50,7 +50,7 @@ from typing import Any, Callable
 
 from .mailrules import (CODE_RULES, LINK_RULES, any_of, extract_otp,
                         get as get_rule)
-from .parsing import extract_magic_link
+from .parsing import extract_magic_links
 # ⚠️ `MODE_CODE` **不在**这里 —— 它只用于 `runner.Pipeline.__init__` 的默认参数。
 #    import 一个本模块用不到的名字，死符号扫描会报，且会误导读者以为阶段层要看它。
 from .typesafe import MODE_LINK, Result, TypeSafeClient, TypeSafeError
@@ -325,18 +325,31 @@ class StageMixin:
         两个入口的行为可以悄悄分叉，且分叉后只在其中一条路径上复现。
 
         抽取后 `stage_login` 从 97 行降到约 75 行（`src/` 最热函数）。
+
+        🔴 **按序试所有候选**（2026-09-21 补跑实测）：正文里同一个 URL 可能有多份、
+        且**只有一部分是完整的**（实测 12 份里 8 份被截断了 4 个字符，见
+        `parsing._looks_complete`）。只试第一条 ⇒ 恰好取到残缺那条就必失败。
+        残缺那条 GET 只会拿回 400（不消耗一次性 token），所以逐条试是安全的；
+        而**成功那条会消耗 token** ⇒ 一旦拿到 redirect 就立刻返回，不再往下试。
         """
-        link = extract_magic_link(mail.body)
-        if not link:
+        links = extract_magic_links(mail.body)
+        if not links:
             self._fail(rec, "login", "魔法链接邮件里没找到链接")
             return None
-        try:
-            redirect = cl.exchange_magic_link(link)
-            token = cl.token_from_redirect_url(redirect)
-        except TypeSafeError as exc:
-            self._fail(rec, "login", f"魔法链接交换失败: {exc}")
-            return None
-        return cl.auth_callback(token, "magic_links", rec.email)
+        last_err = ""
+        for link in links:
+            try:
+                redirect = cl.exchange_magic_link(link)
+                token = cl.token_from_redirect_url(redirect)
+            except TypeSafeError as exc:
+                # 只记**最后一条**的错误：前面的失败是"这条候选残缺"，
+                # 最后一条的报错才最接近真正的原因（若全都残缺，就都一样）。
+                last_err = str(exc)
+                continue
+            return cl.auth_callback(token, "magic_links", rec.email)
+        suffix = f"（已试 {len(links)} 条候选）" if len(links) > 1 else ""
+        self._fail(rec, "login", f"魔法链接交换失败{suffix}: {last_err}")
+        return None
 
     # ── 阶段 1+2：发信 + 收凭据 + 认证回调（**唯一入口**） ─────────────
     def stage_login(self, rec: AccountRecord, *,

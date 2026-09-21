@@ -230,7 +230,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 235 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 262 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -241,9 +241,10 @@ $PY tools/selftest.py      # 235 项，含负对照，**全程离线**（不碰�
 | `test_parsing` | Server Action 渲染形态 | 12 | **索引集合不许写死**；`:2` 缺失不许 skip；旧形态不能被弄坏 |
 | `test_parsing` | Stytch 落地页 JS 对象字面量 | 4 | 裸键名不是 JSON |
 | `test_parsing` | 魔法链接：HTML 实体反转义 | 6 | 🔴 两个后端正文形态不同：Remail 给 **HTML**，`&` 被转义成 `&amp;` ⇒ 不还原则 token 参数名变成 `amp;token`，**等于没传 token**（见 §4.12） |
+| `test_parsing` | 魔法链接：残缺候选排在完整之后 | 9 | 🔴 正文里同一 URL 有 **12 份、8 份被截断 4 字符**（`&token=D8…` → `&token…`）⇒ 只取第一个必失败（见 §4.13） |
 | `test_ledger` | 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
 | `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK`（含历史词汇） |
-| `test_ledger` | 身份字段空白归一化 / 只写 LF | 13 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
+| `test_ledger` | 身份字段空白归一化 / 只写 LF | 23 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
 | `test_mailrules` | 收件规则 | 17 | 发件人同域必须叠加 subject；弯引号；CODE/LINK 分组不重叠；**营销流规则与 `SENDER_UPDATES` 不许回归** |
 | `test_mailrules` | OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码**；非锚定必须显式告警 |
 | `test_orchestration` | 编排：认证错误码分流 | 13 | 401/401/403 三条路不能混；400 的 `Unrecognized key` 要点名具体键 |
@@ -253,7 +254,7 @@ $PY tools/selftest.py      # 235 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | onboarding：站点门禁驱动 | 11 | 门禁链按站点重定向走；未知步骤报名字；非 `/setup/*` 跳转不许当"已通过" |
 | `test_orchestration` | 编排：门禁是引导，不是门槛 | 9 | ★ **门禁卡住但 key 建得出 ⇒ 必须记 `keyed`**（不误报 partial）；同一跳只提交一次；有界停下 |
 | `test_orchestration` | 登录：码模式 → 魔法链接回捞 | 5 | 同一次发码可能回**链接**而非码（实测 4 次里 1 次） |
-| `test_orchestration` | 编排：确认邮件等待阈值 | 5 | **迟到 ≠ 未发**；阈值不许退回 180s；超时文案必须带轮询计数 |
+| `test_orchestration` | 编排：确认邮件等待阈值 | 11 | **迟到 ≠ 未发**；阈值不许退回 180s；超时文案必须带轮询计数 |
 | `test_orchestration` | 编排：resume 不重复建 key | 4 | `resume` 不许给同一账号建第二把 key（含"没 key 的照常处理"正对照） |
 | `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
 | `test_orchestration` | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
@@ -261,11 +262,13 @@ $PY tools/selftest.py      # 235 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
 | `test_orchestration` | 编排：邮箱后端选择（cf / remail） | 27 | 🔴 `_clone()` 不许丢后端（串行复现不出来）；`domain` 语义按后端取；取件凭证跨进程恢复；取全文只在**匹配成功后** |
+| `test_orchestration` | 编排：魔法链接候选按序试 | 10 | 完整候选排第一 ⇒ **只发一次请求**；第一条失效 ⇒ **继续试**下一条（判据是**拿到会话**，不是"URL 长得对"） |
+| `test_orchestration` | 工具：Remail 探针必须只读（源码级） | 8 | ★ 不许出现 `create_mailbox` / `order` / `purchase` 的**调用点**（含"正则能识别付费调用"负对照）；所有 `_request` 都是 GET；退出码契约 0/1/2/3 |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **235 项**（24 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
-> 所以按输出分段统计时它会被算进"邮箱后端选择"那一段（显示 28 而非 27）——
-> 想复算就按"最后一段减 1"处理。
+> 合计 **262 项**（26 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
+> 所以按输出分段统计时它会被算进**最后一个**用例段（当前是「Remail 探针必须只读」，
+> 显示 9 而非 8）——想复算就按"最后一段减 1"处理。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >
@@ -605,12 +608,24 @@ $PY tools/relogin_pending.py --all-pending      # 台账里所有无 key 账号
 > 只在 `--mail-backend remail` 时出现。**共同点**：错误文案都容易把人引向错误方向 ——
 > 分别读起来像"站点没发链接"、"Remail 没库存"、"Remail 坏了"、"站点丢包"。
 
+**第 0 步（先跑这个，只读、不下单、不花积分）**：
+
+```bash
+$PY tools/probes/probe_remail.py          # 退出码 0 全绿 / 1 有告警 / 2 凭据缺失 / 3 接口不可用
+```
+
+一次报全四件事：**凭据**（base/项目/模式/后缀是否齐）· **API Key 体检**（余额，实测 `balance`
+就在 profile 响应里）· **项目与库存**（每个商品的 `codePrice`/`purchasePrice` + `totalAvailable`，
+并直接给出**全局最便宜的有货档**与"按余额最多还能买 N 单"）· **凭证台账**
+（`result/remail_orders.jsonl` 的坏行 / 缺字段 / 同地址重复下单 / **花了钱但没拿到 key** / 后缀漂移）。
+**① ~ ④ 里大半问题在这一步就能定位，不用逐个试。**
+
 **① `魔法链接邮件里没找到链接`** —— 两个独立根因，2026-09-21 实测**都踩过**：
 
 | 根因 | 判据 | 状态 |
 |---|---|---|
 | **只读了 `bodyPreview`**（截断预览：实测 **248 字符、完全无链接**，全文 **4012 字符**才有） | `send: ok`、`mail_wait` 正常，就是 extract 返回空 | 已修：`wait_for_mail` 匹配成功后调 `_hydrate()` 取全文 |
-| **全文是 HTML，`&` 被转义成 `&amp;`** | 提取出的 URL 含 `&amp;`，参数名变成 `amp;token` ⇒ **等于没传 token** | 已修：`extract_magic_link` 加 `html.unescape()` |
+| **全文是 HTML，`&` 被转义成 `&amp;`** | 提取出的 URL 含 `&amp;`，参数名变成 `amp;token` ⇒ **等于没传 token** | 已修：`extract_magic_links()` 加 `html.unescape()`（⚠️ 与 §4.13 的**残缺候选**是两个不同的坑，别互相顶替） |
 
 ```bash
 # 复算：直接看这个邮箱到底能取到什么（只读，不花钱）
@@ -666,6 +681,69 @@ for p in d['products']:
 ```bash
 $PY tools/relogin_pending.py --email <邮箱> --mail-backend remail --rounds 2
 ```
+
+### 4.13 `魔法链接交换失败: 页面长度 256`（**链接被截断**，2026-09-21 实测）
+
+**症状**：一批里少数账号（实测 100 批里 4 个）终态 `failed`，`error` 是
+`魔法链接交换失败: 魔法链接页面未找到 dfp 交换参数（链接可能已被使用/过期，页面长度 256）`。
+**这行文案会把排查引向"重新发信"——方向是错的，白烧账号。**
+
+**根因**：同一封邮件正文里**同一个 URL 出现多次（实测 12 次），其中一部分被截断了 4 个字符**：
+
+```
+完整：…&stytch_token_type=magic_links&token=D8SZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ
+残缺：…&stytch_token_type=magic_links&tokenSZNLCEWqnwIucRySURNiIZob5Y5B8rVl7nEenAmiWJ
+                                            ↑ `=D8` 整个没了
+```
+
+残缺形态**等于根本没传 `token`** ⇒ Stytch 回 `400 invalid_public_token_id`（报的是
+`public_token` 的**格式**问题，与"少了个参数"毫无字面关联）⇒ 外层把它读成"链接已用/过期"。
+旧实现 `extract_magic_link()` **只取第一个匹配**，恰好取到残缺那条 ⇒ 该账号**必失败**，
+而**完整的那条就在同一封邮件里**。
+
+⚠️ **`=D8` 是 token 的字面字符，不是 quoted-printable 转义。** 受控实验四形态：
+
+| 形态 | 结果 |
+|---|---|
+| `&token=D8SZNL…`（原样） | **HTTP 200 + dfp payload** ✅ |
+| `&token=SZNL…`（把 `=D8` 补成 `=`） | 400 |
+| 把 `=D8` 解成字节 `0xD8` | 400 |
+
+⇒ **不能靠"还原转义"修，只能换一条候选。**
+
+**判据（一眼定案）**：把邮件正文里的 URL 原文打出来，看有没有 `&token` 后面直接跟字符
+（缺 `=`）。只看错误文案永远看不出真因。
+
+```bash
+# 只读：把该邮箱最近一封确认邮件的所有 URL 候选列出来（不消耗 token）
+$PY -c "
+import sys; sys.path.insert(0,'.')
+from src import config
+from src.tempemail import TempMailClient
+from src.parsing import extract_magic_links, _looks_complete
+cl=TempMailClient(config.TEMPMAIL_BASE, config.TEMPMAIL_ADMIN_KEY)
+for m in cl.list_mails('<邮箱>'):
+    if 'confirm' in (m.subject or '').lower():
+        for u in extract_magic_links(m.body):
+            print(('完整' if _looks_complete(u) else '残缺'), u[-60:])
+"
+```
+
+**处置**：不需要重新发信。直接补跑即可 —— 修复后的 `_exchange_link()` 会**按序试所有候选**，
+完整的那条排第一：
+
+```bash
+$PY tools/relogin_pending.py --email <邮箱> --rounds 2
+```
+
+实测这 4 个账号**第 1 轮就用历史链接**拿到 key（**零成本、未重新发信**）。
+
+**为什么"逐条试"是安全的**：残缺那条 GET 只会拿回 400、**不消耗**一次性 token；成功那条
+**一旦拿到 redirect 就立刻返回**，不会继续往下试。
+
+**护栏**：`test_magic_link_truncated_variant`（解析层，9 项）+
+`test_magic_link_tries_all_candidates`（编排层，10 项）。⚠️ 编排层那条的替身用**独立的第二实现**
+判断"带不带 `&token=`"，避免"用被测代码验证被测代码"。
 
 ## 5. 别做这些事
 

@@ -194,6 +194,23 @@ class TypeSafeClient:
 
     # ── 4. 认证回调 ───────────────────────────────────────────────────
     def auth_callback(self, token: str, token_type: str, email: str) -> Result:
+        # 🔴 `waitlistEmail` 已于 2026-09-21 从请求体**删除**，不要加回来。
+        #
+        # 站点把该接口的 schema 收紧成了 strict：**多一个未知键直接 400**，
+        # 响应体是 Zod 的 flatten 格式 ——
+        #     {"error":"Bad request",
+        #      "details":{"formErrors":["Unrecognized key: \"waitlistEmail\""],
+        #                 "fieldErrors":{}}}
+        # 当时**所有**账号（含 122 个已获批、早已拿到 key 的）登录全部失败，
+        # 而错误文案只有一句 `HTTP 400: Bad request` —— 完全看不出
+        # 是"我们多发了一个键"，排查方向会跑偏到验证码/白名单上。
+        #
+        # 邮箱现在由 token/session 在**服务端**推导：200 响应体里自带
+        # `"email":"<该账号>"`，客户端不需要（也不允许）再传。
+        # `email` 形参仍然保留 —— 它还在给 `Referer` 用。
+        #
+        # 护栏：`tools/tests/test_orchestration.py::test_auth_callback_payload_shape`
+        # 逐键钉住请求体，多键/少键都会报红。
         payload = {
             "token": token,
             "tokenType": token_type,
@@ -201,7 +218,6 @@ class TypeSafeClient:
             "preferredOrgId": None,
             "inviteId": None,
             "oauthState": None,
-            "waitlistEmail": email,
         }
         r = self.s.post(f"{config.SITE_ORIGIN}/api/auth/callback", json=payload,
                         headers={"Origin": config.SITE_ORIGIN,

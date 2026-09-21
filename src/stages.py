@@ -156,6 +156,7 @@ class StageMixin:
         | `401 Code expired` | OTP 错/过期（凭据校验在**前**，不看邮箱） | 重新发码，10 分钟内提交 |
         | `401 Authentication failed` | 魔法链接 token **已被用过**（一次性） | 换一封邮件里的链接 |
         | `403 Access restricted` | 凭据有效，但**不在白名单** | 等获批，别改请求 |
+        | `400 Bad request` + `Unrecognized key` | 请求体多/少了键（站点改了 schema） | 改 `typesafe.auth_callback` 的键集 |
 
         混掉的代价：把"取码 bug"当成"邀请制拦截"（或反过来），
         会把排查引向完全错误的方向 —— 这两条路的处置**恰好相反**。
@@ -176,6 +177,17 @@ class StageMixin:
             return self._fail(
                 rec, "login",
                 f"认证回调 HTTP 401: {code}（token 已被使用，链接一次性）{suffix}")
+        # 站点 schema 收紧/放宽时走这里：Zod 的 strict 校验会把"未知键"单独列进
+        # `details.formErrors`。不特判的话就只剩一句 `HTTP 400: Bad request`，
+        # 完全看不出是"请求体多了一个键" —— 2026-09-21 实测正是这个形态：
+        # 全链路 100% 失败（含 122 个已获批账号），文案毫无指向性，排查跑偏到
+        # 验证码与白名单上。这里把它翻成人能直接执行的一句话。
+        form_errs = (res.data.get("details") or {}).get("formErrors") or []
+        if any("Unrecognized key" in str(e) for e in form_errs):
+            return self._fail(
+                rec, "login",
+                f"认证回调 HTTP {res.status}: 请求体里有站点不认识的键 —— "
+                f"{form_errs}；改 src/typesafe.py::auth_callback（键集有测试钉住）{suffix}")
         return self._fail(rec, "login", f"认证回调 HTTP {res.status}: {code}{suffix}")
 
     # ── 魔法链接交换（两个调用点共用的唯一实现） ───────────────────────

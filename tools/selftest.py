@@ -27,6 +27,7 @@ from tests.test_ledger import (test_identity_whitespace_normalization,  # noqa: 
                                test_ledger_union, test_status_vocabulary)
 from tests.test_mailrules import test_mailrules, test_otp_extraction  # noqa: E402
 from tests.test_orchestration import (test_apply_and_approval,  # noqa: E402
+                                      test_auth_callback_payload_shape,
                                       test_auth_error_triage, test_claim,
                                       test_code_mode_falls_back_to_magic_link,
                                       test_concurrency_no_crosstalk,
@@ -82,6 +83,7 @@ def main() -> int:
     test_mailrules()
     test_otp_extraction()
     test_auth_error_triage()
+    test_auth_callback_payload_shape()
     test_apply_and_approval()
     test_login_action_index_drift_retries()
     test_code_mode_falls_back_to_magic_link()

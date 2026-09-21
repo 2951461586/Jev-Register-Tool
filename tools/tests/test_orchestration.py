@@ -102,6 +102,12 @@ class _FakeResp:
         self.status_code = status
         self.headers = headers or {}
 
+    def json(self):
+        """`requests` 的 `.json()` 失败时抛的 `JSONDecodeError` 是 `ValueError`
+        的子类，而调用方（如 `auth_callback`）正是靠捕获 `ValueError` 兜底的，
+        所以这里直接用 `json.loads`，失败行为与真会话一致。"""
+        return json.loads(self.text)
+
 
 class _FakeSession:
     """按序吐出预置页面，并记录 GET 次数（用来断言重试次数）。
@@ -123,9 +129,66 @@ class _FakeSession:
         self.calls += 1
         return _FakeResp(self.pages[i])
 
-    def post(self, url, files=None, headers=None, timeout=None):
-        self.posts.append({"url": url, "files": files or {}, "headers": headers or {}})
+    def post(self, url, files=None, headers=None, timeout=None, json=None):
+        # `json` 形参与 `requests` 对齐（这里遮住的是模块名，不是别的）；
+        # 记录它是为了能逐键断言请求体。
+        self.posts.append({"url": url, "files": files or {}, "headers": headers or {},
+                           "json": json})
         return self.post_resp
+
+
+def test_auth_callback_payload_shape() -> None:
+    """`/api/auth/callback` 的请求体**键集**逐字钉住。
+
+    🔴 2026-09-21 实测：站点把该接口的 schema 收紧成 strict —— 多一个未知键
+    直接 400，响应体是 Zod 的 flatten 格式：
+
+        {"error":"Bad request",
+         "details":{"formErrors":["Unrecognized key: \\"waitlistEmail\\""],
+                    "fieldErrors":{}}}
+
+    当时**所有**账号登录全灭（含 122 个已获批、早已拿到 key 的），
+    而错误文案只有一句 `HTTP 400: Bad request`，完全看不出
+    是"我们多发了一个键" —— 排查方向会跑偏到验证码/白名单上。
+
+    这条护栏的作用：下次站点再改 schema，**离线自测先报红**，
+    而不是等到真打站点时以一句无指向性的 400 暴露。
+    """
+    print("\n[auth_callback 请求体形态]")
+    ses = _FakeSession([], post_resp=_FakeResp('{"success":true}', 200))
+    cl = ts.TypeSafeClient(session=ses)
+    cl.auth_callback("123456", "otp", "who@example-mail.test")
+
+    check("确实打了一次 POST", len(ses.posts) == 1, str(len(ses.posts)))
+    sent = ses.posts[-1]["json"] or {}
+    check("★ 请求体键集 == 站点 strict schema 允许的键",
+          set(sent) == {"token", "tokenType", "returnTo", "preferredOrgId",
+                        "inviteId", "oauthState"},
+          f"实际键集 {sorted(sent)}")
+    check("★ 不含 waitlistEmail（站点已删该字段，带上必 400）",
+          "waitlistEmail" not in sent, str(sorted(sent)))
+    check("token / tokenType 原样透传",
+          sent.get("token") == "123456" and sent.get("tokenType") == "otp", str(sent))
+    check("打到的是 /api/auth/callback",
+          str(ses.posts[-1]["url"]).endswith("/api/auth/callback"),
+          str(ses.posts[-1]["url"]))
+    check("带 Origin / Referer / Accept",
+          {"Origin", "Referer", "Accept"} <= set(ses.posts[-1]["headers"]),
+          str(sorted(ses.posts[-1]["headers"])))
+
+    # 负对照：站点报"未知键"时必须翻成一句人能直接执行的话。
+    # 不特判的话只剩 `HTTP 400: Bad request` —— 这条正是当时的实际体验。
+    with offline() as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = st.AccountRecord(key="x@example-mail.test", email="x@example-mail.test")
+        pipe._fail_auth(rec, ts.Result(
+            ok=False, stage="auth_callback", status=400,
+            data={"error": "Bad request",
+                  "details": {"formErrors": ['Unrecognized key: "waitlistEmail"'],
+                              "fieldErrors": {}}}))
+        check("★ 400 Unrecognized key → 报出具体键名，并指向 auth_callback",
+              "Unrecognized key" in rec.error and "auth_callback" in rec.error,
+              rec.error)
 
 
 def _login_html(nums) -> str:

@@ -3,8 +3,12 @@
 背景：`complete_onboarding()` 依赖 `/api/me` 的
 `latest_tos_acceptance` / `human_name` / `console_survey_completed_at` 三个字段
 判断缺口。大 HAR 里**只出现了 /setup/tos 与 /setup/set-name**，没有
-/setup/console-survey ⇒ 怀疑站点已把三步简化成两步，而我们的
-`needs_survey` 判据永远为 True ⇒ 永远多跑一步 ⇒ 404 ⇒ 假 partial。
+/setup/console-survey ⇒ 当时怀疑站点已把三步简化成两步。
+
+⚠️ 该怀疑**已被推翻**：`/setup/console-survey` 存在，且**时有时无** ——
+2026-09-21 晚 100 批实测，走到该跳的 68 个账号里 28 个遇到它。
+站点步数在 2~3 之间摆动，**不要写死步数**。真问题不是"站点删了这步"，
+而是"`needs_survey` 判据永远为 True ⇒ 永远多跑一步 ⇒ 404 ⇒ 假 partial"。
 
 用法：
     python tools/probes/probe_onboarding_state.py

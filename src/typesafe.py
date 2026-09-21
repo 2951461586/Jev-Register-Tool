@@ -21,7 +21,10 @@
     邮箱不再出现在页面里）⇒ 已从本模块移除，不要再加回去；
   · `/login` 提交后**直接**发 "Welcome to TypeSafe — confirm your email"；
   · `POST /api/auth/callback` 直接 200，**不再有 `403 Access restricted`**；
-  · onboarding 只剩两步，且由**站点重定向**驱动（见 `onboarding_gate`）。
+  · onboarding 由**站点重定向**驱动（见 `onboarding_gate`）。⚠️ **步数不稳定**：
+    站点在 2~3 步之间摆动，`console-survey` 时有时无（2026-09-21 晚 100 批实测：
+    走到该跳的 68 个账号里 28 个遇到 `console-survey`，另 34 个卡在 `set-name`
+    重复出现）。⇒ 不要在任何地方写死"只剩 N 步"。
 
 ⇒ 注册与登录合并成一次动作，`stages.stage_login` 是链路的唯一入口。
 
@@ -74,9 +77,12 @@ MODE_CODE = "code"
 #    首选**永远**是运行时抓 `$ACTION_*` 隐藏域。
 #    ⇒ 走这条路必须留痕：`post_setup()` 会打显式告警，失败时 error 指向真因。
 #
-# 2026-09-21 更新：`/setup/console-survey` 条目**已删除** —— 站点把 onboarding
-# 简化成两步（ToS → set-name），那个路由不再存在（实测所有 `/setup/*` 与 `/hook`
-# 在 ToS 未接受时一律 307 到 `/setup/tos`，接受后一律 307 到 `/setup/set-name`）。
+# 2026-09-21 更新：`/setup/console-survey` **不进本表** —— 不是因为它不存在
+# （它存在，且晚批实测 28/68 账号会走到它），而是因为**那一页没有 `$ACTION_*`
+# 隐藏域**（渲染的是 "Get started / Let's create your org" 向导），
+# 给它编一个 action id 也没有东西可提交。⚠️ 早先这里写的"该路由已不存在 /
+# onboarding 只剩两步"是**从单次观测过度概括**，已被同日实测与本批日志推翻；
+# 站点步数在 2~3 之间摆动，见 `complete_onboarding()` 的说明。
 # 下面两个 id 是 2026-09-21 实测值（与同日 HAR 的 `next-action` 头逐字一致）。
 FALLBACK_SETUP_ACTIONS = {
     "/setup/tos": "6046a5522e4a3fd387f720ff2166e85612b1b5b9db",
@@ -389,8 +395,9 @@ class TypeSafeClient:
 
         历史教训（2026-09-21 实测，误报率 19/25 = 76%）：
         旧实现用 `/api/me` 的 `console_survey_completed_at` 判断"要不要跑 survey"。
-        可站点**已经把 survey 这一步删掉了**（onboarding 从三步变两步），
-        该字段于是永远为 `None` ⇒ 每次都多发一次 survey POST ⇒
+        可站点**在步数上自己就不稳定**（`console-survey` 时有时无，
+        2026-09-21 晚 100 批实测 28/68 账号走到它），
+        该字段于是长期为 `None` ⇒ 每次都多发一次 survey POST ⇒
         而那时页面渲染的是欢迎页、**没有 `$ACTION_*` 隐藏域**
         ⇒ 退化到已作废的 fallback ⇒ 404
         ⇒ **账号明明已经完全 onboard，却被记成 `partial`**。

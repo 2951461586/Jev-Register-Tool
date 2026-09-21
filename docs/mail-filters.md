@@ -2,7 +2,7 @@
 
 > 格式对齐同机 OpenXLab 项目的做法：**信封发件人子串做第一道过滤，主题子串做第二道。**
 > 实现：`src/mailrules.py`　自测：`tools/selftest.py`（`[收件规则 mailrules]` 段 21 项，
-> `[OTP 抽取（锚定 / 降级）]` 段 10 项；全套 179 项 —— 以 `$PY tools/selftest.py`
+> `[OTP 抽取（锚定 / 降级）]` 段 10 项；全套 184 项 —— 以 `$PY tools/selftest.py`
 > 末行的 `通过 N / 失败 0` 为准，本文不重复维护这个数字的副本）
 
 ## 1. 为什么要两道过滤

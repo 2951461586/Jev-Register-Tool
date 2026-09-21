@@ -213,7 +213,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 179 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 184 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -242,9 +242,10 @@ $PY tools/selftest.py      # 179 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
 | `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
 | `test_orchestration` | 登录：`/api/auth/callback` 请求体键集 | 7 | 站点是 **strict** schema ⇒ 多一个键 = 全员登录失败，只回一句 `400 Bad request`（2026-09-21 实测，见 §4.8） |
+| `test_orchestration` | onboarding：合并提交 + `/api/me` 读滞后 | 5 | POST 报错后**必须回读** `/api/me`：缺口关了就是成功，不许把"已经好了"记成失败（实测误报 76%，见 §4.9） |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **179 项**（22 段 + 1 项入口元检查）。
+> 合计 **184 项**（23 段 + 1 项入口元检查）。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >
@@ -441,6 +442,49 @@ $PY tools/probes/audit_keys_against_site.py --limit 2
 > 上想，会白跑一整轮。`stages._fail_auth` 现在特判 Zod 的 `Unrecognized key`，
 > 直接报出是哪个键、该改哪个文件。
 
+### 4.9 `onboarding` 卡在最后一跳（`/setup/console-survey` 抓不到 `$ACTION_*`）
+
+**症状**：`--mode resume` / `--mode full` 报
+
+```
+onboarding 失败: HTTP 404 —— 且本次走的是**降级通路**（未抓到 $ACTION_* 隐藏域：
+/setup/console-survey?returnTo=%2Fhook 未渲染出 Server Action 隐藏域…）
+```
+
+`status=partial`，而 `/api/me` 显示 `needs_tos=False / needs_name=False /
+needs_survey=True` —— **前两跳都成功了，只有第三跳没做完**。
+
+**判据 —— 先分清"会话问题"还是"站点改版"**（别直接按改版处置）：
+
+用**新会话**重跑同一个账号（`--mode resume` 会重新登录 ⇒ 天然是新会话）。
+
+- 新会话**立刻成功** ⇒ 本节这种情况，**不是**页面结构变了
+- 新会话**也失败** ⇒ 才是真改版，跑 `probes/probe_onboarding.py --post`
+
+**根因（实测，未完全归因）**：站点对 `/setup/*` 的渲染**取决于会话状态**。
+同一个会话里（2026-09-21 逐跳记录）：
+
+| 动作 | GET 到的页面 | `$ACTION_*` |
+|---|---|---|
+| 登录后 GET `/setup/tos` | len 39490，"Tell us about yourself" 表单 | `['1']` ✓ |
+| POST `/setup/tos` → GET `/setup/set-name` | 同上 | `['1']` ✓ |
+| POST `/setup/set-name` → GET `/setup/console-survey` | **len 40507** | **（无）** ✗ |
+
+而**同一会话内轮询 62 秒都不恢复**；**换一个新会话立刻就有 `$ACTION_1`**。
+⇒ **onboarding 的最后一跳在同一会话里做不到。**
+
+**处置**：多跑一轮 —— 靠换会话补上。
+
+```bash
+$PY tools/resume_pending.py            # 默认 --rounds 3，第 2 轮就会补上
+```
+
+⚠️ **`--rounds 1` 不够**（实测：25 个里 19 个停在 `partial`，**76%**）。
+`resume_pending.py` 的默认值本来就是 3，**不要为了"省一轮"把它调小**。
+
+> 若单跑一个账号，第二次 `--mode resume` 即可（已验证 3 个账号：
+> `login ok → onboarding ok → api_key ok`，直接拿到 key）。
+
 ## 5. 别做这些事
 
 - ❌ 别用 `/admin/all` 拉列表再自己筛——烧 D1 读配额，且会被别人的邮件挤出窗口
@@ -460,3 +504,5 @@ $PY tools/probes/audit_keys_against_site.py --limit 2
 - ❌ 别看到 `confirm` 超时就直接重投申请（先回查收件箱，迟到 ≠ 未发）
 - ❌ 别往 `/api/auth/callback` 的请求体里**加键**：站点是 strict schema，
   多一个键 = 全体账号登录失败，且只回一句 `400 Bad request`（见 §4.8）
+- ❌ 别把 `resume_pending.py` 的 `--rounds` 调到 1：onboarding 的**最后一跳
+  在同一会话里做不到**，第 2 轮换会话才补得上（实测 76% 会停在 partial，见 §4.9）

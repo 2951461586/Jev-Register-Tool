@@ -9,7 +9,7 @@
 
 产物（全部落在 **`result/`**，即交付物目录）：
 
-    result/success.jsonl        成功账号（从台账补录，幂等）
+    result/success.jsonl        成功**账号**（账号级：每邮箱一行；从台账补录，幂等）
     result/keys.txt             email----api_key----api_key_id（人可读，直接复制）
     result/keys_verified.json   机器可读的验收结果
 
@@ -101,10 +101,37 @@ def main() -> int:
     # 补录：把成功记录同步进 result/success.jsonl（**交付物**目录）。
     # 幂等（按 key 并集去重，且 EARNED_FIELDS 保证空值不覆盖已有凭据），可反复跑。
     # 这样"改目录约定之前"拿到的成功数据也会被补齐，不必手工搬。
+    #
+    # 🔴 `success.jsonl` 是**账号级**台账：`Ledger` 以 `key`（= 邮箱）为主键，
+    # 同账号重跑拿到的**第二把** key 会覆盖前一把 ⇒ 落盘行数 == 唯一邮箱数，
+    # 天然少于 `recs` 条数。这不丢数据（第二把 key 仍在 keys.txt /
+    # keys_verified.json 里，那两个是**凭据级**的），但**日志必须自证落盘行数**：
+    # 只印 "更新 129 / 未变 113"（= 242 条输入）会被读成"242 行都写进去了"，
+    # 而 `upsert_many` 自己的 docstring 就要求"增量写回必须能自证真的写进去了"。
+    # 这条原则必须在**调用点**兑现，不能只写在被调方。
     succ = Ledger(config.SUCCESS_LEDGER_PATH)
     st = succ.upsert_many(recs)
+    n_rows = len(succ.raw_rows())
+    emails_in = {r["key"] for r in recs}
+    n_keys = len({r["api_key"] for r in recs})
+    # 每条输入都必须被处理到（added/updated/kept 覆盖全集）
+    assert st["added"] + st["updated"] + st["kept"] == len(recs), (
+        f"upsert 只处理了 {st['added'] + st['updated'] + st['kept']} / {len(recs)} 条输入")
+    # 「没丢行」的准确判据是**输入里的每个邮箱都出现在落盘结果里**。
+    # ⚠️ 不能写成 `落盘行数 == 输入邮箱数`：success.jsonl 是**累积**文件，
+    # 可能含主台账里已不存在的历史邮箱，那样会误炸。
+    missing = emails_in - {r["key"] for r in succ.load()}
+    assert not missing, (
+        f"补录后仍有 {len(missing)} 个邮箱不在 success.jsonl 里：{sorted(missing)[:3]}")
     print(f"成功台账 {config.SUCCESS_LEDGER_PATH}："
-          f"新增 {st['added']} / 更新 {st['updated']} / 未变 {st['kept']}")
+          f"新增 {st['added']} / 更新 {st['updated']} / 未变 {st['kept']}"
+          f"（输入 {len(recs)} 条）")
+    print(f"  落盘 {n_rows} 行（**账号级**，每行一个邮箱）；输入落在 "
+          f"{len(emails_in)} 个邮箱上"
+          + (f"，比输入少 {len(recs) - len(emails_in)} 行 —— "
+             f"同账号重跑的第二把 key 被按邮箱合并掉了。"
+             f"**要凭据清单请看 keys.txt / keys_verified.json（{n_keys} 把，凭据级）**"
+             if len(recs) > len(emails_in) else "，与输入一致"))
 
     # 同一邮箱可能有多条（重跑过），按 key 去重
     seen: dict[str, dict] = {}

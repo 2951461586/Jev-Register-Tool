@@ -203,3 +203,22 @@ def test_identity_whitespace_normalization() -> None:
           f"_write_lf 出现 {vsrc.count('_write_lf(')} 次")
     check("verify_keys 不再用会翻译换行的 Path.write_text",
           "write_text(" not in vsrc, "还有 write_text 调用")
+
+    # 7) 交付物侧：`verify_keys.py` 补录 success.jsonl 后必须**自证落盘行数**。
+    #    `success.jsonl` 是**账号级**（以邮箱为主键）⇒ 落盘行数天然少于输入条数
+    #    （同账号的第二把 key 被合并）。只印 "更新 N / 未变 M"（= 输入条数）
+    #    会被读成"N 行都写进去了"，而 `upsert_many` 的 docstring 明确要求
+    #    "增量写回必须能自证真的写进去了" —— 这条得在**调用点**兑现。
+    _after_upsert = vsrc.split("upsert_many(recs)", 1)[-1]
+    check("★ verify_keys 补录后回读 success.jsonl 落盘行数",
+          "raw_rows()" in _after_upsert,
+          "upsert 之后没看到 raw_rows() —— 无法自证落盘了几行")
+    check("★ verify_keys 断言「输入里的邮箱都在落盘结果里」（防丢行）",
+          "assert not missing" in _after_upsert,
+          "缺少防丢行断言（丢行会被静默放过）")
+    check("verify_keys 防丢行判据不是「落盘行数 == 输入邮箱数」",
+          "assert n_rows == n_emails" not in _after_upsert,
+          "success.jsonl 是累积文件，用行数相等做判据会误炸")
+    check("verify_keys 日志同时印出输入条数与落盘行数",
+          "（输入 " in _after_upsert and "落盘 " in _after_upsert,
+          "日志没把两个口径都写出来，读者会以为二者相等")

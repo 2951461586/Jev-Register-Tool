@@ -172,9 +172,9 @@ $PY tools/verify_keys.py
 - `result/success.jsonl` —— 成功**账号**（账号级：每邮箱一行；从台账补录，幂等；每次跑批也会自动追加）
 - ⚠️ **两套口径别混**：`success.jsonl` 是**账号级**（`Ledger` 以邮箱为主键，同账号重跑的
   第二把 key 会被合并掉），而 `keys.txt` / `keys_verified.json` 是**凭据级**（每把 key 一行）
-  ⇒ 三者行数**天然不等**。2026-09-21 快照：**182 / 248 / 242**（后两者不等是因为
-  `keys.txt` 与 `keys_verified.json` 不是同一次 `verify_keys.py` 写出来的 ——
-  **它们只在同一次运行内才保证一致**）。要交付凭据以 `keys.txt` 为准；
+  ⇒ **前两者**行数**天然不等**。2026-09-21 19:03 快照：**225 / 290 / 290**
+  （`keys.txt` 与 `keys_verified.json` 由**同一次** `verify_keys.py` 写出，故相等；
+  两者**只在同一次运行内**才保证一致，跨次比较会不等）。要交付凭据以 `keys.txt` 为准；
   `verify_keys.py` 会把「输入条数」与「落盘行数」两个口径都印出来自证。
 
   ```bash

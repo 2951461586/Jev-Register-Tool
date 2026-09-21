@@ -4,10 +4,17 @@
 拆分原因（2026-09-20 二轮审计 ⑩）：本文件曾 1155 行、20 个测试挤在一起，
 改一条断言要在上千行里翻。现在按被测对象分四个模块：
 
-    tests/test_parsing.py        解析层（PoW / 紧凑 JSON / Server Action / JS 字面量）
+    tests/test_parsing.py        解析层（紧凑 JSON / Server Action / JS 字面量）
     tests/test_ledger.py         台账（并集合并 / 状态词汇 / 身份字段归一化）
     tests/test_mailrules.py      收件规则 + OTP 抽取
-    tests/test_orchestration.py  编排层（错误码分流 / 申请 / 登录 / 监听 / 并发）
+    tests/test_orchestration.py  编排层（错误码分流 / 登录 / onboarding 门禁 /
+                                 重跑去重 / 并发）
+
+2026-09-21：邀请制取消后删掉 5 个用例（`test_pow` / `test_apply_and_approval` /
+`test_confirm_timeout_headroom` / `test_watch_skips_keyed` / `test_claim`），
+新增 5 个（`test_chain_has_no_external_gate` / `test_onboarding_gate_drives_steps` /
+`test_onboarding_gate_is_guidance_not_a_gate` / `test_mail_timeout_headroom` /
+`test_resume_skips_keyed`）。
 
 ⚠️ **仍然不是 pytest**（刻意不引）：本项目零第三方依赖，跑法不变 ——
     $PY tools/selftest.py
@@ -26,21 +33,22 @@ from tests import support  # noqa: E402
 from tests.test_ledger import (test_identity_whitespace_normalization,  # noqa: E402
                                test_ledger_union, test_status_vocabulary)
 from tests.test_mailrules import test_mailrules, test_otp_extraction  # noqa: E402
-from tests.test_orchestration import (test_apply_and_approval,  # noqa: E402
-                                      test_auth_callback_payload_shape,
-                                      test_auth_error_triage, test_claim,
+from tests.test_orchestration import (test_auth_callback_payload_shape,  # noqa: E402
+                                      test_auth_error_triage,
+                                      test_chain_has_no_external_gate,
                                       test_code_mode_falls_back_to_magic_link,
                                       test_concurrency_no_crosstalk,
-                                      test_confirm_timeout_headroom,
                                       test_fan_out_worker_crash_is_recorded,
                                       test_key_survives_rerun_failure,
                                       test_login_action_index_drift_retries,
-                                      test_onboarding_merged_submit_is_not_a_failure,
+                                      test_mail_timeout_headroom,
+                                      test_onboarding_gate_drives_steps,
+                                      test_onboarding_gate_is_guidance_not_a_gate,
                                       test_post_setup_degrade_is_observable,
-                                      test_success_ledger,
-                                      test_watch_skips_keyed)
+                                      test_resume_skips_keyed,
+                                      test_success_ledger)
 from tests.test_parsing import (test_compact_ref, test_js_object,  # noqa: E402
-                                test_pow, test_setup_action_forms)
+                                test_setup_action_forms)
 
 
 def _registry_gap() -> tuple[list[str], list[str]]:
@@ -74,7 +82,6 @@ def _registry_gap() -> tuple[list[str], list[str]]:
 
 
 def main() -> int:
-    test_pow()
     test_compact_ref()
     test_setup_action_forms()
     test_js_object()
@@ -85,14 +92,14 @@ def main() -> int:
     test_otp_extraction()
     test_auth_error_triage()
     test_auth_callback_payload_shape()
-    test_apply_and_approval()
+    test_chain_has_no_external_gate()
     test_login_action_index_drift_retries()
-    test_onboarding_merged_submit_is_not_a_failure()
+    test_onboarding_gate_drives_steps()
+    test_onboarding_gate_is_guidance_not_a_gate()
     test_code_mode_falls_back_to_magic_link()
-    test_confirm_timeout_headroom()
-    test_watch_skips_keyed()
+    test_mail_timeout_headroom()
+    test_resume_skips_keyed()
     test_post_setup_degrade_is_observable()
-    test_claim()
     test_key_survives_rerun_failure()
     test_success_ledger()
     test_concurrency_no_crosstalk()

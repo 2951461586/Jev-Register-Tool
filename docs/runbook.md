@@ -28,19 +28,29 @@ $PY tools/run_e2e.py --doctor
 
 `--doctor` 会验：配置齐全 → 邮箱服务健康 → 能建邮箱 → 台账可读。
 
-## 1. 五种模式
+## 1. 三种模式
 
 | 模式 | 干什么 | 会不会发注册请求 |
 |---|---|---|
-| `--mode apply` | 建邮箱 + 投递申请 + 等确认邮件 | 会（申请段） |
+| （默认）`full` | ★ 全链路：建邮箱 → 发信 → 登录 → onboarding → 建 key | 会 |
 | `--mode scan` | 按规则表给窗口内邮件分桶，**列出漏网主题** | 不会（只读） |
-| `--mode watch` | 轮询等获批，**命中即刻自动续跑 4→7** | 命中才会 |
-| `--mode resume` | 对指定已获批邮箱跑 4→7 | 会（注册段） |
-| `--mode claim` | ⚠️ **实验性；两进程用法已知失效**（见 §1.5） | 会（注册段） |
+| `--mode resume` | 对**指定邮箱**补跑（幂等，可反复跑） | 会 |
+
+> 🔴 **2026-09-21 邀请制取消后删掉了三个模式**（`apply` / `watch` / `claim`）：
+>
+> | 删掉的 | 为什么 |
+> |---|---|
+> | `apply` | 它投的 Framer 表单**本身不存在了**（申请环节没了） |
+> | `watch` | 它轮询全表共享窗口找"获批邮件"，而"获批"这个**事件不存在了** |
+> | `claim` | 人工接力。两进程用法**实测已失效**（必报 `401 Code expired`），见 §1.5 |
+>
+> 连带删除 `stages.stage_login_with_token()` 与 `tempemail.first_mail_matching()`
+> —— 它们是这两个模式各自的唯一落点。原文件在
+> `.workbuddy-ai/backup/refactor-20260921-180438/`。
 
 ### 并发（`--concurrency`）
 
-`apply` / `full` / `resume` 支持 `--concurrency N`（默认 1 = 串行，行为与加并发前一致）：
+`full` / `resume` 支持 `--concurrency N`（默认 1 = 串行，行为与加并发前一致）：
 
 ```bash
 $PY tools/run_e2e.py --mode resume --email a@example-mail.test --email b@example-mail.test \
@@ -48,65 +58,43 @@ $PY tools/run_e2e.py --mode resume --email a@example-mail.test --email b@example
 ```
 
 - 并发安全的**前提**是每个账号只读**自己的**收件箱索引端点（`/api/inbox?email=`）。
-  申请段与注册段都满足。
 - 每个 worker 用**独立的 `Pipeline` 实例**（各自的 `requests.Session` 与 `stats`），
   唯一共享的是带锁的 `Ledger`。会话 client **不再是实例字段** ——
   挂实例字段在串行时看不出问题，并发会**串号**（A 的 key 建在 B 的会话上）。
-- 🔴 **`--mode watch` 不支持并发**，传了会被直接拒绝。
-  它读的是**全表共享窗口**（`/admin/all`，retention 只有 100 行），
-  并发读不会更快，只会互相抢同一批行 + 放大 D1 读配额。
-  要提速就缩短 `--watch-interval`。
+- 实测（2026-09-21）：`--count 2 --concurrency 2` 两把 key 互不串号，都通过验收。
 
-### 1.1 投递申请
+### 1.1 全链路（默认模式）
 
 ```bash
-$PY tools/run_e2e.py --mode apply --count 5
+$PY tools/run_e2e.py --count 5
 ```
 
-单账号约 3~6s（含等确认邮件）。**这一段的终点是"确认邮件到达"，不是"获批"。**
+单账号关键路径实测 `login 6.7s + create_key 5.0s`。
 
-🔴 **看到 `未在 Ns 内收到 waitlist 确认邮件` 不要直接当成失败。**
-2026-09-20 实测：连跑 10 批次时确认邮件的到达延迟**单调爬升**
-（41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 s），
-阈值当时是 180s，最后两条被判 `failed` —— 但收件箱复核显示它们
-**在超时后 12s / 18s 就落了库**，是**假阴性**。
+**这一段的终点是"建出 key"，中间没有任何需要等待的外部环节。**
+（旧的 `apply → 等回执 → 等获批 → resume` 四步流程已随邀请制取消作废。）
 
-同一天还发现**两例延迟约 20 分钟**的（09:01 / 09:04 提交 → 09:21:28 才入库）。
-那段时间正好横跨共享 Worker 的故障恢复窗口（09:19:29 才恢复落库），
-所以更像是**故障期积压/重投**而非常态延迟；两例后来都正常获批，
-也说明**确认邮件没收到并不影响审批**。
+🔴 **看到 `未在 Ns 内收到确认邮件` 不要直接当成失败，也不要先去改请求。**
 
-> ⇒ 阈值只是"本次不等了"，**不是**"这封邮件不会来了"。
-> 任何固定阈值都会漏掉长尾 —— 所以处置必须是"先回查，再决定"。
+2026-09-20 连跑 10 批次实测的到达延迟（秒）：
+`41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 / ∞`
+最后两条在阈值 180s 处被判 `failed`，但收件箱复核显示它们**在超时后 12s / 18s
+就落了库** —— 是**假阴性**。所以阈值现在取 `MAIL_TIMEOUT = 300s`
+（`tools/selftest.py` 的 `[编排：确认邮件等待阈值]` 段把"不许调回 180s"钉住）。
 
-🔴 **超时不再记为 `failed`，而是 `applied`（申请已投递）**（2026-09-20 改）。
-理由是有**硬证据**的：当天 5 个"确认邮件超时"的账号**后来全部获批**，
-其中一个的确认邮件**至今从未到达** ⇒ 回执与申请注册是**两件独立的事**。
-把回执超时记成 `failed`，会让这些账号从"待复查"清单里消失 ——
-与 P0（台账等级语义）是同一类错误：**不报错，只是少几行**。
-`applied` 在 `ledger.RANK` 里是 1 分，低于 `confirmed`(2) / `approved`(3) / `keyed`(5)，
-所以后续复查仍会把它正确升级，不会锁死。
+处置顺序：
 
-> 护栏：`tools/selftest.py` 的 `[编排：确认邮件等待阈值]` 段会把阈值 ≥ 240s
-> 钉住、检查文案点明"申请已注册 / 勿重投"，并用**负对照**断言超时**不许**被记成
-> `failed`。改回旧行为自测立刻失败。
-
-处置顺序（**先复核，再决定要不要重投**）：
-
-1. 回查该邮箱的收件箱索引端点，确认邮件到底有没有到（迟到 ≠ 未发）：
-
+1. **先重跑一次**。魔法链接 7 天有效，重跑会连历史链接一起用
+   （`relogin_pending.py` 就是干这个的），比改请求更有效。
+2. 回查收件箱，确认邮件到底有没有到（迟到 ≠ 未发）：
    ```bash
    $PY tools/run_e2e.py --mode scan     # 看窗口内到底有什么
    ```
+3. 只有**发信请求本身**失败（`stages.send != ok`）才算真的失败。
 
-2. **优先用 `--mode watch` 接住下游**。`watch` **完全不看台账状态** ——
-   它直接扫 Worker 窗口里所有 `account is ready` 邮件，谁获批就续跑 4→7。
-   所以哪怕确认回执永远没到，只要申请注册成功了，链路照样能走完。
-3. 只有表单提交本身失败（`stages.apply != ok`）才算真的失败；
-   表单 201 但回执未到 ⇒ **不要重投**（重投只会再产生一个重复申请）。
-4. 阈值默认 `CONFIRM_TIMEOUT = 300s`。需要临时覆盖用 `--confirm-timeout`。
-   在"回执普遍迟到"的时段，**不要为了等回执把阈值调大** ——
-   那会让整批跑得极慢；正确做法是调小阈值（快速投递）+ 用 `watch` 接下游。
+> 超时文案里带了**邮箱接口的轮询计数**（`轮询 N 次，5xx M 次`）：
+> 计数正常 = 站点没发（重跑即可）；计数很高 / 5xx 多 = **我们读不出来**
+> （去查 Worker）。这两件事的处置**恰好相反**，所以文案必须把它们分开。
 
 ### 1.2 看窗口里到底有什么（最常用的诊断）
 
@@ -117,75 +105,60 @@ $PY tools/run_e2e.py --mode scan
 **这是"我到底收到了什么"的唯一可信来源**，比凭印象说"我好像收到过"靠谱。
 判据见 `docs/mail-filters.md` §5。
 
-### 1.3 等获批并自动续跑（**批量出号的标准姿势**）
-
-```bash
-$PY tools/run_e2e.py --mode watch --watch-timeout 900 --watch-interval 15 \
-  > exports/watch.log 2>&1 &
-```
-
-🔴 **必须常驻**。审批是批量定时的（实测延迟约 15~25 分钟），而 Worker 窗口只有
-**~37 分钟**（100 行 ÷ 邻居刷屏速率）——"等邮件到了再去取"这种设计必然漏掉。
-`watch` 是**边到边取**：命中当场消费。
-
-它不依赖台账地址（扫全窗口），所以申请是在别处提交的也能接上。
-
-### 1.4 对已获批邮箱补跑
+### 1.3 补跑指定邮箱
 
 ```bash
 $PY tools/run_e2e.py --mode resume \
   --email a@example-mail.test --email b@example-mail.test
 ```
 
-零申请请求，可反复跑（幂等）。**失败重试就用这个。**
+可反复跑（幂等）。**失败重试就用这个。**
 
-### 1.5 人工接力（获批邮箱是真人邮箱时）
+🔴 **默认跳过台账里已有 `api_key` 的地址**（`skip_keyed=True`）。
+重跑会给同一账号**造出第二把 key**：两把在服务端都有效，但
+`Ledger.load()` 按邮箱去重、**末行胜出** ⇒ 交付物里少一把。
+这与 P0 / 阈值误判是同一类：**不报错，只是行数不对**。
+确需重跑请从库内调用并传 `skip_keyed=False`（CLI 上没有这个开关，是刻意的）。
 
-> 🔴 **先读这段，不要直接照抄命令。**
->
-> `--mode claim` 的**两进程用法已知失效**（2026-09-20 实测）：`--send` 与
-> `--token` 是**两个独立进程**，各自新建 `TypeSafeClient()`，中间**没有任何会话传递**。
-> 实测**码在 2 分钟内提交仍报 `401 Code expired`**。
->
-> ⚠️ 而 §4.2 对这个错误码的处置写的是"重新发码，10 分钟内提交" ——
-> **照着做会掉进死循环**。这就是必须在这里显式警告的原因：错误码与根因毫无字面关联。
+护栏：`test_resume_skips_keyed`（含"没有 key 的地址照常被处理"的正对照）。
 
-**第一选择：`resume`**（同一进程内完成"发码 → 收码 → 提交"，会话是连续的）：
+### 1.4 整批补跑（从台账里挑）
 
 ```bash
-$PY tools/run_e2e.py --mode resume --email me@real.com
+$PY tools/resume_pending.py
 ```
 
-> 只要邮箱在 Worker 覆盖的域内（= 我们自己建的临时邮箱），**一律用 `resume`**。
-> 它才是"失败重试"的正常入口（见 §1.4）。
+它挑的是"有邮箱、但还没有 `api_key`"的地址。**进度/计数只信它** ——
+它走 `Ledger.load()` 的**合并视图**，不是"末行胜出"（那会让重跑失败把计数
+**压低**，守卫据此误判"没有新增"而提前收工）。详见 §4.3。
 
-**只有当邮箱是真人邮箱、Worker 读不到时**才轮到 `claim`，而它当前是坏的：
+### 1.5 人工接力（`--mode claim`）—— **已移除，不是"修好"**
 
-```bash
-# ⚠️ 以下流程 2026-09-20 实测报 401 Code expired，仅作为"待修复路径"的记录，
-#    不要当成可用流程。
-$PY tools/run_e2e.py --mode claim --email me@real.com --send
-$PY tools/run_e2e.py --mode claim --email me@real.com --token 123456
-```
+> 🔴 这一节记录的是**已删除的功能**，留在这里是为了不丢掉根因。
+> 不要照抄任何命令 —— 那些参数在 CLI 上已经不存在了。
 
-**根因候选（⚠️ 未验证 —— 等一次真人邮箱场景实测）**：
+`claim` 的用途曾是"邮箱是真人邮箱、Worker 读不到时，由人把验证码/魔法链接
+token 粘进来"。它被删除有三条独立理由：
 
-`stage_login()` 在提交回调**之前**会先 `GET /login?waitlist=<email>` 建立会话
-（经由 `fetch_actions()`），而 `stage_login_with_token()` **完全没有这一步** ——
-它上来就 `POST /api/auth/callback`。两条路唯一的差别就在这里，所以最可能的原因是
-回调缺少 `/login` 页面种下的会话 cookie。
+1. **它本身实测已失效**：`--send` 与 `--token` 是**两个独立进程**，各自新建
+   `TypeSafeClient()`，中间**没有任何会话传递**。实测**码在 2 分钟内提交仍报
+   `401 Code expired`**。⚠️ 而 §4.2 对这个错误码的处置写的是"重新发码，
+   10 分钟内提交" —— **照着做会掉进死循环**。错误码与根因毫无字面关联。
+2. **它的唯一调用者 `runner.claim()` 已随 `watch()` 一起删除** ⇒ 无入口。
+3. **新链路里没有这个场景**：魔法链接 7 天有效，`resume` 一条命令就能把
+   没拿到 key 的地址重跑（含历史链接复用）。
 
-**验证方法**（不要跳过这一步就宣布修好了）：在 `stage_login_with_token()` 开头补一次
-`cl.s.get(config.SITE_LOGIN, params={"waitlist": rec.email})`，然后用一个真实获批邮箱
-重跑两进程流程。若 401 消失即证实。
+**根因候选（⚠️ 始终未实测，随功能删除而失去验证机会）**：
 
-> 本项目已经有过"判据跑在错误的层上 ⇒ 假阴性"的教训（见 `tools/resume_pending.py`
-> 的 docstring：按"末行胜出"计数会把重跑失败记录压掉，导致计数**下降**、
-> 守卫误判"没有新增"而提前收工）。
-> **在拿到实测凭据之前，这个修复只能记为"候选"，不能记为"已完成"。**
+`stage_login()` 在提交回调**之前**会先 `GET /login` 建立会话（经由
+`fetch_actions()`），而 `stage_login_with_token()` **完全没有这一步** ——
+它上来就 `POST /api/auth/callback`。两条路唯一的差别就在这里，所以最可能的
+原因是回调缺少 `/login` 页面种下的会话 cookie。
 
-`claim` **不需要** `TEMPMAIL_ADMIN_KEY`，一次只处理一个地址
-（凭据一次性 + 10 分钟有效期）。
+> 记录这一条是因为它是"**判据跑在错误的层上 ⇒ 假阴性**"的又一个实例
+> （参见 `tools/resume_pending.py` 的 docstring）。若将来真要做"人工粘凭据"，
+> 先验证这个候选：在新建 client 之后补一次 `GET /login`，再跑两进程流程。
+> **没实测前不许记为"已修"** —— 现在是"已删除"，这两个词不能混。
 
 ## 2. 验收（**不算完成，除非跑过这一步**）
 
@@ -199,8 +172,15 @@ $PY tools/verify_keys.py
 - `result/success.jsonl` —— 成功**账号**（账号级：每邮箱一行；从台账补录，幂等；每次跑批也会自动追加）
 - ⚠️ **两套口径别混**：`success.jsonl` 是**账号级**（`Ledger` 以邮箱为主键，同账号重跑的
   第二把 key 会被合并掉），而 `keys.txt` / `keys_verified.json` 是**凭据级**（每把 key 一行）
-  ⇒ 三者行数**天然不等**（实测 177 / 242 / 242）。要交付凭据以 `keys.txt` 为准；
-  `verify_keys.py` 现在会把「输入条数」与「落盘行数」两个口径都印出来自证。
+  ⇒ 三者行数**天然不等**。2026-09-21 快照：**182 / 248 / 242**（后两者不等是因为
+  `keys.txt` 与 `keys_verified.json` 不是同一次 `verify_keys.py` 写出来的 ——
+  **它们只在同一次运行内才保证一致**）。要交付凭据以 `keys.txt` 为准；
+  `verify_keys.py` 会把「输入条数」与「落盘行数」两个口径都印出来自证。
+
+  ```bash
+  wc -l result/success.jsonl result/keys.txt          # 账号级 / 凭据级
+  "$PY" -c "import json;print(len(json.load(open('result/keys_verified.json'))))"
+  ```
 - `result/keys.txt` —— `email----api_key----api_key_id`（可复制）
 - `result/keys_verified.json` —— 机器可读的验收结果
 
@@ -217,39 +197,40 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 188 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 186 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
 
 | 模块 | 段 | 项数 | 钉住什么 |
 |---|---|---:|---|
-| `test_parsing` | PoW | 5 | `sha256(salt+secret)` 前缀 + Form-Fields 逐字一致 |
 | `test_parsing` | Server Action bound 参数 | 2 | `$ACTION:0` 必须紧凑 JSON（带空格 ⇒ 500） |
 | `test_parsing` | Server Action 渲染形态 | 12 | **索引集合不许写死**；`:2` 缺失不许 skip；旧形态不能被弄坏 |
-| `test_parsing` | Stytch JS 字面量 | 4 | 裸键名不是 JSON |
+| `test_parsing` | Stytch 落地页 JS 对象字面量 | 4 | 裸键名不是 JSON |
 | `test_ledger` | 台账并集合并（真实词汇） | 15 | **`keyed` 之后重跑失败不许清空 `api_key`** |
-| `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK` |
-| `test_ledger` | 身份字段空白归一化 / 只写 LF / 交付物自证 | 13 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
-| `test_mailrules` | 收件规则 | 21 | 发件人同域必须叠加 subject；弯引号；CODE/LINK 分组不重叠 |
+| `test_ledger` | 状态词汇覆盖（AST） | 4 | 新增 status 必须登记进 `ledger.RANK`（含历史词汇） |
+| `test_ledger` | 身份字段空白归一化 / 只写 LF | 13 | CRLF 污染台账键（实测污染过 39 条）；`verify_keys.py` 补录后必须回读落盘行数并印出两个口径 |
+| `test_mailrules` | 收件规则 | 17 | 发件人同域必须叠加 subject；弯引号；CODE/LINK 分组不重叠；**营销流规则与 `SENDER_UPDATES` 不许回归** |
 | `test_mailrules` | OTP 抽取 | 10 | 锚定优先；**诱饵在前仍取真码**；非锚定必须显式告警 |
-| `test_orchestration` | 编排：认证错误码分流 | 12 | 401/401/403 三条路不能混 |
-| `test_orchestration` | 编排：申请段 / 邀请制 | 9 | 未获批**不算执行失败**；计时器不重叠 |
+| `test_orchestration` | 编排：认证错误码分流 | 13 | 401/401/403 三条路不能混；400 的 `Unrecognized key` 要点名具体键 |
+| `test_orchestration` | auth_callback 请求体形态 | 7 | 站点是 **strict** schema ⇒ 多一个键 = 全员登录失败，只回一句 `400 Bad request`（见 §4.8） |
+| `test_orchestration` | 编排：链路无外部阻断点 | 7 | 结构护栏：`stage_apply` / `stage_wait_approval` / `claim` / `watch` **都不许回归** |
 | `test_orchestration` | 登录：Server Action 编号漂移 → 重试 | 7 | 缺索引先原样重试，别把编号漂移当"页面结构变了" |
+| `test_orchestration` | onboarding：站点门禁驱动 | 11 | 门禁链按站点重定向走；未知步骤报名字；非 `/setup/*` 跳转不许当"已通过" |
+| `test_orchestration` | 编排：门禁是引导，不是门槛 | 9 | ★ **门禁卡住但 key 建得出 ⇒ 必须记 `keyed`**（不误报 partial）；同一跳只提交一次；有界停下 |
 | `test_orchestration` | 登录：码模式 → 魔法链接回捞 | 5 | 同一次发码可能回**链接**而非码（实测 4 次里 1 次） |
-| `test_orchestration` | 编排：确认邮件等待阈值 | 6 | **迟到 ≠ 未发**；阈值不许退回 180s |
-| `test_orchestration` | 监听：不重复建 key | 3 | `watch` 续跑不许给同一账号建第二把 key |
-| `test_orchestration` | 编排：claim 两段式 | 7 | `code_sent` 不是 `failed`（**单进程内**的语义；两进程失效见 §1.5） |
+| `test_orchestration` | 编排：确认邮件等待阈值 | 5 | **迟到 ≠ 未发**；阈值不许退回 180s；超时文案必须带轮询计数 |
+| `test_orchestration` | 编排：resume 不重复建 key | 4 | `resume` 不许给同一账号建第二把 key（含"没 key 的照常处理"正对照） |
+| `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
 | `test_orchestration` | 编排：重跑失败不丢凭据 | 6 | P0 回归（端到端） |
 | `test_orchestration` | 编排：成功台账只收成功 | 8 | `result/` 是交付物 ⇒ 失败那次一条都不许写进去 |
 | `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
-| `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
-| `test_orchestration` | 登录：`/api/auth/callback` 请求体键集 | 7 | 站点是 **strict** schema ⇒ 多一个键 = 全员登录失败，只回一句 `400 Bad request`（2026-09-21 实测，见 §4.8） |
-| `test_orchestration` | onboarding：合并提交 + `/api/me` 读滞后 | 5 | POST 报错后**必须回读** `/api/me`：缺口关了就是成功，不许把"已经好了"记成失败（实测误报 76%，见 §4.9） |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **188 项**（23 段 + 1 项入口元检查）。
+> 合计 **186 项**（21 段 + 1 项入口元检查）。⚠️ 元检查那行**打印在最后一段后面**，
+> 所以按输出分段统计时它会被算进"并发 worker 崩溃"那一段（显示 8 而非 7）——
+> 想复算就按"最后一段减 1"处理。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >
@@ -271,48 +252,57 @@ $PY tools/selftest.py      # 188 项，含负对照，**全程离线**（不碰�
 
 ### 4.1 `403 Access restricted`（该邮箱未被邀请）
 
-**不是 bug，是白名单。** 别改请求，去等获批。
+**不是 bug，是白名单。** 别改请求。
+
+> ⚠️ 2026-09-21 起邀请制已取消，实测回调**直接 200** ⇒ 这个码**不再是常态**。
+> 但处置逻辑保留：站点随时可能恢复白名单，而删掉它会让"没被邀请"伪装成
+> "凭据错误"，把排查引向重新发码的死循环。
 
 判断顺序（见 `docs/mail-filters.md`）：
 
-1. `--mode scan` 里 `account_ready` 是 0 封吗？→ 是就还没获批，继续 `watch`
-2. `account_ready` 有，但 `resume` 仍 403 → 抄错邮箱了，核对地址
+1. `--mode scan` 里 `welcome_confirm` 是 0 封吗？→ 是就先跑一次 `full`/`resume`
+2. 有确认邮件、`resume` 仍 403 → 抄错邮箱了，核对地址
+3. 都排除 → 站点可能重新开了白名单，等通知（没有"查获批邮件"这条路了，
+   因为那封邮件不再产生）
 
 ### 4.2 `401 Code expired` / `401 Authentication failed`
 
-三个错误码别混：
+四个错误码别混：
 
 | 响应 | 含义 | 处置 |
 |---|---|---|
 | `401 Code expired` | OTP 错/过期（凭据校验在**前**，不看邮箱） | 重新发码，10 分钟内提交 |
-| `401 Authentication failed` | 魔法链接 token **已被用过**（一次性） | 换一封邮件里的链接 |
-| `403 Access restricted` | 凭据有效，但**不在白名单** | 等获批 |
+| `401 Authentication failed` | 魔法链接 token **已被用过**（一次性） | 换一封邮件里的链接（或重跑，历史链接会被一起用） |
+| `403 Access restricted` | 凭据有效，但**不在白名单** | 见 §4.1 |
 | `400 Bad request` + `Unrecognized key` | 请求体多/少了键（站点改了 schema） | 见 §4.8 |
 
 **校验顺序**：token 先、白名单后。无效 token 时**根本不看邮箱**——
 所以只有"凭据正确时拿到的 403"才算白名单证据。
 
-> 🔴 **一个已知的例外，别照上表处置**：如果你用的是 `--mode claim` 的两进程用法
-> （`--send` 然后另起一个进程 `--token`），那么 `401 Code expired` **不是**
-> "码过期/抽错码"，而是**会话没接上**——两个进程各建一套会话，凭据再新也没用。
-> 此时"重新发码"是**无效处置**，会把你推进死循环。
-> 判据：同一个码，用 `--mode resume` 走单进程能过、用 claim 两进程必失败。
-> 详见 §1.5。
+> 🔴 历史上还有一个**例外**：`--mode claim` 的两进程用法会让 `401 Code expired`
+> 表示"会话没接上"而不是"码过期"，照着上表处置会掉进死循环。
+> **该模式已于 2026-09-21 整体删除**（连同 `stage_login_with_token()`），
+> 所以这个例外不存在了。根因记录留在 §1.5，不要把它读成"还有个模式可用"。
 
-### 4.3 "没收到验证码邮件"
+### 4.3 "没收到确认邮件"
 
-先分清三种情况（`--mode scan` 的计数会告诉你）：
+先分清三种情况（`--mode scan` 的计数 + 超时文案里的轮询计数会告诉你）：
 
 | 症状 | 根因 | 处置 |
 |---|---|---|
-| `signin_code` / `verify_code` 计数涨了，但流程说没收到 | 收信时序 / 匹配问题 | 看 `mailrules` 是否有漏网主题 |
-| 计数没涨 | 发信没成功或窗口被冲刷 | 重试；确认窗口下界时间戳 |
+| `welcome_confirm` 计数涨了，但流程说没收到 | 收信时序 / 匹配问题 | 看 `mailrules` 是否有漏网主题 |
+| 计数没涨，且**轮询次数正常、5xx 为 0** | 站点没发（发信丢包） | **重跑一次** —— 魔法链接 7 天有效 |
+| 计数没涨，且**轮询次数很高 / 5xx 多** | 我们**读不出来**（Worker 侧） | 查 Worker，见 §4.4 / §4.5 |
 | `--mode scan` 报"漏网主题" | **站点改了文案** | 更新 `src/mailrules.py` 的规则表 |
 | 日志里出现 `⚠ 取码走了**降级**路径` | **站点改了邮件模板**，锚定失配 | 去查模板/规则，**不要**去重新发码 |
 | 明明收到了码却报 `401 Code expired` | 抽到了**报文头里的数字**而非真码 | 查有没有那行降级警告（见 §4.3.1） |
 
-实测 `oai-d3b08883633d4bc2` 出现过一次 `未收到验证码邮件`，**重试即成功**
-（瞬时问题）。所以**单次失败先重试，不要直接判死**。
+实测 `oai-d3b08883633d4bc2` 出现过一次超时，**重试即成功**（瞬时问题）。
+所以**单次失败先重试，不要直接判死**。
+
+🔴 站点发信**确实会丢包**：实测同一账号 4 次发码里 1 次回的是魔法链接、
+另有整批"请求 200 但邮件完全不到"的时段（见 §4.10）。
+判据是超时文案里的 `轮询 N 次，5xx M 次` —— 它把"没发"和"读不出来"分开。
 
 ### 4.3.1 取码走了降级路径（新增）
 
@@ -356,9 +346,17 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H 'content-type: application/js
 > 表名是 **`emails`**，不是 `messages`（`messages` 只是 `/admin/all` 的 JSON 字段名）。
 > 先 `SELECT name FROM sqlite_master WHERE type='table'` 拿真实表名。
 
-### 4.6 `onboarding 失败: HTTP 404`（**站点改版**，2026-09-20 实测）
+### 4.6 `/setup/*` 的 Server Action 隐藏域换了形态（**站点改版**，2026-09-20 实测）
 
-**症状**：`login` 成功（说明邀请门槛已过），但统一报 `onboarding 失败: HTTP 404`。
+**症状**：`login` 成功，但 onboarding 报错。⚠️ **报错文案在 2026-09-21 变过**：
+
+| 时期 | 文案 |
+|---|---|
+| 2026-09-20 | `onboarding 失败: HTTP 404`（只有这一句，无指向性） |
+| 2026-09-21 起 | `提交 tos 后门禁**原地不动**（tos）：HTTP 200 但内容不是有效提交（多半走了降级通路、action id 已失效）｜本次 [tos:via=next-action(6046a5522e4a…),HTTP 200]，门禁序列 [...]` |
+
+新文案把 **`via=`（走的哪条通路）、HTTP 码、门禁序列** 全打出来了 ——
+判读时先看 `via=`：`next-action(...)` 就是降级通路，`nojs(action_1)` 才是首选通路。
 
 **根因**：`/setup/*` 页的 Server Action 隐藏域换了形态。
 
@@ -379,11 +377,15 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H 'content-type: application/js
 **处置**：跑探针，把两跳分开看：
 
 ```bash
+$PY tools/probes/probe_gate_chain.py        # ★ 首选：逐跳打门禁 + 最后试建 key
 $PY tools/probes/probe_onboarding.py <email>          # 只读：GET + 看有没有 $ACTION 隐藏域
 $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路分别裸打
 ```
 
 判读：`A. 渐进增强` 通路 200 而 `B. 降级` 通路 404 ⇒ **解析器的问题，不是站点挂了**。
+
+> ⚠️ 别把"门禁原地不动"一律当改版处置：先确认 **key 建不出来**。
+> 若 key 建得出来，那只是 §4.9 的正常留痕。
 
 **已修**：`_actions_from_html` 改成扫**任意** `<n>`、只要求 `:0` 存在，
 `:1`/`:2` 有就收没有就不发，并带出 `$ACTION_KEY`
@@ -446,123 +448,122 @@ $PY tools/probes/audit_keys_against_site.py --limit 2
 > 上想，会白跑一整轮。`stages._fail_auth` 现在特判 Zod 的 `Unrecognized key`，
 > 直接报出是哪个键、该改哪个文件。
 
-### 4.9 `onboarding` 卡在最后一跳（`/setup/console-survey` 抓不到 `$ACTION_*`）
+### 4.9 `stages.onboarding = partial`（**正常现象，不是故障**，2026-09-21 重写）
 
-**症状**：`--mode resume` / `--mode full` 报
+**症状**：日志里出现
 
 ```
-onboarding 失败: HTTP 404 —— 且本次走的是**降级通路**（未抓到 $ACTION_* 隐藏域：
-/setup/console-survey?returnTo=%2Fhook 未渲染出 Server Action 隐藏域…）
+  [onboarding] ⚠ 门禁未归零：遇到不认识的引导步骤 'console-survey'（…）
+  [onboarding]   （门禁序列 ['tos', 'set-name', 'console-survey']；仍继续建 key …）
 ```
 
-`status=partial`，而 `/api/me` 显示 `needs_tos=False / needs_name=False /
-needs_survey=True` —— **前两跳都成功了，只有第三跳没做完**。
+然后 `[api_key] apikey_…` 照常出现，最终 `status=keyed`。
 
-**判据 —— 先分清"会话问题"还是"站点改版"**（别直接按改版处置）：
+🔴 **这是正常的，不要去"修"它。** 站点把 `/hook` 的重定向当**引导**用，
+而我们能自动提交的只有前两跳：
 
-用**新会话**重跑同一个账号（`--mode resume` 会重新登录 ⇒ 天然是新会话）。
-
-- 新会话**立刻成功** ⇒ 本节这种情况，**不是**页面结构变了
-- 新会话**也失败** ⇒ 才是真改版，跑 `probes/probe_onboarding.py --post`
-
-**根因（实测，未完全归因）**：站点对 `/setup/*` 的渲染**取决于会话状态**。
-同一个会话里（2026-09-21 逐跳记录）：
-
-| 动作 | GET 到的页面 | `$ACTION_*` |
+| 门禁 | 我们能不能提交 | 说明 |
 |---|---|---|
-| 登录后 GET `/setup/tos` | len 39490，"Tell us about yourself" 表单 | `['1']` ✓ |
-| POST `/setup/tos` → GET `/setup/set-name` | 同上 | `['1']` ✓ |
-| POST `/setup/set-name` → GET `/setup/console-survey` | **len 40507** | **（无）** ✗ |
+| `tos` | ✅ | `$ACTION_1` 隐藏域在，`post_setup` 走 no-JS 通路 |
+| `set-name` | ✅ | 同上（实测降级通路也能成） |
+| `console-survey` | ❌ | 该页**没有 `$ACTION_*` 隐藏域**，渲染的是 "Get started / Let's create your org" 向导 |
 
-而**同一会话内轮询 62 秒都不恢复**；**换一个新会话立刻就有 `$ACTION_1`**。
-⇒ **onboarding 的最后一跳在同一会话里做不到。**
+**决定性证据**：门禁停在 `console-survey` 时，`POST /api/api-keys` 返回
+**200 + 明文 key**（2026-09-21 实测，`probe_gate_chain.py` 的最后一节）。
+⇒ **门禁不是硬门槛，判据是能不能建出 key。**
 
-**处置**：多跑一轮 —— 靠换会话补上。
+复现命令（一次跑完，会逐跳打出 `/hook` 的原始 `location`）：
 
 ```bash
-$PY tools/resume_pending.py            # 默认 --rounds 3，第 2 轮就会补上
+$PY tools/probes/probe_gate_chain.py
 ```
 
-⚠️ **`--rounds 1` 不够**（实测：25 个里 19 个停在 `partial`，**76%**）。
-`resume_pending.py` 的默认值本来就是 3，**不要为了"省一轮"把它调小**。
+**处置**：什么都不用做。`stages.onboarding = partial` 只是留痕，
+`status` 仍然是 `keyed`，key 也通过了验收。
 
-> 若单跑一个账号，第二次 `--mode resume` 即可（已验证 3 个账号：
-> `login ok → onboarding ok → api_key ok`，直接拿到 key）。
+> ⚠️ 历史（2026-09-21 早先版本）：那时判据是"门禁必须归零"，于是这些账号被记成
+> `partial`，还试过"靠下一轮换会话补上"（`resume_pending.py --rounds 3`）。
+> **现在不需要了** —— 但 `resume_pending.py` 的 `--rounds` 默认值没有改回 1，
+> 因为多轮对"发信丢包"仍然有用（见 §4.10）。
+>
+> ⚠️ 另一个坑：`/hook` **自己非确定性** —— 同一次运行里相邻两次 `GET /hook`
+> 会给出不同答案（实测 `set-name` 与 200 交替）。所以**任何**拿它当归零判据的
+> 写法都会空转。`complete_onboarding` 现在有 `attempted` 去重，同一跳只提交一次。
 
-### 4.10 发码请求"成功"但邮件**完全不到**（站点发信故障，2026-09-21 实测）
+### 4.10 发信请求"成功"但邮件**完全不到**（站点发信故障，2026-09-21 实测）
 
-**症状**：`--mode resume` 报 `未收到验证码邮件` / `未收到魔法链接邮件`，
-或发码阶段报 `HTTP 500 Internal Server Error` / `HTTP 503 Service Unavailable`；
-重试仍不恢复。
+**症状**：报 `未在 Ns 内收到确认邮件`，或发信阶段报
+`HTTP 500 Internal Server Error` / `HTTP 503 Service Unavailable`；重试仍不恢复。
 
-⚠️ **`--mode claim --send` 回「已发出 6 位验证码」也不能当成「邮件会到」。**
+⚠️ **`POST /login` 回「已发出」也不能当成「邮件会到」。**
 站点会**接受**请求却不发信：2026-09-21 实测 **12 次发码只送到 1 封（~8%）**，
 其中**已获批账号也大量收不到**（16:57 那次收到了，17:01 那次就收不到）。
 ⇒ 判"是否获批"时，**只有"已获批账号收得到、待审批账号收不到"才成立**；
 已获批账号自己都在丢信时，任何"未获批"的结论都是**假判据**。
 
-**判据 —— 拿一个"已获批且有 key"的账号发码做对照**（这一步不能跳）：
+**判据 —— 看超时文案里的轮询计数**（这一步不能跳）：
 
-```bash
-$PY tools/run_e2e.py --mode claim --email <已获批账号> --send
-# 等 ~200s 后查它的收件箱
-```
+| 超时文案 | 含义 | 处置 |
+|---|---|---|
+| `轮询 N 次，5xx 0 次`（N 与等待时长匹配） | 站点**没发** | 重跑；或等站点恢复 |
+| `轮询 N 次，5xx M 次`（M 明显 > 0） | 我们**读不出来** | 查 Worker（§4.4 / §4.5） |
 
-- **已获批账号也收不到** ⇒ **站点发信故障**。此时**任何**"未获批"的结论都不成立
-  —— 判据（登录）本身被阻断了。等站点恢复再判断。
-- **已获批账号收得到、待审批账号收不到** ⇒ 才可能是白名单问题。
-
-> 这是"通路坏了"与"业务门槛"的分水岭，和 §4.8 那次用
-> `probes/audit_keys_against_site.py` 做的判定同一个思路。
+> 这两件事的处置**恰好相反**，所以文案必须把它们分开 ——
+> 只写一句"没收到"会让运维按老经验去改请求，白跑一轮。
 
 **辅助证据（一起看）**：
 
 1. **D1 直查**（`tools/probes/probe_worker_health.py` 第 2 节）：看 `newest` 距现在多久。
    若 `newest` 很近 ⇒ 收信链路正常，问题在**发信**侧。
 2. 🔴 **别拿 `Welcome to TypeSafe — confirm your email` 当"未获批"信号 —— 它恰恰是凭据。**
-   它是 Stytch 的**魔法链接**（`stytch_token_type=magic_links`、`finish creating your account`、
+   它是 Stytch 的**魔法链接**（`stytch_token_type=magic_links`、
    **7 天有效、一次性**）；`mailrules.LINK_RULES` 里的 `welcome_confirm` 就是它。
-   2026-09-21 实测它**发给了两个最终拿到 key 的账号**，也发给了一个已获批待领号的账号
+   2026-09-21 实测它**发给了两个最终拿到 key 的账号**
    ⇒ **与获批状态无关**。曾据正文 `finish creating your account` 把它误判成
    "站点认为该邮箱还没有账号"，方向**是反的**。
-3. **看本批申请确认邮件是否都到了**（`You're on the waitlist for Jev!`）。
-   都到了 ⇒ **申请段正常**，问题只在登录段。
 
-⚠️ **别用 `/login` 页形态判获批**：站点有 A/B 实验，`/login` 会返回两种页面
+⚠️ **别用 `/login` 页形态判任何东西**：站点有 A/B 实验，`/login` 会返回两种页面
 （`len=41953 acts=['2','3']` vs `len=43507 acts=['2','3','4']`），
 **在已获批和待审批账号里都出现** ⇒ 与账号状态无关。
 
 **处置**：等站点发信恢复后重跑 `tools/resume_pending.py`。故障期间重试只是浪费请求。
+（`resume_pending.py` 的 `--rounds 3` 在这里仍然有意义：多轮给丢包留了机会。）
 
-### 4.11 🔑 判"是否获批"的**唯一可信**方法：直接实测登录（2026-09-21）
+### 4.11 判"这个邮箱到底能不能拿 key"的**唯一可信**方法：直接跑一次
 
-**背景**：`stage_wait_approval` 等的是获批邮件 `TypeSafe AI: Your account is ready`，
-但共享 Worker 的 D1 窗口只有 100 行、被同机邻居项目刷屏 ⇒ 这封信会被挤掉。
-本批 50 个账号**全部停在 `confirmed`，一封获批邮件都没见着**。
+**背景**：旧链路要等 `TypeSafe AI: Your account is ready` 获批邮件，
+但共享 Worker 的 D1 窗口只有 100 行、被同机邻居项目刷屏 ⇒ 那封信会被挤掉。
+当时 50 个账号**全部停在 `confirmed`，一封获批邮件都没见着**。
 
-🔴 **「窗口里没看到获批邮件」≠「未获批」**。可信判据只有**站点侧实测**：
+🔴 **「窗口里没看到某封邮件」≠「那个状态没发生」**。可信判据只有**站点侧实测**：
 
 | `POST /api/auth/callback` 响应 | 含义 |
 |---|---|
-| `200` + `{"success":true,"userId":…,"org_memberships":[…]}` | **已获批**（白名单通过、会话已建立） |
-| `403 {"error":"Access restricted"}` | **未获批**（业务门槛，不是技术故障） |
+| `200` + `{"success":true,"userId":…}` | 凭据有效、会话已建立 |
+| `403 {"error":"Access restricted"}` | 未获批（业务门槛，不是技术故障，见 §4.1） |
 | `401 Authentication failed` | 凭据一次性、**已被用过** ⇒ 换一封，**别当判据** |
 
-⇒ 对无 key 的账号，**不要等获批邮件，直接跑登录**。
+⇒ 对无 key 的账号，**不要靠读邮件推断状态，直接跑一次**：
 
-🔴 **并且要用上"已经躺在收件箱里"的魔法链接。**
+```bash
+$PY tools/run_e2e.py --mode resume --email <邮箱>
+```
+
+🔴 **`relogin_pending.py` 会用上"已经躺在收件箱里"的魔法链接。**
 `stage_login` 的 `wait_for_mail(since_ms=now-5s)` 只认**请求之后到达**的信
 ⇒ 上一轮收到、当时没消费掉的链接永远用不上，而它 **7 天有效**。
 2026-09-21 实测：一个账号的 `welcome_confirm` 链接在收件箱里躺了 35 分钟，
 用它走 `exchange_magic_link → auth_callback` **一次就拿到 200**
-（此前该账号一直报 `未收到验证码邮件`）。
+（此前该账号一直报超时）。
 
-工具：`python tools/relogin_pending.py --email <邮箱> --rounds 3 --wait 180`
-（先消费历史链接 → 再发新的 → 等码/链接 → onboarding → 建 key → 落账）。
-`--all-pending` 对台账里所有无 key 账号跑。**刻意串行，别加并发。**
+```bash
+$PY tools/relogin_pending.py --email <邮箱> --rounds 3
+$PY tools/relogin_pending.py --all-pending      # 台账里所有无 key 账号
+```
 
-⚠️ **别把 `--mode claim --send` 的"已发出"当"发码成功"** —— 站点会**接受请求却不发信**
-（实测送达率 ~8%，已获批账号也在丢信）。判据落在**信到了没**，不是**站点回没回 200**。
+**刻意串行，别加并发**（它逐账号读收件箱 + 建会话，并发没有收益）。
+
+⚠️ **判据落在"信到了没"，不是"站点回没回 200"** —— 站点会接受请求却不发信（§4.10）。
 
 ## 5. 别做这些事
 
@@ -571,19 +572,22 @@ $PY tools/run_e2e.py --mode claim --email <已获批账号> --send
 - ❌ 别对 `api.typesafe.ai` 假设 OpenAI 兼容
 - ❌ 别为了省事重装/重建环境；优先改配置与代码
 - ❌ 别在凭据有效性没被验证之前，把 `403` 当结论
-- ❌ 别把"此刻没查到"讲成"不存在"——批量审批有时间差
+- ❌ 别把"此刻没查到"讲成"不存在"——站点行为有延迟，重跑一次常常就好
 - ❌ 别在 `stages` 里就地写取码正则（走 `mailrules.extract_otp`）
 - ❌ 别看到降级警告就去重新发码（模板没变的话，重发只会再降级一次）
 - ❌ 别把会话 client 挂成 `Pipeline` 的实例字段（并发会串号）
-- ❌ 别给 `--mode watch` 加并发（它读的是全表共享窗口）
 - ❌ 别把 `$ACTION_<n>` 的索引集合写死（`/login` 用 2/3/4，`/setup/*` 用 1）
 - ❌ 别信 `FALLBACK_SETUP_ACTIONS` 里的 action id 长期有效（部署一变就作废）。
   它是**最后手段**不是可用通路 —— 走它必定打告警（2026-09-21 起），
   看到告警就去查页面实际渲染形态，别指望它自己能成功
-- ❌ 别看到 `confirm` 超时就直接重投申请（先回查收件箱，迟到 ≠ 未发）
 - ❌ 别往 `/api/auth/callback` 的请求体里**加键**：站点是 strict schema，
   多一个键 = 全体账号登录失败，且只回一句 `400 Bad request`（见 §4.8）
 - ❌ 别在站点发信故障期间用"没收到邮件"推断"未获批"：先拿**已获批账号**发码做对照，
   它也收不到就说明判据本身被阻断了（见 §4.10）
-- ❌ 别把 `resume_pending.py` 的 `--rounds` 调到 1：onboarding 的**最后一跳
-  在同一会话里做不到**，第 2 轮换会话才补得上（实测 76% 会停在 partial，见 §4.9）
+- ❌ **别拿 `/hook` 的门禁当归零判据**：它是引导、而且**自己非确定性**
+  （相邻两次 GET 答案不同）。`stages.onboarding = partial` 是正常留痕（见 §4.9）
+- ❌ **别对 `--mode resume` 传台账里已有 `api_key` 的地址**：会造第二把 key，
+  而 `Ledger.load()` 按邮箱去重 ⇒ 交付物少一把（见 §1.3）
+- ❌ 别试图把已删除的 `apply` / `watch` / `claim` 三个模式"加回来"：
+  它们依赖的站点侧环节（申请表单、获批事件、跨进程会话）都不存在或已证伪。
+  `test_chain_has_no_external_gate` 会立刻报红

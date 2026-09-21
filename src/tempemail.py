@@ -36,9 +36,10 @@ class Stats:
       `f"邮箱服务持续 5xx（N 次，最近 HTTP {code}）"`。
       再留一份副本在 `stats` 里没人读，就是"看着像有诊断能力、其实没有"。
     - `created` 连失败诊断都不参与。
-    保留 `polls` / `http_5xx` 是因为它们出现在 `stage_apply` 的确认超时信息里
-    （`邮箱接口轮询 N 次，5xx M 次`）—— 那是"服务端读不出来"与"邮件没到"的唯一分界，
-    而这两件事的处置**恰好相反**。
+    保留 `polls` / `http_5xx` 是因为它们出现在 `stages.StageMixin._mail_timeout_msg()`
+    的超时信息里（`邮箱接口轮询 N 次，5xx M 次`）—— 那是"服务端读不出来"与
+    "邮件没到"的唯一分界，而这两件事的处置**恰好相反**（前者修 Worker，后者重跑）。
+    （2026-09-21 之前读它的是已删除的 `stage_apply`；计数器本身没动。）
     """
 
     polls: int = 0
@@ -167,12 +168,6 @@ class TempMailClient:
                 if match(m):
                     return m
             time.sleep(interval)
-        return None
-
-    def first_mail_matching(self, email: str, match: Callable[[Mail], bool]) -> Mail | None:
-        for m in self.list_mails(email=email):
-            if match(m):
-                return m
         return None
 
     def scan_all(self, limit: int = 100) -> list[Mail]:

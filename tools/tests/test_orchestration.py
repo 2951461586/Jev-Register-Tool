@@ -1,5 +1,5 @@
-"""编排层自测：错误码分流 / 申请段 / 登录（含编号漂移与链接回捞）/
-监听去重 / claim / 重跑不丢 key / 并发不串号 / worker 崩溃不静默丢弃。
+"""编排层自测：错误码分流 / 登录（含编号漂移与链接回捞）/ onboarding 门禁 /
+resume 去重 / 重跑不丢 key / 并发不串号 / worker 崩溃不静默丢弃 / 链路无外部阻断点。
 
 全部**离线**：出网点由 `support.offline()` 换成替身。
 """
@@ -11,8 +11,8 @@ import json
 import tempfile
 from pathlib import Path
 
-from .support import (RANK, Mail, _FakeTypeSafe, _link_mail, _make_pipe,
-                      _otp_mail, _tmp_ledger, _waitlist_mail, check, offline,
+from .support import (RANK, Mail, _FakeTypeSafe, _confirm_mail, _link_mail,
+                      _make_pipe, _otp_mail, _tmp_ledger, check, offline,
                       pl, st, ts)
 
 def test_auth_error_triage() -> None:
@@ -38,8 +38,8 @@ def test_auth_error_triage() -> None:
           "Code expired" in rec.error and "重新发码" in rec.error, rec.error)
     check("[负对照] 401 不该被误判成 invite_only",
           "invite_only" not in rec.error, rec.error)
-    check("[负对照] 401 不该把 approved 标成 pending",
-          rec.stages.get("approved") != "pending", str(rec.stages))
+    check("[负对照] 401 不该打上邀请制门禁标记",
+          rec.stages.get("invite_gate") != "pending", str(rec.stages))
 
     # 401 Authentication failed（token 已用过）
     with offline(ts_status=401, ts_body={"error": "Authentication failed"},
@@ -49,51 +49,18 @@ def test_auth_error_triage() -> None:
     check("401 Authentication failed → 错误里点名'token 已被使用'（与过期区分开）",
           "已被使用" in rec.error, rec.error)
 
-    # 403 Access restricted
+    # 403 Access restricted —— 邀请制已取消，但这条分流**必须保留**：
+    # 站点随时可能恢复白名单，删掉它会让"没被邀请"伪装成"凭据错误"。
     with offline(ts_status=403, ts_body={"error": "Access restricted"},
                  mails=[_otp_mail("e3@example-mail.test")]) as P:
         rec = _make_pipe(P, _tmp_ledger()).resume(["e3@example-mail.test"])[0]
     check("403 → failed", rec.status == "failed", rec.status)
     check("403 → 标为 invite_only（run_e2e 的阻断统计靠这个串）",
           "invite_only" in rec.error, rec.error)
-    check("403 → stages.approved=pending（如实反映'没获批'）",
-          rec.stages.get("approved") == "pending", str(rec.stages))
-
-
-def test_apply_and_approval() -> None:
-    """申请段 + 邀请制门槛：没获批**不等于**这次执行失败。"""
-    print("\n[编排：申请段 / 邀请制门槛]")
-
-    with offline(mails=[_waitlist_mail("*")]) as P:
-        rec = _make_pipe(P, _tmp_ledger()).run_batch(count=1, mode="apply")[0]
-    check("mode=apply 的终点是 confirmed", rec.status == "confirmed", rec.status)
-    check("apply / confirm 两阶段都记 ok",
-          rec.stages.get("apply") == "ok" and rec.stages.get("confirm") == "ok",
-          str(rec.stages))
-    # 计时器必须**不重叠**：`apply` 只算提交表单，等邮件单独记 `confirm_wait`。
-    # 以前两者合一，报告里会印出 "阶段分解: apply 181.13s"，读起来像表单提交卡了 3 分钟。
-    check("★ timings 里 apply 与 confirm_wait 分开记（不重叠，可求和）",
-          "apply" in rec.timings and "confirm_wait" in rec.timings,
-          str(sorted(rec.timings)))
-    check("★ apply 计时只覆盖提交表单（远小于等邮件的耗时）",
-          rec.timings.get("apply", 9e9) < 5.0,
-          f"apply={rec.timings.get('apply')}")
-
-    # 负对照：framer 提交失败必须落到 apply 阶段
-    with offline(framer_ok=False) as P:
-        rec = _make_pipe(P, _tmp_ledger()).run_batch(count=1, mode="apply")[0]
-    check("[负对照] framer 提交失败 → status=failed", rec.status == "failed", rec.status)
-    check("[负对照] 失败记在 apply 阶段（不是 confirm）",
-          rec.stages.get("apply") == "failed", str(rec.stages))
-
-    # 全链路：只有确认邮件、没有获批邮件 ⇒ 停在邀请制门槛
-    with offline(mails=[_waitlist_mail("*")]) as P:
-        rec = _make_pipe(P, _tmp_ledger()).run_batch(count=1, mode="full")[0]
-    check("未获批 → 如实报 invite_only", "invite_only" in rec.error, rec.error)
-    check("★ 未获批**不把 status 打成 failed**（它不算执行失败）",
-          rec.status != "failed", rec.status)
-    check("未获批 → stages.approved=pending", rec.stages.get("approved") == "pending",
-          str(rec.stages))
+    check("403 → stages.invite_gate=pending（如实反映'被白名单拦住'）",
+          rec.stages.get("invite_gate") == "pending", str(rec.stages))
+    check("[负对照] 403 不再使用已删除的 approved 阶段名",
+          "approved" not in rec.stages, str(rec.stages))
 
 
 class _FakeResp:
@@ -124,7 +91,7 @@ class _FakeSession:
         self.posts: list[dict] = []
         self.post_resp = post_resp if post_resp is not None else _FakeResp("", 200)
 
-    def get(self, url, params=None, timeout=None):
+    def get(self, url, params=None, timeout=None, allow_redirects=True):
         i = min(self.calls, len(self.pages) - 1)
         self.calls += 1
         return _FakeResp(self.pages[i])
@@ -137,28 +104,46 @@ class _FakeSession:
         return self.post_resp
 
 
-class _SetupSession:
-    """按 **URL** 应答的假会话 —— 测 `complete_onboarding` 的"回读判定"。
+class _GateSession:
+    """按 URL 应答的假会话 —— 模拟站点的 **onboarding 串行门禁**。
 
-    与 `_FakeSession`（按序吐页面）的区别：这里 `/api/me` 要能**逐次变化**
-    （第一次报缺口、第二次报缺口已关），其余 `/setup/*` 页面返回**已完成
-    onboarding** 的形态 —— 也就是**没有 `$ACTION_*` 隐藏域**的欢迎页。
+    真实行为（2026-09-21 实测）：
+        ToS 未接受   → `GET /hook` 307 → `/setup/tos?returnTo=…`
+        接受 ToS 后  → `GET /hook` 307 → `/setup/set-name?returnTo=…`
+        set-name 后  → `GET /hook` 200（欢迎页，链路打通）
+
+    `gate_seq` 是每次 `GET /hook` 依次返回的门禁名（`""` = 已通过）。
+    `post_status` 控制 `/setup/*` 的 POST 结果。
+    `redirect_to` 让 `/hook` 固定跳到某个**非 `/setup/*`** 的目标（测"门禁不可识别"）；
+    `hook_ok` 让 `/hook` 固定 200（测"真的已通过"）。
     """
 
-    def __init__(self, *, me_seq: list[dict], post_status: int = 404):
+    def __init__(self, *, gate_seq: list[str] | None = None, post_status: int = 200,
+                 redirect_to: str = "", hook_ok: bool = False):
         self.headers: dict = {}
-        self.me_seq = list(me_seq)
+        self.gate_seq = list(gate_seq or [])
         self.post_status = post_status
-        self.me_calls = 0
+        self.redirect_to = redirect_to
+        self.hook_ok = hook_ok
+        self.hook_calls = 0
         self.posts: list[dict] = []
 
-    def get(self, url, params=None, headers=None, timeout=None):
+    def get(self, url, params=None, headers=None, timeout=None, allow_redirects=True):
+        if url.endswith("/hook"):
+            self.hook_calls += 1
+            if self.hook_ok:
+                return _FakeResp("<html><body>Welcome inside TypeSafe</body></html>", 200)
+            if self.redirect_to:
+                return _FakeResp("", 307, {"location": self.redirect_to})
+            i = min(self.hook_calls - 1, len(self.gate_seq) - 1) if self.gate_seq else 0
+            gate = self.gate_seq[i] if self.gate_seq else ""
+            if gate:
+                return _FakeResp("", 307,
+                                 {"location": f"/setup/{gate}?returnTo=%2Fhook"})
+            return _FakeResp("<html><body>Welcome inside TypeSafe</body></html>", 200)
         if url.endswith("/api/me"):
-            i = min(self.me_calls, len(self.me_seq) - 1)
-            self.me_calls += 1
-            return _FakeResp(json.dumps(self.me_seq[i]), 200)
-        # /setup/*：onboarding 已完成 ⇒ 渲染欢迎页，**没有任何隐藏域**
-        return _FakeResp("<html><body>Welcome inside TypeSafe</body></html>", 200)
+            return _FakeResp(json.dumps({"human_name": None, "org_memberships": []}), 200)
+        return _FakeResp("", 200)
 
     def post(self, url, files=None, headers=None, timeout=None, json=None):
         self.posts.append({"url": url, "files": files or {}, "headers": headers or {}})
@@ -175,7 +160,7 @@ def test_auth_callback_payload_shape() -> None:
          "details":{"formErrors":["Unrecognized key: \\"waitlistEmail\\""],
                     "fieldErrors":{}}}
 
-    当时**所有**账号登录全灭（含 122 个已获批、早已拿到 key 的），
+    当时**所有**账号登录全灭（含 122 个已拿到 key 的），
     而错误文案只有一句 `HTTP 400: Bad request`，完全看不出
     是"我们多发了一个键" —— 排查方向会跑偏到验证码/白名单上。
 
@@ -219,49 +204,80 @@ def test_auth_callback_payload_shape() -> None:
               rec.error)
 
 
-def test_onboarding_merged_submit_is_not_a_failure() -> None:
-    """onboarding 的 POST 报错后**必须回读状态**：缺口关了就不是失败。
+def test_onboarding_gate_drives_steps() -> None:
+    """🔴 onboarding 的判据是**站点的重定向**，不是 `/api/me` 的字段。
 
-    🔴 2026-09-21 实测：站点把 `/setup/tos` / `/setup/set-name` /
-    `/setup/console-survey` 合并成**同一张表单**（三个路由返回逐字节相同的页面），
-    提交一次三项一起完成；而紧接着的 `/api/me` **读有滞后**。
-
-    于是我们会多发一次 survey POST —— 可那时 onboarding 已完成，页面渲染的是
+    2026-09-21 实测：站点把 onboarding 从三步缩成**两步**（删掉了 console-survey），
+    而旧实现用 `/api/me` 的 `console_survey_completed_at` 判断"要不要跑 survey"
+    ⇒ 该字段永远为 `None` ⇒ 每次都多发一次 survey POST ⇒ 而那时页面渲染的是
     欢迎页、**没有 `$ACTION_*` 隐藏域** ⇒ 退化到已作废的 fallback ⇒ 404
-    ⇒ 被记成 `partial`。实跑 25 个里误报 **19 个（76%）**，
-    交付流程在"最后一跳"上白跑一整轮，还会把"账号已就绪"错报成"失败"。
+    ⇒ **账号明明已经完全 onboard，却被记成 `partial`**（实跑 25 个误报 19 个）。
+
+    ⇒ 改成"问站点下一步是什么"（`GET /hook` 不跟随重定向），站点增删步骤时
+      本逻辑**自动适应**。
     """
-    print("\n[onboarding：合并提交 + /api/me 读滞后]")
+    print("\n[onboarding：站点门禁驱动]")
 
-    me_open = {"human_name": "u1", "latest_tos_acceptance": {"tos_version": 3},
-               "console_survey_completed_at": None, "org_memberships": []}
-    me_closed = {**me_open, "console_survey_completed_at": "2026-09-21T05:38:22"}
-
-    # 正例：POST 404，但回读显示 survey 已关 ⇒ 判成功。
-    # ⚠️ 前面要给 **3 个** `me_open` —— `complete_onboarding` 在跑 survey 前会读
-    #    3 次 `/api/me`（初始 + 两次重读）。少给一项会被 index 截断，
-    #    于是 survey 步骤根本不会执行，用例就测了个空（第一版踩过）。
-    ses = _SetupSession(me_seq=[me_open, me_open, me_open, me_closed])
+    # 正例：tos → set-name → 通过
+    ses = _GateSession(gate_seq=["tos", "set-name", ""], post_status=200)
     cl = ts.TypeSafeClient(session=ses)
     cl.email = "u1@example-mail.test"
     ob = cl.complete_onboarding(display_name="u1")
-    check("★ POST 报 404 但回读缺口已关 ⇒ 整体 ok（不再误报 partial）",
-          ob.ok, f"ok={ob.ok} error={ob.error!r}")
-    check("★ 该步被记成「上一步已顺带完成」",
-          any("顺带完成" in str(d) for d in ob.data.get("completed", [])),
+    check("★ 两步都跑完 ⇒ 整体 ok", ob.ok, f"ok={ob.ok} error={ob.error!r}")
+    check("★ 走的是站点报的步骤（tos → set-name）",
+          ob.data.get("completed") == ["tos", "set-name"],
           str(ob.data.get("completed")))
-    check("★ 回读判定留了日志痕迹（不是静默放过）",
-          any("回读" in line for line in cl.log), str(cl.log[-2:]))
-    check("确实打了 POST（证明走的是降级通路那条真实路径）",
-          len(ses.posts) >= 1, str(len(ses.posts)))
+    check("确实 POST 了两次（每步一次）", len(ses.posts) == 2, str(len(ses.posts)))
+    check("★ 没有出现 console-survey（站点已删这一步）",
+          not any("console-survey" in str(p["url"]) for p in ses.posts),
+          str([p["url"] for p in ses.posts]))
 
-    # 负对照：POST 404 且回读仍显示缺口未关 ⇒ 必须如实报失败
-    ses2 = _SetupSession(me_seq=[me_open])
+    # 正例 2：门禁一次就通过（onboarding 已完成）⇒ 不发任何 POST
+    ses2 = _GateSession(gate_seq=[""])
     cl2 = ts.TypeSafeClient(session=ses2)
-    cl2.email = "u2@example-mail.test"
-    ob2 = cl2.complete_onboarding(display_name="u2")
-    check("★ [负对照] 回读后缺口仍在 ⇒ 如实报失败（不许把真失败放行）",
-          not ob2.ok, f"ok={ob2.ok} error={ob2.error!r}")
+    ob2 = cl2.complete_onboarding()
+    check("[正对照] 门禁已通过 ⇒ 直接成功且零 POST",
+          ob2.ok and not ses2.posts, f"ok={ob2.ok} posts={len(ses2.posts)}")
+
+    # 🔴 负对照 1：POST 失败但门禁**推进了** ⇒ 判成功（"上一步顺带完成"）
+    ses3 = _GateSession(gate_seq=["tos", "", ""], post_status=404)
+    cl3 = ts.TypeSafeClient(session=ses3)
+    ob3 = cl3.complete_onboarding()
+    check("★ POST 报 404 但门禁已推进 ⇒ 判成功（不误报 partial）",
+          ob3.ok, f"ok={ob3.ok} error={ob3.error!r}")
+    check("★ 该步被标成「上一步已顺带完成」",
+          any("顺带完成" in str(d) for d in ob3.data.get("completed", [])),
+          str(ob3.data.get("completed")))
+
+    # 负对照 2：POST 失败且门禁**没动** ⇒ 如实报失败
+    ses4 = _GateSession(gate_seq=["tos"], post_status=404)
+    cl4 = ts.TypeSafeClient(session=ses4)
+    ob4 = cl4.complete_onboarding()
+    check("★ [负对照] 门禁没动 ⇒ 如实报失败（不许把真失败放行）",
+          not ob4.ok, f"ok={ob4.ok} error={ob4.error!r}")
+
+    # 负对照 3：站点出现我们不认识的步骤 ⇒ 报出来，不硬猜字段
+    ses5 = _GateSession(gate_seq=["brand-new-step"])
+    cl5 = ts.TypeSafeClient(session=ses5)
+    ob5 = cl5.complete_onboarding()
+    check("★ [负对照] 未知门禁 ⇒ 明确报出步骤名（不静默死循环）",
+          not ob5.ok and "brand-new-step" in ob5.error, ob5.error)
+
+    # 🔴 负对照 4：`/hook` 跳到**非 `/setup/*`** 的地方（会话失效被送回 /login）
+    # 旧实现只匹配两个写死路径，未匹配就 `return ""` ⇒ 被上游当成"onboarding
+    # 已通过"而放行 —— 门禁明明没过却继续去建 key，是**静默放行**。
+    ses6 = _GateSession(gate_seq=[], redirect_to="/login?returnTo=%2Fhook")
+    cl6 = ts.TypeSafeClient(session=ses6)
+    ob6 = cl6.complete_onboarding()
+    check("★ [负对照] 非 /setup/* 的跳转 ⇒ 判失败，不许当成『已通过』",
+          not ob6.ok and "/login" in ob6.error, f"ok={ob6.ok} err={ob6.error!r}")
+
+    # 正对照：`/hook` 直接 200 ⇒ 才是真的"已通过"
+    ses7 = _GateSession(gate_seq=[], hook_ok=True)
+    cl7 = ts.TypeSafeClient(session=ses7)
+    ob7 = cl7.complete_onboarding()
+    check("  [正对照] /hook 200 ⇒ 判通过（证明上面那条不是把所有跳转都打死）",
+          ob7.ok, f"ok={ob7.ok} err={ob7.error!r}")
 
 
 def _login_html(nums) -> str:
@@ -286,24 +302,27 @@ def test_login_action_index_drift_retries() -> None:
     15 分钟后复测 15/15 又全回到 `('2','3','4')`。
     ⇒ 写死索引的**前提**（编号稳定）会被部署/边缘缓存短暂破坏，
     判死之前必须原样重试一次；不做语义识别是因为 LINK/CODE 只能靠编号区分。
+
+    ⚠️ 2026-09-21 复测：`/login` 页**仍是这个形态**（2/3/4，各带 :0/:1/:2），
+    所以 `ACTION_LINK='2'` / `ACTION_CODE='3'` 这两个语义位继续有效。
     """
     print("\n[登录：Server Action 编号漂移 → 重试]")
 
     ok = ts.TypeSafeClient(session=_FakeSession([_login_html("234")]))
-    acts = ok.fetch_actions("a@x.com")
+    acts = ok.fetch_actions()
     check("正常页一次就拿到 action", sorted(acts) == ["2", "3", "4"], str(sorted(acts)))
     check("正常页不浪费重试", ok.s.calls == 1, f"GET 次数={ok.s.calls}")
 
     flaky = ts.TypeSafeClient(session=_FakeSession([_login_html("245"),
                                                     _login_html("234")]))
-    acts = flaky.fetch_actions("a@x.com")
+    acts = flaky.fetch_actions()
     check("★ 编号漂移时重试后能拿到（不再直接判死）",
           sorted(acts) == ["2", "3", "4"], str(sorted(acts)))
     check("★ 确实只重试了一次（GET 2 次）", flaky.s.calls == 2, f"GET 次数={flaky.s.calls}")
 
     dead = ts.TypeSafeClient(session=_FakeSession([_login_html("245")] * 5))
     try:
-        dead.fetch_actions("a@x.com")
+        dead.fetch_actions()
         raised = ""
     except ts.TypeSafeError as exc:
         raised = str(exc)
@@ -324,7 +343,9 @@ def test_code_mode_falls_back_to_magic_link() -> None:
     （魔法链接），4 次是 "Your TypeSafe sign-in code"。等码的那次必然超时，
     于是该账号被重试 10 次、每次都记 `未收到验证码邮件`，排查被一路引向
     "共享 D1 窗口被刷爆"，而真相只是**凭据形态换了**。
-    改用 link 模式一跑就进去了（随后 403 —— 那才是它真正的状态）。
+
+    ⚠️ 2026-09-21 起默认走 link 模式，这条回捞只在显式 `--login-mode code` 时生效，
+    但**不能删** —— 站点仍支持码模式，而它的失败表现与"邮箱坏了"完全一样。
     """
     print("\n[登录：码模式 → 魔法链接回捞]")
 
@@ -348,24 +369,27 @@ def test_code_mode_falls_back_to_magic_link() -> None:
           and _FakeTypeSafe.last_token_type == "otp",
           _FakeTypeSafe.last_token_type or "(未调用 auth_callback)")
 
-    # 负对照：两种邮件都没有 ⇒ 才允许判"未收到验证码邮件"
+    # 负对照：两种邮件都没有 ⇒ 才允许判"验证码邮件也没等到"。
+    # 文案必须**同时**点明"码邮件"与"回捞链接"都试过 —— 只说一句"没收到"
+    # 会让运维以为回捞没跑（或以为邮箱坏了），把处置引向改请求。
     with offline(mails=[]) as P:
         pipe = _make_pipe(P, _tmp_ledger())
         rec = pl.AccountRecord(key="c@x.com", email="c@x.com")
         cl = pipe.stage_login(rec, mail_timeout=0.1)
-    check("[负对照] 两种凭据都没有 → 才判『未收到验证码邮件』",
-          cl is None and "未收到验证码邮件" in (rec.error or ""),
+    check("[负对照] 两种凭据都没有 → 才判『验证码邮件也没等到』",
+          cl is None and "验证码邮件" in (rec.error or "")
+          and "回捞魔法链接" in (rec.error or ""),
           f"cl={cl} err={rec.error}")
 
-    # 护栏：回捞窗口不能设太大，否则未获批账号每次重跑都要多白等
-    check("★ 回捞窗口 <= 60s（不给未获批账号拖长重跑）",
+    # 护栏：回捞窗口不能设太大，否则失败账号每次重跑都要多白等
+    check("★ 回捞窗口 <= 60s（不给失败账号拖长重跑）",
           0 < st.LINK_FALLBACK_TIMEOUT <= 60.0, str(st.LINK_FALLBACK_TIMEOUT))
 
 
 def _setup_page(*, with_action: bool) -> str:
     """造一个 `/setup/*` 页面。
 
-    新形态（2026-09-20 起）是索引 **1**、**只有 `:0` `:1`**、另加 `$ACTION_KEY`
+    真实形态（2026-09-20 起）是索引 **1**、**只有 `:0` `:1`**、另加 `$ACTION_KEY`
     —— 旧代码枚举 `("2","3","4")` 且要求 `:2` 同时存在，在新形态上一条都抓不到。
     这里刻意用新形态，测的就是"抓不到时怎么办"。
     """
@@ -384,8 +408,7 @@ def test_post_setup_degrade_is_observable() -> None:
     `except TypeSafeError: acts = {}` 是**静默**的，然后退化到
     `FALLBACK_SETUP_ACTIONS`；而那张表的 id 三处文档都写明**已全部作废**
     （POST 回 `404 Server action not found.`）。于是"站点改版"最终只表现为
-    `onboarding 失败: HTTP 404` —— 与真因毫无字面关联，这正是 runbook §4.6
-    那段"为什么难定位"复盘的结构性成因。
+    `onboarding 失败: HTTP 404` —— 与真因毫无字面关联。
 
     对照：`stages.stage_login` 的 OTP 降级（`how != "anchored"`）是**打告警**的。
     同一模式两处处置必须一致 —— 这条测试把它钉住。
@@ -427,68 +450,55 @@ def test_post_setup_degrade_is_observable() -> None:
           str(sorted(sess2.posts[0]["files"])))
 
 
-def test_confirm_timeout_headroom() -> None:
-    """🔴 回归护栏：等确认邮件的阈值不能退回 180s。
+def test_mail_timeout_headroom() -> None:
+    """🔴 回归护栏：等确认邮件的阈值不能调小。
 
     2026-09-20 连跑 10 批次的实测延迟（秒）：
         41.7 / 52.9 / 52.8 / 43.9 / 68.6 / 86.7 / 93.6 / 192 / 198 / ∞
     后两条在阈值 180s 处被判 `failed`，但收件箱复核显示它们分别**在超时后
-    12s / 18s 就落了库** —— 是假阴性。台账里多两条"失败"，运营者会据此重投申请。
+    12s / 18s 就落了库** —— 是假阴性。台账里多两条"失败"，运营者会据此重投。
 
     阈值必须留出实测最大延迟的余量；这条断言把"不许调回 180s"钉在测试里。
     """
     print("\n[编排：确认邮件等待阈值]")
 
-    d = inspect.signature(pl.Pipeline.stage_apply).parameters["confirm_timeout"].default
+    d = inspect.signature(st.StageMixin.stage_login).parameters["mail_timeout"].default
     check("★ 默认阈值 ≥ 240s（实测最大延迟 198s，180s 会误判成失败）",
           isinstance(d, (int, float)) and d >= 240, f"default={d}")
-    check("★ 默认阈值取自常量 CONFIRM_TIMEOUT（单一真源，别写字面量）",
-          d == pl.CONFIRM_TIMEOUT, f"{d} vs {pl.CONFIRM_TIMEOUT}")
+    check("★ 默认阈值取自常量 MAIL_TIMEOUT（单一真源，别写字面量）",
+          d == pl.MAIL_TIMEOUT, f"{d} vs {pl.MAIL_TIMEOUT}")
 
-    # 超时文案要能提示"迟到 vs 未发"这个歧义 —— 否则运维只会看到一句"没收到"，
-    # 而 runbook 对它的处置（重投申请）在假阴性场景下是错的。
-    # 注意：这里必须显式传一个极小的阈值，否则会真等满默认的 300s。
+    # 超时文案必须点明"丢包 + 链接 7 天有效 ⇒ 重跑比改请求有效"。
+    # 否则运维只会看到一句"没收到"，而它的正确处置（重跑）在假阴性场景下
+    # 与"站点坏了"的处置完全不同。
     with offline(mails=[]) as P:
-        rec = _make_pipe(P, _tmp_ledger()).run_batch(
-            count=1, mode="apply", confirm_timeout=0.2)[0]
-    check("★ 回执超时 → status=applied（**不是 failed**）且记在 confirm 阶段",
-          rec.status == "applied" and rec.stages.get("confirm") == "failed",
-          f"{rec.status} {rec.stages}")
-    check("  [负对照] 回执超时**不许**被记成 failed"
-          "（记成 failed 会让账号从待复查清单里消失）",
-          rec.status != "failed", rec.status)
-    check("★ 超时文案点明'申请已注册 / 勿重投'（假阴性靠 watch + 回查排除）",
-          "回执未到" in rec.error and "误判" in rec.error and "回查" in rec.error,
-          rec.error)
-    # `applied` 必须在 RANK 里，且**低于** confirmed —— 否则要么静默落 0 分，
-    # 要么反过来把 confirmed 覆盖掉。
-    check("★ applied 在 RANK 中且低于 confirmed（保证后续能被升级）",
-          0 < RANK.get("applied", -1) < RANK["confirmed"],
-          f"applied={RANK.get('applied')} confirmed={RANK['confirmed']}")
+        rec = _make_pipe(P, _tmp_ledger()).resume(["t@example-mail.test"],
+                                                  mail_timeout=0.2)[0]
+    check("★ 邮件超时 → failed", rec.status == "failed", rec.status)
+    check("★ 超时文案点明'站点发信丢包'与'链接 7 天有效'（指明下一步是重跑）",
+          "丢包" in rec.error and "7 天" in rec.error, rec.error)
+    check("★ 超时文案带上了邮箱接口的轮询计数（区分'读不出来'与'没发'）",
+          "轮询" in rec.error and "5xx" in rec.error, rec.error)
 
 
-def _ready_mail(to: str) -> Mail:
-    return Mail(id="m-ready", to=to,
-                sender="010001a0bb95b4b5-722f1aae@envelope.updates.typesafe.ai",
-                subject="TypeSafe AI: Your account is ready",
-                body="Your account is ready.", received_at=2)
+def test_resume_skips_keyed() -> None:
+    """🔴 `resume` 必须跳过台账里**已有 api_key** 的地址。
 
+    重跑会给同一账号**造出第二把 key**。两把在服务端都有效，但
+    `Ledger.load()` 按邮箱去重、**末行胜出** ⇒ 交付物里少一把。
+    这与 P0 / 阈值误判同一类：**不报错，只是行数不对**。
 
-def test_watch_skips_keyed() -> None:
-    """🔴 `watch` 读的是**全表窗口**，旧批次的获批邮件会在窗口里停留很久。
-
-    没有跳过逻辑时，同一账号会被再跑一次 4→7 ⇒ **造出第二把 key**。
-    两把在服务端都有效，但 `Ledger.load()` 按邮箱去重、**末行胜出** ⇒
-    交付物里少一把。这与 P0 / 阈值误判同一类：**不报错，只是行数不对**。
+    （这条保护原先长在 `watch()` 里；`watch()` 随邀请制取消而删除，
+      保护移到了 `resume` —— 它是现在唯一的"会被重复调用"入口。）
     """
-    print("\n[监听：不重复建 key]")
+    print("\n[编排：resume 不重复建 key]")
     dup, fresh = "dup@example-mail.test", "fresh@example-mail.test"
     led = _tmp_ledger()
     led.append({"email": dup, "key": dup, "status": "keyed",
                 "api_key": "apikey_ORIGINAL", "api_key_id": "kid_orig"})
 
-    with offline(mails=[_ready_mail(dup), _ready_mail(fresh), _otp_mail(fresh)]) as P:
-        recs = _make_pipe(P, led).watch(timeout=0.5, interval=0.05)
+    with offline(mails=[_confirm_mail(dup), _confirm_mail(fresh)]) as P:
+        recs = _make_pipe(P, led).resume([dup, fresh])
 
     got = {r.email for r in recs}
     check("★ 已有 api_key 的地址被跳过（不重复建 key）", dup not in got, str(got))
@@ -498,28 +508,12 @@ def test_watch_skips_keyed() -> None:
     check("★ 原 key 未被覆盖（交付物不会少一把）",
           after.get("api_key") == "apikey_ORIGINAL", str(after.get("api_key")))
 
-
-def test_claim() -> None:
-    """claim 的两段式语义：发码不提交 ⇒ code_sent。"""
-    print("\n[编排：claim 两段式]")
-
-    with offline() as P:
-        rec = _make_pipe(P, _tmp_ledger()).claim("m@real.com", "", send_first=True)
-    check("send_first 且无 token → code_sent", rec.status == "code_sent", rec.status)
-    check("[负对照] code_sent 不是 failed（不该进失败统计）",
-          rec.status != "failed", rec.status)
-    check("发码动作记进 stages", rec.stages.get("send_code") == "ok", str(rec.stages))
-
-    with offline() as P:
-        rec = _make_pipe(P, _tmp_ledger()).claim("m@real.com", "")
-    check("无 send_first 也无 token → failed", rec.status == "failed", rec.status)
-    check("错误说明了缺什么", "缺少 token" in rec.error, rec.error)
-
-    with offline() as P:
-        led = _tmp_ledger()
-        rec = _make_pipe(P, led).claim("m@real.com", "123456")
-    check("带 token → 一次跑完 4→7，status=keyed", rec.status == "keyed", rec.status)
-    check("claim 的结果也落进台账", len(led.load()) == 1, str(len(led.load())))
+    # 负对照：显式 skip_keyed=False 时必须真的重跑 ——
+    # 否则"保护"就变成了"不能重跑"，而重跑恰恰是补丢包账号的手段。
+    with offline(mails=[_confirm_mail(dup)]) as P:
+        recs2 = _make_pipe(P, led).resume([dup], skip_keyed=False)
+    check("[负对照] skip_keyed=False 时确实重跑（保护是可关的）",
+          len(recs2) == 1 and recs2[0].email == dup, str([r.email for r in recs2]))
 
 
 def test_key_survives_rerun_failure() -> None:
@@ -538,7 +532,9 @@ def test_key_survives_rerun_failure() -> None:
 
     with offline(ts_status=401, ts_body={"error": "Code expired"},
                  mails=[_otp_mail("keep@example-mail.test")]) as P:
-        rec2 = _make_pipe(P, led).resume(["keep@example-mail.test"])[0]
+        # skip_keyed=False —— 本次要测的**正是**"重跑"这条路
+        rec2 = _make_pipe(P, led).resume(["keep@example-mail.test"],
+                                         skip_keyed=False)[0]
     check("第二次：这次失败了", rec2.status == "failed", rec2.status)
 
     merged = {r["key"]: r for r in led.load()}["keep@example-mail.test"]
@@ -696,3 +692,102 @@ def test_fan_out_worker_crash_is_recorded() -> None:
     import resume_pending as rp
     check("★ 待补清单排除 worker-crash 占位键、保留真失败账号",
           rp.pending(led) == ["real@example-mail.test"], str(rp.pending(led)))
+
+
+def test_chain_has_no_external_gate() -> None:
+    """🔴 结构护栏：邀请制取消后，链路里**不许再有"为等待而存在"的机制**。
+
+    这条守的是"重构真的删干净了"。任何一处回归（例如有人把
+    `stage_wait_approval` 或 `watch()` 加回来）都会在这里报红，
+    而不是等到实跑时以"多等了 10 分钟什么也没发生"的形式暴露。
+    """
+    print("\n[编排：链路无外部阻断点]")
+
+    for name in ("stage_apply", "stage_wait_approval"):
+        check(f"★ stages 不再有 {name}（申请/审批段已删除）",
+              not hasattr(st.StageMixin, name), f"StageMixin.{name} 还在")
+    for name in ("claim", "watch"):
+        check(f"★ Pipeline 不再有 {name}（为等待而存在的机制）",
+              not hasattr(pl.Pipeline, name), f"Pipeline.{name} 还在")
+
+    rb = inspect.signature(pl.Pipeline.run_batch).parameters
+    check("★ run_batch 不再有 mode / approval_timeout / confirm_timeout",
+          not ({"mode", "approval_timeout", "confirm_timeout"} & set(rb)),
+          str(sorted(rb)))
+
+    # 正向验证：`stage_login` 在 email 为空时**自己建邮箱**
+    # （旧链路这一步在 stage_apply 里；删了 stage_apply 就必须有人接住它）
+    with offline(mails=[_confirm_mail("*")]) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = pl.AccountRecord(key="", email="")
+        cl = pipe.stage_login(rec, mail_timeout=1.0)
+    check("★ stage_login 在 email 为空时自建邮箱（接住 stage_apply 的职责）",
+          bool(rec.email) and rec.stages.get("mailbox") == "ok" and cl is not None,
+          f"email={rec.email!r} stages={rec.stages}")
+
+    check("★ 确认邮件的规则在主路径上（welcome_confirm 是唯一入口凭据）",
+          st.MATCH_LINK(_confirm_mail("x@example-mail.test")),
+          "MATCH_LINK 不认确认邮件 —— 主路径会直接超时")
+
+
+def test_onboarding_gate_is_guidance_not_a_gate() -> None:
+    """🔴 **建 key 才是判据，`/hook` 的门禁只是引导。**
+
+    2026-09-21 实跑取证（`tools/probes/probe_gate_chain.py`）：
+
+      1. 门禁链其实是**三步** `tos → set-name → console-survey`，而
+         `console-survey` 那一页**没有 `$ACTION_*` 隐藏域**
+         （渲染的是 "Get started / Let's create your org" 向导）⇒ 我们提交不了；
+      2. 就在这个"门禁未归零"的状态下，`POST /api/api-keys` 返回
+         **200 + 明文 key**；
+      3. 更狠的是 `/hook` **自己非确定性**：同一次运行里相邻两次 `GET /hook`
+         给出不同答案（`set-name` 与 200 交替出现）。
+
+    ⇒ 拿门禁当门槛有两个独立后果：① 把"已经能拿 key"的账号判成 `partial`
+      （误报，实测踩过）；② 门禁非确定性时循环空转、最后报一句空错误。
+
+    本用例钉住新语义：门禁没归零 **不阻止**建 key；只有 key 建不出来才算失败。
+    """
+    print("\n[编排：门禁是引导，不是门槛]")
+
+    # 门禁永远停在不认识的步骤上 ⇒ onboarding 判 not ok，但 key 必须照建
+    ses = _GateSession(gate_seq=["console-survey"] * 4, post_status=200)
+    cl = ts.TypeSafeClient(session=ses)
+    cl.email = "g1@example-mail.test"
+    ob = cl.complete_onboarding()
+    check("★ 不认识的步骤 ⇒ onboarding 报 not ok（不假装成功）",
+          not ob.ok, f"ok={ob.ok} err={ob.error!r}")
+    check("★ 报出了步骤名与门禁序列（否则没法定位是哪一跳）",
+          "console-survey" in (ob.error or "")
+          and ob.data.get("gates") == ["console-survey"],
+          f"err={ob.error!r} gates={ob.data.get('gates')}")
+    check("★ 不认识的步骤**只查一次**就停（门禁非确定性，别空转）",
+          ses.hook_calls == 1, f"GET /hook 次数={ses.hook_calls}")
+
+    # 同一跳重复出现（门禁非确定性）⇒ 也必须有界停下
+    ses2 = _GateSession(gate_seq=["tos", "tos", "tos", "tos"], post_status=200)
+    cl2 = ts.TypeSafeClient(session=ses2)
+    ob2 = cl2.complete_onboarding()
+    check("★ 同一跳重复出现 ⇒ 有界停下（不把 4 步空推满）",
+          not ob2.ok and ses2.hook_calls == 2,
+          f"ok={ob2.ok} GET /hook 次数={ses2.hook_calls} "
+          f"gates={ob2.data.get('gates')}")
+    check("★ 已提交过的步骤不会被重复 POST",
+          len(ses2.posts) == 1, f"POST 次数={len(ses2.posts)}")
+
+    # 端到端：门禁卡住 + key 建得出来 ⇒ 必须记 keyed，且留痕说明门禁没归零
+    with offline(mails=[_confirm_mail("g2@example-mail.test")],
+                 onboarding_ok=False) as P:
+        pipe = _make_pipe(P, _tmp_ledger())
+        rec = pl.AccountRecord(key="g2@example-mail.test",
+                               email="g2@example-mail.test")
+        cl3 = pipe.stage_login(rec, mail_timeout=1.0)
+        check("  前置：会话已建立", cl3 is not None, f"err={rec.error!r}")
+        pipe.stage_create_key(rec, cl3, name="1")
+    check("★★ 门禁卡住但 key 建出来 ⇒ status=keyed（不误报 partial）",
+          rec.status == "keyed" and bool(rec.api_key),
+          f"status={rec.status} key={rec.api_key!r} err={rec.error!r}")
+    check("★ 同时留下『onboarding 未归零』的痕迹（不许静默当成功）",
+          rec.stages.get("onboarding") == "partial",
+          str(rec.stages))
+    check("★ 成功路径不往 error 里写东西", rec.error == "", repr(rec.error))

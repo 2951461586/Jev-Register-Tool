@@ -3,28 +3,40 @@
 格式对齐同机 OpenXLab 项目的做法（`sender_contains="openxlab"`）：
 **信封发件人子串做第一道过滤，主题子串做第二道。**
 
-为什么必须两道（这是本文件存在的全部理由）
-────────────────────────────────────────────
-实测窗口内 6 类邮件的**信封发件人**（注意：是 VERP 信封地址，不是人类可读的 From）：
+2026-09-21：邀请制取消，营销流整体消失
+──────────────────────────────────────
+本表曾经要处理**六类**邮件，其中两类来自营销流（Loops/SES 的
+`envelope.updates.typesafe.ai`）：
 
     envelope.updates.typesafe.ai   x15   TypeSafe AI: Your account is ready      ← 获批
     envelope.updates.typesafe.ai   x9    TypeSafe AI: You're on the waitlist...   ← 申请确认
-    em5082.typesafe.ai             x2    Welcome to TypeSafe — confirm your email
+
+TypeSafe 取消邀请制后，**这两类邮件不再产生**（申请与审批两个环节都没了），
+对应的 `waitlist_confirm` / `account_ready` 两条规则连同 `SENDER_UPDATES`
+常量一起删除。现在窗口内只剩**事务流**（SendGrid `em5082` / Postmark
+`pm-bounces`）：
+
+    em5082.typesafe.ai             Welcome to TypeSafe — confirm your email  ← 主路径凭据
     em5082.typesafe.ai / pm-bounces.typesafe.ai  Your TypeSafe sign-in code
     em5082.typesafe.ai / pm-bounces.typesafe.ai  Your TypeSafe verification code
-    dm.openxlab.org.cn             x54   【OpenXLab】注册激活                      ← 邻居项目
+    dm.openxlab.org.cn             【OpenXLab】注册激活                       ← 邻居项目
 
-🔴 **"申请确认"和"获批"的信封发件人完全相同**（都是 `envelope.updates.typesafe.ai`）。
-   只按发件人过滤 ⇒ 会把"你在等待名单上"误判成"你已获批"，
-   进而对未获批的账号去跑注册段，拿到 403 还以为是白名单问题。
-   ⇒ **必须叠加主题。** 这也是 OpenXLab 那条规则不能直接照搬的原因：
-      它一类邮件一个域，我们两类邮件共用一个域。
+⚠️ **删除的判据是可实测的**，不要凭印象把规则加回来：窗口内若再出现
+   `envelope.updates.typesafe.ai` 的信，`--mode scan` 会把它列进
+   "漏网主题"（这正是 `diagnose()` 存在的意义），届时再按实际文案补规则。
+
+为什么仍然**必须叠加主题**（这条教训与邀请制无关，长期有效）
+────────────────────────────────────────────────────────────
+历史上"申请确认"与"获批"两封信的**信封发件人完全相同**，只按发件人过滤会把
+"你在等待名单上"误判成"你已获批"，进而对未获批的账号跑注册段、拿到 403 还以为
+是白名单问题。⇒ 只按域过滤永远不够稳，**主题是必需的判别位**。
+（OpenXLab 那条规则不能直接照搬的原因也在这：它一类邮件一个域。）
 
 另外两个坑
 ──────────
-1. 主题里的是**弯引号** U+2019：`You’re on the waitlist`。
-   按 `you're`（直引号 U+0027）匹配**永远不中**。所以规则只用无标点的片段
-   （`on the waitlist`），并在匹配前做一次 Unicode 归一化兜底。
+1. 主题里可能出现**弯引号** U+2019（`You’re …`）。
+   按 `you're`（直引号 U+0027）匹配**永远不中**。所以规则只用无标点的片段，
+   并在匹配前做一次 Unicode 归一化兜底。
 2. 信封发件人里**内嵌了收件人地址**（VERP 回弹编码）：
    `bounces+<acct>-<shard>-oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai`
    这可以当一条免费的收件人一致性校验用，但**不要**把它当收件人字段的替代
@@ -34,7 +46,7 @@
 ────────
     from .mailrules import RULES, get, sender_ok, subject_ok, extract_otp
 
-    rule = get("account_ready")
+    rule = get("welcome_confirm")
     if rule.matches(mail): ...
 
     code, how = extract_otp(mail.body)     # how ∈ {"anchored","loose","none"}
@@ -48,21 +60,18 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 # ── 发件人域常量（改这里就够了，不要在规则里散落字符串） ───────────────
-# 全部 TypeSafe 流量的信封域都以此结尾（envelope.updates / em5082 / pm-bounces）
+# 全部 TypeSafe 流量的信封域都以此结尾（em5082 / pm-bounces）
 SENDER_TYPESAFE = "typesafe.ai"
-# 营销/通知流：申请确认 + 获批**共用**这个域
-SENDER_UPDATES = "envelope.updates.typesafe.ai"
 #
-# ⚠️ 这里曾有一个 `SENDER_TRANSACTIONAL = ("em", "pm-bounces")`，零引用，
-# 2026-09-20 二轮审计后删除。**它不是无害的残留**：它的注释声称收件过滤分了
-# "营销流 / 事务流"两档，而规则表里**每一条** `sender_contains` 用的都是
-# `SENDER_TYPESAFE`（见下方 RULES）—— 也就是说那套分层**实现上根本没落地**。
-# 下一个按注释理解的人会以为"事务流只匹配 `em*`/`pm-bounces*`"，实际匹配整个域。
+# ⚠️ 这里曾有一个 `SENDER_UPDATES = "envelope.updates.typesafe.ai"`，
+# 2026-09-21 随邀请制取消一并删除 —— 它只被 `waitlist_confirm` /
+# `account_ready` 两条规则引用，而那两条已不存在。
+# 删除是**功能性的**（不是清理）：留着它会让人以为营销流还要处理。
 #
-# 为什么**不**去把它落地（即把事务流四条规则收紧到 `em*`/`pm-bounces*`）：
-# 事务流实测走了 **SendGrid（`em5082`）与 Postmark（`pm-bounces`）两条腿**，
-# 将来还可能换供应商。按域匹配更稳，收紧只会引入新的漏匹配风险。
-# ⇒ 结论是删常量、保留宽匹配，而不是反过来。
+# ⚠️ 更早还删过一个 `SENDER_TRANSACTIONAL = ("em", "pm-bounces")`，零引用。
+# 那条的教训仍然适用：**注释声称的分层必须在代码里真的落地**，
+# 否则下一个按注释理解的人会以为"事务流只匹配 `em*`/`pm-bounces*`"，实际匹配整个域。
+# 现在只剩一类流量，按域匹配（`SENDER_TYPESAFE`）就够，不需要再分层。
 
 
 def _norm(s: str) -> str:
@@ -108,52 +117,42 @@ class MailRule:
 
 # ── 规则表 ────────────────────────────────────────────────────────────
 # 顺序无关，靠 name 取；subject_excludes 是**负对照**，防止一条规则吃掉另一条。
+#
+# 阶段标签反映**当前**链路的阶段序号（`1-signup` → `2-login`）：
+#   1-signup  POST /login 发信 → 收确认邮件（唯一入口，取代了旧链路的 1-3 段）
+#   2-login   换 token / 取码 → 认证回调
 RULES: tuple[MailRule, ...] = (
     MailRule(
-        name="waitlist_confirm",
-        stage="2-confirm",
-        sender_contains=SENDER_UPDATES,
-        subject_contains="on the waitlist",
-        subject_excludes=("account is ready",),
-        note="申请确认。正文 'We'll be in touch when it's your turn.' —— "
-             "**不是**获批，别混。",
-    ),
-    MailRule(
-        name="account_ready",
-        stage="3-approved",
-        sender_contains=SENDER_UPDATES,
-        subject_contains="account is ready",
-        subject_excludes=("waitlist",),
-        note="🔴 获批信号，**唯一**能解锁注册段的邮件。"
-             "与 waitlist_confirm 同域，所以 subject 是必需的判别位。",
-    ),
-    MailRule(
         name="welcome_confirm",
-        stage="4-login",
+        stage="1-signup",
         sender_contains=SENDER_TYPESAFE,
         subject_contains="confirm your email",
-        note="Stytch 注册确认信。实测**不是**解锁条件（没有它的地址也能注册成功），"
-             "但它的魔法链接 7 天有效，是重试登录时最稳的凭据来源。",
+        note="🔴 **主路径的唯一凭据来源**（2026-09-21 起）。"
+             "`POST /login` 提交邮箱后站点直接回这封 —— 不再需要先申请、再等获批。"
+             "正文里的 Stytch 魔法链接 **7 天有效**，是重试登录时最稳的凭据。"
+             "⚠️ 历史注记：邀请制时期它「不是解锁条件」（没有它也能注册成功），"
+             "那个前提**已随邀请制取消而失效**，现在它就是入口。",
     ),
     MailRule(
         name="signin_code",
-        stage="4-login",
+        stage="2-login",
         sender_contains=SENDER_TYPESAFE,
         subject_contains="sign-in code",
-        note="6 位登录验证码，10 分钟有效、一次性。",
+        note="6 位登录验证码，10 分钟有效、一次性。"
+             "由 `/login` 的「Email me a code instead」分支（ACTION_3）触发。",
     ),
     MailRule(
         name="signin_link",
-        stage="4-login",
+        stage="2-login",
         sender_contains=SENDER_TYPESAFE,
         subject_contains="sign in to typesafe",
         note="Stytch 登录魔法链接（由 /login 的 ACTION_2 触发）。"
-             "与 welcome_confirm 都是魔法链接，但触发源不同："
-             "welcome_confirm 来自注册表单，这条来自登录表单。",
+             "与 welcome_confirm 都是魔法链接，但**触发源不同**："
+             "welcome_confirm 来自首次注册的 `/login` 提交，这条来自已注册账号的登录。",
     ),
     MailRule(
         name="verify_code",
-        stage="4-login",
+        stage="2-login",
         sender_contains=SENDER_TYPESAFE,
         subject_contains="verification code",
         note="6 位验证码的另一种文案。与 signin_code 分开是为了日志可读；"

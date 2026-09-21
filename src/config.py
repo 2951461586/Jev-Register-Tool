@@ -50,21 +50,17 @@ SITE_ORIGIN = "https://console.typesafe.ai"
 SITE_LOGIN = f"{SITE_ORIGIN}/login"
 STYTCH_LOGIN_HOST = "https://login.typesafe.ai"
 
-# ── Framer 表单（waitlist 申请） ─────────────────────────────────────────
-FRAMER_SITE_ID = "f8111b111e9ce8d3e21d0f9765b6ce69c2a2f3f8b0f0744a436382f9f9a8231e"
-FRAMER_FORM_ID = "ed4ea778-4721-4bcd-bedb-15f8de22eb0b"
-FRAMER_SUBMIT_URL = f"https://api.framer.com/forms/v1/forms/{FRAMER_FORM_ID}/submit"
-FRAMER_REFERER = "https://typesafe.ai/"
-
-# PoW 参数，从 framer.CwAF0H4T.mjs 里读出来的常量（FE/IE/LE/RE）
-POW_SALT = "framer"
-POW_DIFFICULTY = 3          # sha256 十六进制前缀需要 3 个 '0'
-POW_TOKEN_LENGTH = 30
-POW_MAX_TIME_MS = 10_000
-
-# 蜜罐字段（__framer_0..5）的静态取值，与浏览器实测一致
-HONEYPOT_FIELD_COUNT = 11   # VE 列表长度
-HONEYPOT_VERSION = "3"
+# ── Framer 表单（waitlist 申请）—— **已于 2026-09-21 整体移除** ─────────
+#
+# 这里曾有 `FRAMER_SITE_ID` / `FRAMER_FORM_ID` / `FRAMER_SUBMIT_URL` /
+# `FRAMER_REFERER` 与一套 PoW 常量（`POW_SALT` / `POW_DIFFICULTY` / …）。
+# 它们服务于"向 Framer 表单投递 waitlist 申请"这一步，而 TypeSafe
+# **已取消邀请制**：现在 `/login` 直接发确认邮件，注册即登录。
+#
+# ⇒ 连同 `src/framer_waitlist.py` 一起删除。**不要凭印象加回来**：
+#    判据是 `POST /login` 是否直接回 `x-action-redirect: /login?sent=true`，
+#    以及邮件是否直接是 "Welcome to TypeSafe — confirm your email"。
+#    两条 2026-09-21 实测均成立（见 docs/architecture.md §1）。
 
 # ── 邮箱匹配规则 ────────────────────────────────────────────────────────
 # 🔴 收件规则**不在本文件**，唯一真源是 `src/mailrules.py` 的 `RULES` 表。

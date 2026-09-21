@@ -13,75 +13,62 @@ def test_mailrules() -> None:
         def __init__(self, sender: str, subject: str):
             self.sender, self.subject = sender, subject
 
-    UPD = "envelope.updates.typesafe.ai"
     EM = "em5082.typesafe.ai"
-    # ① 两封关键邮件的信封发件人**完全相同** —— 这是本规则表存在的理由
-    ready = M(f"010001a0bbb0ae2e-c50c1c38@envelope.updates.typesafe.ai",
-              "TypeSafe AI: Your account is ready")
-    wait = M(f"010001a0bb95b4b5-722f1aae@envelope.updates.typesafe.ai",
-             "TypeSafe AI: You\u2019re on the waitlist for Jev!")
-    check("获批邮件命中 account_ready", mr.classify(ready) == "account_ready",
-          mr.classify(ready))
-    check("申请确认命中 waitlist_confirm", mr.classify(wait) == "waitlist_confirm",
-          mr.classify(wait))
-    check("两封的信封发件人确实同域（否则不需要叠加 subject）",
-          ready.sender.split("@")[-1] == wait.sender.split("@")[-1] == UPD)
-    # 🔴 负对照：只按发件人过滤会把"等待名单"误判成"已获批"
-    only_sender = mr.MailRule("only_sender", "x", UPD, "")
-    check("[负对照] 只按发件人过滤时，两封**无法区分**",
-          only_sender.matches(ready) and only_sender.matches(wait))
-    check("[负对照] 获批规则不吃申请确认邮件", not mr.get("account_ready").matches(wait))
-    check("[负对照] 申请确认规则不吃获批邮件",
-          not mr.get("waitlist_confirm").matches(ready))
-
-    # ② 弯引号：直引号写法必须不中，无标点片段必须中
-    check("[负对照] 直引号 you're 匹配不到弯引号 You\u2019re",
-          not mr.subject_ok(wait, "you're"))
-    check("无标点片段 on the waitlist 能中", mr.subject_ok(wait, "on the waitlist"))
-
-    # ③ 确认邮件不能被误判成申请确认（两者都含 'TypeSafe'）
-    welcome = M(f"bounces+<acct>-<shard>-oai-x=example-mail.test@em5082.typesafe.ai",
+    # ① 主路径凭据：确认邮件（2026-09-21 起它是链路的**唯一入口**）
+    welcome = M("bounces+<acct>-<shard>-oai-x=example-mail.test@em5082.typesafe.ai",
                 "Welcome to TypeSafe \u2014 confirm your email")
     check("确认邮件命中 welcome_confirm", mr.classify(welcome) == "welcome_confirm",
           mr.classify(welcome))
-    check("[负对照] 确认邮件不被判成申请确认",
-          mr.classify(welcome) != "waitlist_confirm")
 
-    # ④ 验证码两种文案都要认（并集）
-    # 🔴 这里用 `mr.CODE_RULES`（生产用的同一份分组），**不再按规则名重写一遍** ——
-    #    否则自测验的是"我抄的名字对不对"，而不是"生产的分组对不对"。
-    c1 = M(f"bounces+<acct>-22e6-a@em5082.typesafe.ai", "Your TypeSafe sign-in code")
+    # ② 弯引号：直引号写法必须不中，无标点片段必须中
+    #    （这条与邀请制无关 —— 站点的营销文案里出现过 U+2019，长期有效）
+    curly = M(f"x@{EM}", "You\u2019re on the waitlist")
+    check("[负对照] 直引号 you're 匹配不到弯引号 You\u2019re",
+          not mr.subject_ok(curly, "you're"))
+    check("无标点片段 on the waitlist 能中", mr.subject_ok(curly, "on the waitlist"))
+
+    # ③ 验证码两种文案都要认（并集）
+    c1 = M("bounces+<acct>-22e6-a@em5082.typesafe.ai", "Your TypeSafe sign-in code")
     c2 = M("pm_bounces@pm-bounces.typesafe.ai", "Your TypeSafe verification code")
     check("sign-in code 命中", mr.any_of(*mr.CODE_RULES)(c1))
     check("verification code 也命中", mr.any_of(*mr.CODE_RULES)(c2))
-    check("[负对照] 验证码规则不吃获批邮件",
-          not mr.any_of(*mr.CODE_RULES)(ready))
+    check("[负对照] 验证码规则不吃确认邮件",
+          not mr.any_of(*mr.CODE_RULES)(welcome))
 
-    # ④b 生产分组必须与 `stages` 实际用的谓词一致 —— 这是"第二份真源"的护栏。
-    #     2026-09-20 二轮审计：`stages`（当时叫 `pipeline`）曾用
-    #     `any_of("signin_code","verify_code")` 重写一遍分组，与 `CODE_RULES`
-    #     是同一件事的两份定义 ⇒ 加规则会漏改。
+    # ④ 生产分组必须与 `stages` 实际用的谓词一致 —— 这是"第二份真源"的护栏。
+    #    2026-09-20 二轮审计：`stages`（当时叫 `pipeline`）曾用
+    #    `any_of("signin_code","verify_code")` 重写一遍分组，与 `CODE_RULES`
+    #    是同一件事的两份定义 ⇒ 加规则会漏改。
     check("★ stages.MATCH_CODE 就是 any_of(*CODE_RULES)",
-          st.MATCH_CODE(c1) and st.MATCH_CODE(c2) and not st.MATCH_CODE(ready))
+          st.MATCH_CODE(c1) and st.MATCH_CODE(c2) and not st.MATCH_CODE(welcome))
     check("★ stages.MATCH_LINK 就是 any_of(*LINK_RULES)",
           st.MATCH_LINK(_link_mail("x@example-mail.test"))
-          and not st.MATCH_LINK(ready))
+          and not st.MATCH_LINK(c1))
     check("[负对照] CODE_RULES 与 LINK_RULES 不重叠（码/链接不能互相命中）",
           not any(r.name in {x.name for x in mr.CODE_RULES} for r in mr.LINK_RULES))
 
-    # ⑤ 邻居项目的邮件必须被划为"外来"，不能污染我们的桶
+    # ⑤ 邀请制取消后，**营销流规则必须不再存在** —— 这条是"负向护栏"：
+    #    留着 account_ready 会让人以为"还要等获批邮件"，从而把链路读成 6 段。
+    names = {r.name for r in mr.RULES}
+    check("★ 营销流规则已删除（account_ready / waitlist_confirm）",
+          not (names & {"account_ready", "waitlist_confirm"}), str(sorted(names)))
+    check("★ 主路径凭据规则在（welcome_confirm）", "welcome_confirm" in names)
+    check("★ 营销流发件人常量 SENDER_UPDATES 已删除",
+          not hasattr(mr, "SENDER_UPDATES"))
+
+    # ⑥ 邻居项目的邮件必须被划为"外来"，不能污染我们的桶
     oxl = M("no-reply@dm.openxlab.org.cn", "【OpenXLab】注册激活")
     check("[负对照] OpenXLab 邮件被判为外来", not mr.sender_ok(oxl))
     check("OpenXLab 邮件不进任何桶", mr.classify(oxl) == "unknown")
 
-    # ⑥ diagnose：漏网主题必须被列出来（站点改文案的唯一可见信号）
-    d = mr.diagnose([ready, wait, welcome, c1, c2, oxl,
-                     M(f"x@em5082.typesafe.ai", "TypeSafe: 全新文案 we never saw")])
+    # ⑦ diagnose：漏网主题必须被列出来（站点改文案的唯一可见信号）
+    d = mr.diagnose([welcome, c1, c2, oxl,
+                     M(f"x@{EM}", "TypeSafe: 全新文案 we never saw")])
     check("diagnose 统计外来邮件数", d["foreign"] == 1, str(d["foreign"]))
     check("diagnose 列出漏网主题", len(d["unclaimed_subjects"]) == 1,
           str(d["unclaimed_subjects"]))
-    check("diagnose 分桶正确", len(d["buckets"]["account_ready"]) == 1
-          and len(d["buckets"]["waitlist_confirm"]) == 1)
+    check("diagnose 分桶正确", len(d["buckets"]["welcome_confirm"]) == 1,
+          str({k: len(v) for k, v in d["buckets"].items() if v}))
 
 
 def test_otp_extraction() -> None:

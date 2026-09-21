@@ -2,15 +2,28 @@
 
 链路（全部为纯 HTTP，无需浏览器）：
 
-    1. GET  /login?waitlist=<email>              -> 从 HTML 里抓 3 个 Server Action
-    2a. POST /login?waitlist=<email>  ACTION_2   -> 魔法链接邮件（Stytch magic_links）
-    2b. POST /login?waitlist=<email>  ACTION_3   -> 6 位验证码邮件（Stytch otp）
+    1. GET  /login                        -> 从 HTML 里抓 3 个 Server Action
+    2a. POST /login  ACTION_2             -> 确认邮件（Stytch magic_links）
+    2b. POST /login  ACTION_3             -> 6 位验证码邮件（Stytch otp）
     3.  (仅魔法链接) GET  login.typesafe.ai/v1/magic_links/redirect?...  -> 拿到 dfp 交换参数
-        POST login.typesafe.ai/v1/magic_links/redirect/dfp            -> 拿 Stytch session token
-    4. POST /api/auth/callback  {token, tokenType, waitlistEmail}    -> 建立控制台会话
-    5. GET  /api/me                                                  -> 判断是否需要 onboarding
-    6. POST /setup/tos, /setup/set-name, /setup/console-survey        -> 完成 onboarding
-    7. POST /api/api-keys  {name}                                    -> 拿到明文 api_key
+        POST login.typesafe.ai/v1/magic_links/redirect/dfp             -> 拿 Stytch session token
+    4. POST /api/auth/callback  {token, tokenType, …}                 -> 建立控制台会话
+    5. GET  /hook（**不跟随重定向**）                                  -> 读出 onboarding 门禁
+    6. POST /setup/tos → /setup/set-name                              -> 完成 onboarding
+    7. POST /api/api-keys  {name}                                     -> 拿到明文 api_key
+
+2026-09-21：邀请制取消，链路缩短
+────────────────────────────────
+旧链路必须先"投 Framer 表单申请 → 等回执 → 等人工审批"才轮得到第 1 步，
+且 `/login?waitlist=<email>` 的参数用来**预填邮箱**。现在：
+
+  · `?waitlist=` 参数**已失效**（实测带与不带渲染的页面逐字节相同，
+    邮箱不再出现在页面里）⇒ 已从本模块移除，不要再加回去；
+  · `/login` 提交后**直接**发 "Welcome to TypeSafe — confirm your email"；
+  · `POST /api/auth/callback` 直接 200，**不再有 `403 Access restricted`**；
+  · onboarding 只剩两步，且由**站点重定向**驱动（见 `onboarding_gate`）。
+
+⇒ 注册与登录合并成一次动作，`stages.stage_login` 是链路的唯一入口。
 
 **Server Action 的处理方式**：不硬编码 action id。
 `/login` 页把 `$ACTION_<n>:0/1/2` 三个隐藏域直接渲染在 HTML 里（React 的渐进增强路径），
@@ -21,9 +34,9 @@
 全部在 `src/parsing.py` —— 纯函数、零第三方依赖，可以脱离 `requests` 单独测。
 本模块只负责"发请求 / 判断状态码 / 组装 Result"。
 
-**已知门槛**：TypeSafe 是邀请制。未被邀请的邮箱在第 4 步返回
-`403 {"error":"Access restricted"}`，前端文案为
-"Sorry, TypeSafe is currently invite-only"。这一步无法绕过。
+**邀请制门槛（保留防御）**：TypeSafe 已取消邀请制，但服务端随时可能恢复白名单。
+届时未被邀请的邮箱会在第 4 步返回 `403 {"error":"Access restricted"}`。
+`stages._fail_auth` 保留了这条分流 —— 删掉它会让"没被邀请"伪装成"凭据错误"。
 """
 
 from __future__ import annotations
@@ -52,7 +65,7 @@ MODE_LINK = "link"
 MODE_CODE = "code"
 
 
-# /setup/* 页面的 Server Action ID，取自录制 HAR（部署 id 787c0047… 与当时一致）。
+# /setup/* 页面的 Server Action ID，取自录制 HAR。
 #
 # 🔴 **这些 id 已知会随部署失效，不是可用通路**（2026-09-20 实测全部作废：
 #    POST 回 `404 Server action not found.`）。三处文档都写明了这一点
@@ -60,12 +73,30 @@ MODE_CODE = "code"
 #    保留它只是为了"页面跳过了隐藏域"这类边缘场景留一条最后手段 ——
 #    首选**永远**是运行时抓 `$ACTION_*` 隐藏域。
 #    ⇒ 走这条路必须留痕：`post_setup()` 会打显式告警，失败时 error 指向真因。
-#    重新录制 HAR 拿到新 id 后，记得同步这条注释与 runbook §4.6。
+#
+# 2026-09-21 更新：`/setup/console-survey` 条目**已删除** —— 站点把 onboarding
+# 简化成两步（ToS → set-name），那个路由不再存在（实测所有 `/setup/*` 与 `/hook`
+# 在 ToS 未接受时一律 307 到 `/setup/tos`，接受后一律 307 到 `/setup/set-name`）。
+# 下面两个 id 是 2026-09-21 实测值（与同日 HAR 的 `next-action` 头逐字一致）。
 FALLBACK_SETUP_ACTIONS = {
-    "/setup/tos": "6016020c2c1d719d5d6a7c8f6ab594c8de691556c2",
-    "/setup/set-name": "60ec39e20e3115ab87f21a60e7f7cfe7169dada4ef",
-    "/setup/console-survey": "60f5cf7bebef1c5652bc5e860c24de2872de20d39e",
+    "/setup/tos": "6046a5522e4a3fd387f720ff2166e85612b1b5b9db",
+    "/setup/set-name": "6040f80f99bc6e6200e02120c32264d7eb784c6f2d",
 }
+
+#: `/hook` 是 onboarding 的**终点页**：站点把未完成 onboarding 的访问者从这里
+#: 307 到"当前该做的第一步"。所以它的重定向目标就是**站点权威的门禁状态**。
+#: 这里只列**我们真的会提交**的步骤；站点若新增步骤，`onboarding_gate()` 会
+#: 把新步骤名原样报出来（而不是当成"已通过"）。
+KNOWN_ONBOARDING_GATES: tuple[str, ...] = ("tos", "set-name")
+
+#: 从重定向目标里抠出步骤名：`/setup/<slug>?returnTo=…` → `<slug>`。
+#: 🔴 不写死 slug 集合：站点加一步就会静默落到"未匹配 ⇒ 已通过"那条路上去。
+SETUP_PATH_RE = re.compile(r"/setup/([A-Za-z0-9._-]+)")
+
+#: `complete_onboarding` 最多推几步。当前站点是 2 步（tos → set-name），
+#: 留一倍余量；这个上限的存在意义是**防死循环**（站点若把门禁写成
+#: "接受 ToS 后又回到 ToS"，没有它就会无限 POST）。
+MAX_ONBOARDING_STEPS = 4
 
 
 class TypeSafeError(RuntimeError):
@@ -99,13 +130,19 @@ class TypeSafeClient:
         self.log: list[str] = []
 
     # ── 内部 ──────────────────────────────────────────────────────────
-    def _login_url(self, email: str) -> str:
-        return f"{config.SITE_LOGIN}?waitlist={requests.utils.quote(email, safe='')}"
+    def _login_url(self) -> str:
+        """登录页 URL。
 
-    def _login_headers(self, email: str) -> dict[str, str]:
+        ⚠️ 这里曾经是 `/login?waitlist=<email>` —— 那个参数用于**预填邮箱**。
+        2026-09-21 实测已失效：带与不带它渲染的页面逐字节相同，邮箱不再出现在
+        页面里。留着它会让人以为"发信还依赖它"，所以删掉。
+        """
+        return config.SITE_LOGIN
+
+    def _login_headers(self) -> dict[str, str]:
         return {
             "Origin": config.SITE_ORIGIN,
-            "Referer": self._login_url(email),
+            "Referer": self._login_url(),
             "Accept": "text/html,application/xhtml+xml",
         }
 
@@ -120,10 +157,10 @@ class TypeSafeClient:
     #: 不做语义识别是因为 LINK/CODE 只能靠编号区分，硬猜会发错凭据类型。
     ACTION_FETCH_ATTEMPTS = 2
 
-    def fetch_actions(self, email: str) -> dict[str, dict[str, str]]:
+    def fetch_actions(self) -> dict[str, dict[str, str]]:
         last: tuple[str, ...] = ()
         for i in range(self.ACTION_FETCH_ATTEMPTS):
-            r = self.s.get(config.SITE_LOGIN, params={"waitlist": email}, timeout=30)
+            r = self.s.get(config.SITE_LOGIN, timeout=30)
             if r.status_code != 200:
                 raise TypeSafeError(f"GET /login -> HTTP {r.status_code}",
                                     status=r.status_code)
@@ -141,14 +178,19 @@ class TypeSafeClient:
 
     # ── 2. 触发发信 ───────────────────────────────────────────────────
     def send_login_email(self, email: str, mode: str = MODE_CODE) -> Result:
-        """提交登录表单，触发 Stytch 发信。返回页面的可见文案。"""
+        """提交登录表单，触发 Stytch 发信。返回页面的可见文案。
+
+        2026-09-21 起这是链路的**第一步**（不再需要先申请/等审批）。
+        `MODE_LINK` 会发 "Welcome to TypeSafe — confirm your email"，
+        `MODE_CODE` 会发 6 位验证码。
+        """
         n = ACTION_LINK if mode == MODE_LINK else ACTION_CODE
-        acts = self.fetch_actions(email)
+        acts = self.fetch_actions()
         a = acts[n]
         files = action_form_fields(n, a)
         files["email"] = (None, email)
-        r = self.s.post(config.SITE_LOGIN, params={"waitlist": email}, files=files,
-                        headers=self._login_headers(email), timeout=40)
+        r = self.s.post(config.SITE_LOGIN, files=files,
+                        headers=self._login_headers(), timeout=40)
         txt = visible_text(r.text)
         self.email = email
         self.log.append(f"send_login_email(mode={mode}) HTTP {r.status_code}")
@@ -221,7 +263,7 @@ class TypeSafeClient:
         }
         r = self.s.post(f"{config.SITE_ORIGIN}/api/auth/callback", json=payload,
                         headers={"Origin": config.SITE_ORIGIN,
-                                 "Referer": self._login_url(email),
+                                 "Referer": self._login_url(),
                                  "Accept": "application/json"}, timeout=40)
         body: dict[str, Any] = {}
         try:
@@ -232,7 +274,9 @@ class TypeSafeClient:
         res = Result(ok=r.status_code == 200, stage="auth_callback",
                      status=r.status_code, data=body,
                      error="" if r.status_code == 200 else f"HTTP {r.status_code} {code}")
-        self.log.append(f"auth_callback({token_type}) HTTP {r.status_code} {code}")
+        # `email` **不参与请求体**（见上），只用于 Referer 与这条日志 ——
+        # 它标识"这次回调是为哪个邮箱做的"，并发排查时靠它对齐。
+        self.log.append(f"auth_callback({token_type}, {email}) HTTP {r.status_code} {code}")
         return res
 
     def me(self) -> dict[str, Any] | None:
@@ -333,85 +377,150 @@ class TypeSafeClient:
                       data={"redirect": redirect, "via": used, "fetch_error": fetch_err},
                       error=err)
 
-    def complete_onboarding(self, display_name: str = "Auto User") -> Result:
-        """按 /api/me 的缺口依次补 TOS / 姓名 / 问卷。
+    def onboarding_gate(self) -> str:
+        """站点把我们挡在 onboarding 的**哪一步**？
 
-        🔴 **判据不能只看 POST 的返回码 —— 失败后必须回读一次状态。**
-        （2026-09-21 实测，与 `post_setup` 的降级告警是同一批发现。）
+        返回值三态（调用方**必须**区分，否则会静默放行）：
+            `""`        —— `/hook` 200，onboarding 已通过
+            `"<slug>"`  —— `/setup/<slug>`，当前该做这一步（含我们不认识的步骤）
+            `"!<码> <loc>"` —— 跳到非 `/setup/*` 的地方（多半是会话失效）
 
-        站点现在把三步合成了**同一张表单**（`/setup/tos` / `/setup/set-name` /
-        `/setup/console-survey` 三个路由返回**逐字节相同**的页面，len 都是 39760），
-        提交一次之后服务端把三项**一起**标记完成。而紧接着的 `/api/me` **读有滞后**，
-        仍报 `console_survey_completed_at = None`。
+        🔴 判据必须来自**站点的重定向**，不能来自 `/api/me` 的字段。
 
-        于是我们会多发一次 survey POST —— 可那时 onboarding 已完成，页面渲染的是
-        欢迎页、**没有 `$ACTION_*` 隐藏域** ⇒ 退化到已作废的 fallback ⇒ 404。
-        结果：**账号明明已经完全 onboard，却被记成 `partial`（假阴性）**，
-        实跑 25 个里误报 19 个，交付流程在"最后一跳"上白跑一整轮。
+        历史教训（2026-09-21 实测，误报率 19/25 = 76%）：
+        旧实现用 `/api/me` 的 `console_survey_completed_at` 判断"要不要跑 survey"。
+        可站点**已经把 survey 这一步删掉了**（onboarding 从三步变两步），
+        该字段于是永远为 `None` ⇒ 每次都多发一次 survey POST ⇒
+        而那时页面渲染的是欢迎页、**没有 `$ACTION_*` 隐藏域**
+        ⇒ 退化到已作废的 fallback ⇒ 404
+        ⇒ **账号明明已经完全 onboard，却被记成 `partial`**。
 
-        ⇒ `onboarding_state()`（即 `/api/me`）是**唯一可信的真源**：
-        POST 报错后回读一次，缺口关了就是成功。
-        自测 `test_onboarding_merged_submit_is_not_a_failure` 钉住。
+        ⇒ 改成"问站点下一步是什么"：`GET /hook` 不跟随重定向，看它把我们送去哪。
+          站点增删步骤时本方法**自动适应**，不必跟着改字段名。
+          实测门禁链（2026-09-21）：
+              未接受 ToS     → `/hook` 307 → `/setup/tos?returnTo=…`
+              接受 ToS 后    → `/hook` 307 → `/setup/set-name?returnTo=…`
+              完成 set-name  → `/hook` 200（欢迎页，链路打通）
         """
-        st = self.onboarding_state()
-        done: list[str] = []
+        r = self.s.get(f"{config.SITE_ORIGIN}/hook", allow_redirects=False, timeout=30)
+        if r.status_code == 200:
+            return ""
+        loc = r.headers.get("location") or ""
+        m = SETUP_PATH_RE.search(loc)
+        if m:
+            return m.group(1)
+        # 🔴 不是 `/setup/*` 的跳转（例如会话失效被送回 `/login`）。
+        # 旧实现这里 `return ""` ⇒ 被上游当成"onboarding 已通过"而放行，
+        # 属于**静默放行**：门禁明明没过，却继续去建 key。
+        # 加 `!` 前缀是刻意的——它保证不会与任何合法步骤名相撞。
+        return f"!{r.status_code} {loc}".strip()
 
-        def step(label: str, need_key: str, path: str,
-                 fields: dict[str, str]) -> Result | None:
-            """跑一步；返回非 None 表示**真失败**。"""
-            r = self.post_setup(path, fields)
-            if r.ok:
-                done.append(label)
-                return None
-            if not self.onboarding_state()[need_key]:
-                # 回读判定：缺口已关 ⇒ 是上一步顺带完成的，不是失败
-                done.append(f"{label}（上一步已顺带完成）")
-                self.log.append(
-                    f"⚠ post_setup({path}) 报 {r.error!r}，但回读 /api/me 显示 "
-                    f"`{need_key}` 已关闭 ⇒ 判**成功**"
-                    f"（站点把三步合并成一次提交，而 /api/me 读有滞后）")
-                return None
-            return r
+    def complete_onboarding(self, display_name: str = "Auto User") -> Result:
+        """尽力推进 onboarding；**`ok=False` 不等于"这个账号废了"**。
 
-        if st["needs_tos"]:
-            r = step("tos", "needs_tos", "/setup/tos?returnTo=%2Fhook", {
-                "legalAcknowledged": "true",
-                "returnTo": "/hook",
-                "marketingOptIn": "true",
-                "marketingOptedOutInitial": "",
-            })
-            if r is not None:
-                return r
-        st = self.onboarding_state()
-        if st["needs_name"]:
-            r = step("set-name", "needs_name", "/setup/set-name?returnTo=%2Fhook", {
-                "returnTo": "/hook",
-                "accountEmail": self.email,
-                "displayName": display_name,
-                "jobFunction": "",
-                "skip": "true",
-            })
-            if r is not None:
-                return r
-        st = self.onboarding_state()
-        if st["needs_survey"]:
-            org = ""
-            for m in (st["profile"].get("org_memberships") or []):
-                org = (m.get("org") or {}).get("id", "") or org
-            r = step("console-survey", "needs_survey",
-                     "/setup/console-survey?returnTo=%2Fhook", {
-                         "returnTo": "/hook",
-                         "needsOrgFields": "false",
-                         "orgSurveyOrgId": org,
-                         "needsUserFields": "true",
-                         "skip": "true",
-                     })
-            if r is not None:
-                return r
-        return Result(ok=True, stage="onboarding", data={"completed": done,
-                                                        "state": self.onboarding_state()})
+        🔴 判据换过三次，每次的教训都留着（这是本项目最容易判错的一处）：
+
+        | 版本 | 判据 | 怎么错的 |
+        |---|---|---|
+        | 旧 | `/api/me` 的 `console_survey_completed_at` | 视图有滞后、字段语义会变；站点一改步骤就永真 ⇒ 多发一次 POST ⇒ 404 ⇒ 假 `partial` |
+        | 中 | `GET /hook` 重定向归零 | **站点自己就不稳定**：同一次运行里相邻两次 GET 给出不同答案（实测 `set-name` 与 200 交替），拿它当判据必然空转 |
+        | **今** | **能不能建出 key**（见 `stage_create_key`） | —— |
+
+        2026-09-21 实测（`tools/probes/probe_gate_chain.py`）：
+          · 门禁链是**三步** `tos → set-name → console-survey`，
+            而 `console-survey` 那一页**没有 `$ACTION_*` 隐藏域**（渲染的是
+            "Get started / Let's create your org" 向导），我们无法自动提交；
+          · 就在这个"门禁未归零"的状态下，`POST /api/api-keys` 返回
+            **200 + 明文 key** ⇒ `/hook` 的重定向是**引导**，不是硬门槛。
+
+        ⇒ 本方法只做两件事：① 把**我们认识的**步骤各提交一次；② 如实报告
+          门禁序列与结果。**它不再有权判"账号失败"** —— 那个判断属于建 key 那一步。
+          调用方（`stages.stage_create_key`）据此决定是继续还是收工。
+
+        另外两条防御：
+          · 同一跳**只提交一次**（`attempted`）—— 门禁非确定性时防空转；
+          · 遇到不认识的步骤**停下并记录**，不判失败、也不硬猜字段。
+        """
+        gates: list[str] = []
+        submitted: list[tuple[str, bool]] = []
+        via: list[str] = []
+        last_err = ""
+        attempted: set[str] = set()
+        stopped = f"连推 {MAX_ONBOARDING_STEPS} 步仍未归零"
+
+        for _ in range(MAX_ONBOARDING_STEPS):
+            gate = self.onboarding_gate()
+            gates.append(gate or "(已通过)")
+            if not gate:
+                return self._onboarding_result(True, submitted, gates, via, "")
+            if gate.startswith("!"):
+                # 门禁不可识别（会话失效 / 站点换了跳转目标）——不许当成"已通过"
+                return self._onboarding_result(
+                    False, submitted, gates, via,
+                    f"onboarding 门禁不可识别：{gate}"
+                    f"（会话失效？站点改了跳转目标？）")
+            if gate not in KNOWN_ONBOARDING_GATES:
+                stopped = (f"遇到不认识的引导步骤 {gate!r}（站点新增？"
+                           f"我们无法自动提交它，但它不影响建 key，故不判失败；"
+                           f"要看它的页面形态跑 tools/probes/probe_gate_chain.py）")
+                break
+            if gate in attempted:
+                # 门禁**非确定性**：同一跳又出现了 ⇒ 再提交也是白费。
+                # 若上一跳是 HTTP 失败，如实报出来（这才是真失败）。
+                why = (f"提交 {gate} 失败且门禁原地不动：{last_err}"
+                       if last_err else f"门禁非确定性：{gate!r} 重复出现")
+                stopped = why
+                break
+            attempted.add(gate)
+            if gate == "tos":
+                r = self.post_setup("/setup/tos?returnTo=%2Fhook", {
+                    "legalAcknowledged": "true",
+                    "returnTo": "/hook",
+                    "marketingOptIn": "true",
+                    "marketingOptedOutInitial": "",
+                })
+            elif gate == "set-name":
+                r = self.post_setup("/setup/set-name?returnTo=%2Fhook", {
+                    "returnTo": "/hook",
+                    "accountEmail": self.email,
+                    "displayName": display_name,
+                    "jobFunction": "",
+                    "skip": "true",
+                })
+            submitted.append((gate, r.ok))
+            via.append(f"{gate}:via={r.data.get('via', '?')},HTTP {r.status}")
+            if not r.ok:
+                last_err = r.error
+        return self._onboarding_result(False, submitted, gates, via, stopped)
+
+    @staticmethod
+    def _onboarding_result(ok: bool, submitted: list[tuple[str, bool]],
+                           gates: list[str], via: list[str],
+                           stopped: str) -> Result:
+        """把"提交了什么 / 门禁怎么变"拼成一份可诊断的报告。
+
+        `completed` 里带 `（上一步已顺带完成）` 标记的项 = POST 报了错、但门禁
+        确实往前走了（站点"提交一次顺带完成多步"）。这个标记必须保留：
+        它和"真失败"在台账里长得一样，丢了就分不出两者。
+        """
+        completed = [f"{g}（上一步已顺带完成）" if not was_ok else g
+                     for g, was_ok in submitted]
+        data = {"completed": completed, "gates": gates, "via": via}
+        if not ok:
+            data["stopped"] = stopped
+        return Result(ok=ok, stage="onboarding",
+                      error="" if ok else stopped,
+                      data=data)
 
     def onboarding_state(self) -> dict[str, Any]:
+        """`/api/me` 的快照 —— **仅供诊断留痕，不是任何判据**。
+
+        它已经被换掉两次判据了（`console_survey_completed_at` 不可信，
+        `/hook` 重定向也不可信，见 `complete_onboarding` 的表）。
+        留下的理由：`needs_*` 对"为什么某一步没生效"有解释力
+        （例如 set-name 提交后 `human_name` 仍为空 —— 那是 `skip=true` 的正常结果，
+        不是失败）。生产代码里已无人读它，只有 `tools/probes/` 在读。
+        """
         prof = self.me() or {}
         name = (prof.get("human_name") or "").strip()
         tos = (prof.get("latest_tos_acceptance") or {}).get("tos_version")

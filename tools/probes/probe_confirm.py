@@ -1,10 +1,14 @@
 #!/usr/bin/env python
-"""探针：只走"确认邮件"这一步，把每一跳的原始响应都打出来。
+"""探针：只走"魔法链接"这一步，把每一跳的原始响应都打出来。
 
 用法：
-    python tools/probe_confirm.py <email> [--link <magic_url>] [--callback]
+    python tools/probes/probe_confirm.py <email> [--link <magic_url>] [--callback]
 
 不写台账、不发新邮件。--callback 才会去 POST /api/auth/callback。
+
+🔴 这是**已删证据 `evidence/_stytch.html` 的唯一重建路径**
+（`docs/audit-2026-09-20.md` 记着"如需重现同类材料，跑本探针重新抓"）。
+2026-09-21 起魔法链接是**主路径**（不再是"确认邮件"这种旁支），所以它比过去更该留着。
 """
 
 from __future__ import annotations
@@ -141,11 +145,14 @@ def main() -> int:
         return 1
     tk = requests.utils.unquote(tok.group(1))
     tt = ttype.group(1) if ttype else "magic_links"
+    # 🔴 键集必须与 `typesafe.auth_callback()` 逐字一致：站点是 strict schema，
+    # 多一个键直接 400 `Unrecognized key`。`waitlistEmail` 已于 2026-09-21 删除，
+    # 加回来会让本探针报出一个**看起来像"回调坏了"**的假故障。
     pl = {"token": tk, "tokenType": tt, "returnTo": None, "preferredOrgId": None,
-          "inviteId": None, "oauthState": None, "waitlistEmail": args.email}
+          "inviteId": None, "oauthState": None}
     r4 = s.post(f"{config.SITE_ORIGIN}/api/auth/callback", json=pl,
                 headers={"Origin": config.SITE_ORIGIN,
-                         "Referer": f"{config.SITE_LOGIN}?waitlist={args.email}",
+                         "Referer": config.SITE_LOGIN,
                          "Accept": "application/json"}, timeout=40)
     dump(r4, body=400)
 

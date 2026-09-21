@@ -1,34 +1,20 @@
-"""解析层自测：Framer PoW / `$ACTION` 紧凑 JSON / Server Action 表单 / Stytch JS 字面量。
+"""解析层自测：`$ACTION` 紧凑 JSON / Server Action 表单 / Stytch JS 字面量。
 
 样本 HTML 是**真实抓取**的（见各常量的注释），不是编的 —— 用编的样本会造出
 "断言全过、线上全废"的假安全感。
+
+⚠️ 这里曾有 `test_pow`（Framer 表单的 Proof-of-Work 复刻）。
+2026-09-21 邀请制取消，`src/framer_waitlist.py` 整体删除，PoW 不再有生产
+调用点 ⇒ 该用例连同 `hashlib` / `fw` 依赖一并删除。
 """
 
 from __future__ import annotations
 
-import hashlib
 import html
 import json
 import re
 
-from .support import check, fw, ps, ts
-
-def test_pow() -> None:
-    print("\n[PoW]")
-    secret, digest = fw.pow_secret()
-    ts_ms, _, token = secret.partition(":")
-    check("secret 形如 <ms>:<token>", ts_ms.isdigit() and len(token) == 30,
-          f"got {secret!r}")
-    check("sha256(salt+secret) 以 000 开头",
-          hashlib.sha256(("framer" + secret).encode()).hexdigest().startswith("000"))
-    check("与浏览器实测格式一致",
-          digest == hashlib.sha256(("framer" + secret).encode()).hexdigest())
-    # 负对照：换 salt 必须不再满足
-    bad = hashlib.sha256(("wrong" + secret).encode()).hexdigest()
-    check("[负对照] 换 salt 后不再满足难度", not bad.startswith("000"), bad[:8])
-    check("Framer-Form-Fields 与 HAR 逐字一致",
-          fw.form_fields_header()
-          == "email,__framer_0,__framer_1,__framer_2,__framer_3,__framer_4,__framer_5")
+from .support import check, ps, ts
 
 
 def test_compact_ref() -> None:

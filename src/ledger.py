@@ -36,25 +36,33 @@ _LOCK = threading.RLock()
 #: 而 `verify_keys.py` 是按 `api_key` 有没有值来筛验收清单的 ⇒
 #: 这些账号会**从验收结果里静默消失**（不报错，只是少几行）。
 #:
-#: 当时的真实台账侥幸无损，纯粹因为那 5 个重复 key 的 failed 行**恰好都排在
-#: keyed 行之前**（全部同分 ⇒ `load()` 退化成"末行胜出"）。
-#:
-#: 现在由 `tools/selftest.py::test_status_vocabulary` 用 AST 扫源码钉住：
+#: 现在由 `tools/tests/test_ledger.py::test_status_vocabulary` 用 AST 扫源码钉住：
 #: 新增任何 status 字面量而没登记进本表，自测立刻失败。
 RANK: dict[str, int] = {
-    # ── 阶段层实际写入的词汇（唯一真源：src/stages.py） ──
+    # ── 当前链路实际写入的词汇（唯一真源：src/stages.py） ──
     "keyed": 5,         # 终态成功：拿到 api_key
-    "partial": 4,       # 注册成功但没拿到 key（onboarding / 建 key 失败）
+    "partial": 4,       # 会话已建立但没拿到 key（onboarding / 建 key 失败）
     "registered": 4,    # 会话已建立（过渡态，正常情况下会被 keyed/partial 覆盖）
-    "approved": 3,      # 已获批（解锁注册段）
-    "confirmed": 2,     # 确认邮件已到
-    "applied": 1,       # 申请已投递
-    "code_sent": 1,     # claim 只发了码，还没提交
     "failed": 0,
     "": 0,
+    # ── 历史词汇：邀请制时期的阶段状态，**已不再写入**，但必须留着 ──
+    #
+    # 2026-09-21 邀请制取消，`apply → confirm → approved → login` 四段缩成
+    # `signup+login` 一段，于是 `applied` / `confirmed` / `approved` / `code_sent`
+    # 四个字面量**不再由代码写入**。
+    #
+    # 🔴 **不要因为"代码里搜不到"就删掉它们。** 本表的键是给**历史台账**看的：
+    #    `exports/ledger.jsonl` 里有数百行 `approved` / `confirmed` 记录，
+    #    删掉这些键会让它们 `rank()` 落 0 分（= 与 failed 同级）⇒
+    #    任何一次重跑都会把历史记录里的凭据按"同级覆盖"逻辑清掉。
+    #    这正是上面那段教训的**同一个坑**，只是触发源从"词汇写错"变成"词汇被删"。
+    "approved": 3,      # [历史] 已获批（当时用来解锁注册段）
+    "confirmed": 2,     # [历史] waitlist 确认邮件已到
+    "applied": 1,       # [历史] 申请已投递
+    "code_sent": 1,     # [历史] claim 只发了码、还没提交
     # ── 兼容兄弟项目的旧词汇 ──
-    # 本项目不再写这两个，但历史 / 外部文件里可能出现。
-    # 留着是为了避免"未知词汇静默落到 0 分"（= 和 failed 同级）这个坑复发。
+    # 本项目不再写这两个，但外部文件里可能出现。
+    # 留着是为了避免"未知词汇静默落到 0 分"这个坑复发。
     "success": 5,
     "skipped": 0,
 }
@@ -67,7 +75,11 @@ RANK: dict[str, int] = {
 EARNED_FIELDS: tuple[str, ...] = ("api_key", "api_key_id", "email")
 
 #: 累积型字段：合并时做**并集**，不用后来者整体替换。
-DICT_FIELDS: tuple[str, ...] = ("stages", "timings", "waitlist", "user")
+#:
+#: ⚠️ `waitlist` 是 2026-09-21 之前的字段名（现名 `signup`，见 `stages.AccountRecord`）。
+#: 两者都留着：`signup` 是当前写入的，`waitlist` 兜住**历史台账**里的同名键 ——
+#: 去掉它，历史记录的 `waitlist` 就会在"升级/同级"合并时被丢掉（数据静默缩水）。
+DICT_FIELDS: tuple[str, ...] = ("stages", "timings", "signup", "waitlist", "user")
 
 
 def rank(rec: dict[str, Any]) -> int:

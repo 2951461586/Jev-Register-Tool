@@ -1,16 +1,22 @@
-"""带重试的重新登录：对**无 key 但已申请**的账号跑 4→7，直到拿到 key 或被明确拒绝。
+"""带重试的重新登录：对**无 key 的账号**反复跑"发信 → 收链接 → 建会话"，直到拿到 key。
 
-为什么需要它（2026-09-21 实测得出的两条）
-────────────────────────────────────────────
-1. **`stage_wait_approval` 等的那封"获批邮件"不可信** —— 共享 Worker 的 D1 窗口只有
-   100 行、被同机邻居项目刷屏，获批邮件会被挤掉。项目自己也记了
-   「窗口里没看到 account_ready ≠ 未获批，可信判据只有站点侧实测」。
-   ⇒ 正确做法是**直接尝试登录**：`auth_callback` 回 200 = 已获批；
-   回 `403 Access restricted` = 未获批。这才是那个"站点侧实测"。
-2. **站点发信严重丢包**（实测 12 次发码只到 1 封），但**魔法链接 7 天有效**。
-   ⇒ 只要耐心重试、并且**把已经躺在收件箱里的链接也用上**，就能拿下来。
-   `stage_login` 的 `wait_for_mail(since_ms=now-5s)` 只认"请求之后到达"的信，
-   历史链接永远用不上 —— 这是本脚本要补的洞。
+为什么需要它（2026-09-21 实测）
+────────────────────────────────
+**站点发信存在丢包**（实测 12 次发码只到 1 封），而**魔法链接 7 天有效**。
+⇒ 只要耐心重试、并且**把已经躺在收件箱里的链接也用上**，就能把账号拿下来。
+
+⚠️ 后一条是本脚本存在的**唯一理由**：`stage_login` 的
+`wait_for_mail(since_ms=now-5s)` 只认"本次请求**之后**到达"的信，
+所以上次跑到一半留下的链接**永远用不上**。本脚本不设 `since_ms` 门槛，
+先把历史链接全部试一遍。
+
+与 `--mode resume` 的分工：
+    resume          跑一次，失败就算了（正常批次用这个）
+    relogin_pending 对已知会丢包的账号**多轮重试 + 复用历史链接**（补跑用这个）
+
+2026-09-21 变更：邀请制取消后本脚本**不再需要**"先判断是否获批"那一步
+（旧版曾用 `403 Access restricted` 当"未获批"的可信判据）。现在
+`auth_callback` 回 200 就是成功、回 403 才是真被拦（防御分支保留）。
 
 用法：
     python tools/relogin_pending.py --email a@x --email b@x
@@ -25,13 +31,10 @@ import time
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from _bootstrap import ROOT  # noqa: E402,F401
 
-from src import config, ledger  # noqa: E402
-from src.mailrules import extract_otp  # noqa: E402
 from src.parsing import extract_magic_link  # noqa: E402
 from src.runner import Pipeline  # noqa: E402
-from src.stages import (LINK_FALLBACK_TIMEOUT, MATCH_CODE, MATCH_LINK,  # noqa: E402
-                        AccountRecord)
-from src.typesafe import MODE_CODE, TypeSafeClient, TypeSafeError  # noqa: E402
+from src.stages import MAIL_TIMEOUT, MATCH_LINK, AccountRecord  # noqa: E402
+from src.typesafe import MODE_LINK, TypeSafeClient, TypeSafeError  # noqa: E402
 
 
 def link_mails(cl, email):
@@ -63,7 +66,7 @@ def finish(pipe, rec, cl, res, name):
     return False
 
 
-def relogin_one(pipe, email, *, rounds=3, wait=180.0, name="1"):
+def relogin_one(pipe, email, *, rounds=3, wait=MAIL_TIMEOUT, name="1"):
     rec = AccountRecord(key=email, email=email)
     tried: set[str] = set()
 
@@ -84,50 +87,35 @@ def relogin_one(pipe, email, *, rounds=3, wait=180.0, name="1"):
             if finish(pipe, rec, cl, res, name):
                 return rec
 
-        # ── 2. 没有可用的旧链接就发一次，等新的 ──────────────────────
+        # ── 2. 没有可用的旧链接就发一封新的，等它到 ──────────────────
         cl = TypeSafeClient()
         since = int(time.time() * 1000) - 5_000
         try:
-            r = cl.send_login_email(email, mode=MODE_CODE)
+            r = cl.send_login_email(email, mode=MODE_LINK)
         except TypeSafeError as exc:
-            pipe.log(f"     发码异常 {exc}")
+            pipe.log(f"     发信异常 {exc}")
             time.sleep(15)
             continue
         if not r.ok:
-            pipe.log(f"     发码 HTTP {r.status}")
+            pipe.log(f"     发信 HTTP {r.status}")
             time.sleep(15)
             continue
-        pipe.log(f"     已发码 HTTP {r.status}，等信（码 {wait:.0f}s / 链接 {LINK_FALLBACK_TIMEOUT:.0f}s）…")
+        pipe.log(f"     已发信 HTTP {r.status}，等确认邮件（{wait:.0f}s）…")
 
-        m = pipe.mail.wait_for_mail(email, MATCH_CODE,
-                                    timeout=wait, interval=3.0, since_ms=since)
-        if m is not None:
-            pipe.log(f"     收到码邮件 {str(m.subject)[:40]!r}")
-            token, how = extract_otp(m.body)
-            if token:
-                res = cl.auth_callback(token, "otp", email)
-                if finish(pipe, rec, cl, res, name):
-                    return rec
-            else:
-                pipe.log(f"     码邮件里没抽出 6 位码（how={how}）")
-        else:
-            pipe.log(f"     {wait:.0f}s 内没等到码邮件")
+        m = pipe.mail.wait_for_mail(email, MATCH_LINK, timeout=wait,
+                                    interval=3.0, since_ms=since)
+        if m is None:
+            pipe.log(f"     {wait:.0f}s 内没等到确认邮件")
+            continue
+        url = extract_magic_link(m.body)
+        if url:
+            tried.add(url)
+        pipe.log(f"     收到 {str(m.subject)[:44]!r}")
+        res = pipe._exchange_link(rec, m, cl)
+        if res is not None and finish(pipe, rec, cl, res, name):
+            return rec
 
-        # 码没到 ⇒ 站点可能回的是链接形态（项目记录：4 次里 1 次）
-        m2 = pipe.mail.wait_for_mail(email, MATCH_LINK, timeout=LINK_FALLBACK_TIMEOUT,
-                                     interval=3.0, since_ms=since)
-        if m2 is not None:
-            pipe.log(f"     收到链接邮件 {str(m2.subject)[:40]!r}")
-            url = extract_magic_link(m2.body)
-            if url:
-                tried.add(url)
-            res = pipe._exchange_link(rec, m2, cl)
-            if res is not None and finish(pipe, rec, cl, res, name):
-                return rec
-        else:
-            pipe.log(f"     {LINK_FALLBACK_TIMEOUT:.0f}s 内也没等到链接邮件")
-
-        pipe.log(f"     本轮未拿到可用凭据")
+        pipe.log("     本轮未拿到可用凭据")
 
     pipe._fail(rec, "login", f"{rounds} 轮均未拿到可用凭据（站点发信丢包）")
     return rec
@@ -137,21 +125,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--email", action="append", default=[])
     ap.add_argument("--all-pending", action="store_true",
-                    help="台账里所有无 api_key 且已确认的账号")
+                    help="台账里所有**还没有 api_key** 的真实邮箱账号")
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--wait", type=float, default=180.0)
+    ap.add_argument("--wait", type=float, default=MAIL_TIMEOUT,
+                    help=f"每轮等确认邮件的秒数（默认 {MAIL_TIMEOUT:.0f}）")
     ap.add_argument("--name", default="1")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
 
-    pipe = Pipeline(login_mode=MODE_CODE)
+    pipe = Pipeline(login_mode=MODE_LINK)
     led = pipe.ledger
 
     emails = list(args.email)
     if args.all_pending:
+        # 判据是"**没有 api_key 且 key 看起来是邮箱**"，而不是状态白名单：
+        #   · 状态词汇会随链路变化（2026-09-21 就废掉了 4 个），写白名单必然漂移；
+        #   · `worker-crash#N` 这类占位键**不是邮箱**，拿去发信只会白跑一轮。
+        # 用 `"@" in key` 一条同时解决两件事。
         emails += [r["key"] for r in led.load()
-                   if not r.get("api_key") and r.get("status") in
-                   ("confirmed", "applied", "approved")]
+                   if r.get("key") and "@" in r["key"] and not r.get("api_key")]
     if not emails:
         ap.error("要么给 --email，要么给 --all-pending")
 

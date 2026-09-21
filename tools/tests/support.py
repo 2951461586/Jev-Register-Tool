@@ -23,7 +23,6 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))          # tools/
 from _bootstrap import ROOT  # noqa: E402,F401  （副作用：把仓库根加进 sys.path）
 
-from src import framer_waitlist as fw  # noqa: E402
 from src import parsing as ps  # noqa: E402
 from src import runner as pl  # noqa: E402
 from src import stages as st  # noqa: E402
@@ -80,12 +79,6 @@ class _FakeTempMailClient:
                 return m
         return None
 
-    def first_mail_matching(self, email, match):
-        for m in type(self).pending:
-            if m.recipient in (email, "*") and match(m):
-                return m
-        return None
-
     def list_mails(self, email=None, limit=None):
         return list(type(self).pending)
 
@@ -94,10 +87,11 @@ class _FakeTempMailClient:
 
 
 class _FakeTypeSafe:
-    """替换 `src.stages.TypeSafeClient`（`runner.claim` 里那份也一起换）。
+    """替换 `src.stages.TypeSafeClient`（`runner` 里那份也一起换）。
 
-    ⚠️ 阶段方法建会话的地方在 `stages`，`claim()` 的 `send_first` 分支在 `runner`
-    —— 两个模块的命名空间**都要**替换，见 `offline()`。
+    ⚠️ 出网符号在**两个**模块的命名空间里各有一份读者 —— 都要替换，
+    见 `offline()` 里的 `_PATCH_TARGETS`。漏一个不会报 ImportError，
+    只会让自测开始发真请求（表现是"突然全线超时"）。
 
     ★ `create_api_key` 把**本会话的邮箱**编进 key 里 —— 这是"串号"检测器：
     如果两个并发 worker 共用了会话对象，返回的 key 里就会是**别人的**邮箱。
@@ -106,6 +100,10 @@ class _FakeTypeSafe:
     callback_status = 200
     callback_body: dict = {}
     fail_key = False
+    #: `complete_onboarding` 的替身行为。默认 True（门禁归零）。
+    #: 置 False 用来测"**门禁没归零但 key 建得出来**"这条新语义
+    #: （2026-09-21 实测：站点把 `/hook` 的重定向当引导用，不是硬门槛）。
+    onboarding_ok = True
 
     def __init__(self, *a, **kw):
         self.email = ""
@@ -141,7 +139,12 @@ class _FakeTypeSafe:
                 "org_memberships": []}
 
     def complete_onboarding(self, display_name="x"):
-        return Result(ok=True, stage="onboarding", data={"completed": []})
+        if type(self).onboarding_ok:
+            return Result(ok=True, stage="onboarding", data={"completed": []})
+        return Result(ok=False, stage="onboarding",
+                      error="遇到不认识的引导步骤 'console-survey'",
+                      data={"completed": [], "gates": ["console-survey"],
+                            "via": [], "stopped": "不认识的引导步骤"})
 
     def create_api_key(self, name="1"):
         if type(self).fail_key:
@@ -150,28 +153,32 @@ class _FakeTypeSafe:
 
 
 #: 出网符号。⚠️ **读**它们的模块不止一个 —— patch 必须覆盖全部读者，见 `offline()`。
-_PATCH_NAMES = ("TypeSafeClient", "TempMailClient", "framer_submit")
+#:
+#: 2026-09-21：`framer_submit` 已从本集合移除 —— 它随 `src/framer_waitlist.py`
+#: 一起删除，`runner` / `stages` 两个命名空间里都不再有这个名字。
+#: 下面的 `assert` 会自动发现"某个符号已经不在任何读者里"这件事。
+_PATCH_NAMES = ("TypeSafeClient", "TempMailClient")
 _PATCH_TARGETS = (pl, st)
 
 
 @contextlib.contextmanager
 def offline(*, ts_status: int = 200, ts_body: dict | None = None,
             fail_key: bool = False, mails: list | None = None,
-            framer_ok: bool = True):
-    """把三个出网点换成替身。退出时**必定**还原。
+            onboarding_ok: bool = True):
+    """把出网点换成替身。退出时**必定**还原。
 
     🔴 为什么必须 patch **两个**模块（2026-09-20 二轮审计 ⑪，拆分 `pipeline` 后）：
     monkeypatch 生效与否只看一件事 —— **读**这个符号的那个模块的 globals。
     拆完之后读者分家了：
 
-        stages.TypeSafeClient   ← stage_login / stage_login_with_token 建会话
-        stages.framer_submit    ← stage_apply 提交申请表单
-        runner.TypeSafeClient   ← claim() 的 `send_first` 分支
+        stages.TypeSafeClient   ← stage_login 建会话（`stage_login_with_token`
+                                   已于 2026-09-21 删除，见 `stages.py` 说明）
         runner.TempMailClient   ← Pipeline.__init__ / _clone() 建邮箱客户端
 
     只 patch 其中一个模块，另一个会静默拿到**真类** ⇒ 自测开始发真请求。
     这种失效**不报 ImportError**，只是突然全线超时，极难定位。
-    ⇒ 下面那个 `assert` 就是接缝守卫：三个符号必须都被覆盖到，少一个立刻炸。
+    ⇒ 下面那个 `assert` 就是接缝守卫：符号集必须与 `_PATCH_NAMES` 完全一致，
+      多一个（某个模块又 import 了已删除的东西）少一个都会立刻炸。
     """
     seams = [(m, n) for m in _PATCH_TARGETS for n in _PATCH_NAMES
              if hasattr(m, n)]
@@ -183,12 +190,10 @@ def offline(*, ts_status: int = 200, ts_body: dict | None = None,
     _FakeTypeSafe.callback_status = ts_status
     _FakeTypeSafe.callback_body = dict(ts_body or {})
     _FakeTypeSafe.fail_key = fail_key
+    _FakeTypeSafe.onboarding_ok = onboarding_ok
     fake = {
         "TypeSafeClient": _FakeTypeSafe,
         "TempMailClient": _FakeTempMailClient,
-        "framer_submit": lambda email, **kw: (
-            {"status": 201, "ok": True, "body": ""} if framer_ok
-            else {"status": 422, "ok": False, "body": "form error"}),
     }
     for m, n in seams:
         setattr(m, n, fake[n])
@@ -227,10 +232,28 @@ def _link_mail(to: str) -> Mail:
                 received_at=1)
 
 
-def _waitlist_mail(to: str) -> Mail:
-    return Mail(id="m-wait", to=to, sender="010001a0bb95b4b5-722f1aae@envelope.updates.typesafe.ai",
-                subject="TypeSafe AI: You\u2019re on the waitlist for Jev!",
-                body="We'll be in touch when it's your turn.", received_at=1)
+def _confirm_mail(to: str) -> Mail:
+    """**主路径凭据邮件** —— 主题与 2026-09-21 实测逐字一致。
+
+    它取代了旧的 `_waitlist_mail`（"You're on the waitlist"，申请回执）。
+    邀请制取消后 `/login` 提交邮箱直接回这一封，所以它现在既是"注册确认"
+    也是"登录凭据来源"，一个替身覆盖两件事。
+    """
+    return Mail(id="m-confirm", to=to,
+                # 🔴 sender 里的域名是**我们的收信域**，不是站点的 —— 站点把
+                #    `bounces+<id>-<hash>-x=<我们的域>@em5082.typesafe.ai` 作为
+                #    信封发件人。这里换成文档用假域（`example-mail.test`），
+                #    避免把自有域名写进公开仓库；规则只按**主题**匹配，
+                #    所以 sender 的具体值不影响本夹具的有效性。
+                sender="bounces+17391058-efc7-x=example-mail.test@em5082.typesafe.ai",
+                subject="Welcome to TypeSafe \u2014 confirm your email",
+                body="Welcome to TypeSafe\n"
+                     "Click the button below to finish creating your account. "
+                     "Your link expires in 7 days.\n"
+                     "https://login.typesafe.ai/v1/magic_links/redirect?"
+                     "public_token=public-token-live-x&stytch_token_type=magic_links"
+                     "&token=FAKETOKEN",
+                received_at=1)
 
 
 def _tmp_ledger() -> Ledger:

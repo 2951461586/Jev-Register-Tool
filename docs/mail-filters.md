@@ -1,33 +1,41 @@
 # 收件过滤规则
 
 > 格式对齐同机 OpenXLab 项目的做法：**信封发件人子串做第一道过滤，主题子串做第二道。**
-> 实现：`src/mailrules.py`　自测：`tools/selftest.py`（`[收件规则 mailrules]` 段 21 项，
-> `[OTP 抽取（锚定 / 降级）]` 段 10 项；全套 188 项 —— 以 `$PY tools/selftest.py`
-> 末行的 `通过 N / 失败 0` 为准，本文不重复维护这个数字的副本）
+> 实现：`src/mailrules.py`　自测：`tools/selftest.py`（`[收件规则 mailrules]` 段，
+> 全套 186 项 —— 以 `$PY tools/selftest.py` 末行的 `通过 N / 失败 0` 为准，
+> 本文不重复维护这个数字的副本）
 
 ## 1. 为什么要两道过滤
 
-实测（2026-09-20，Worker 窗口内 100 封）拿到的**信封发件人**分布：
+### 🔴 核心事实（历史，但**这条设计理由长期有效**）
 
-| 信封发件人 | 封数 | 主题 |
-|---|---:|---|
-| `envelope.updates.typesafe.ai` | 15 | `TypeSafe AI: Your account is ready` ← **获批** |
-| `envelope.updates.typesafe.ai` | 9 | `TypeSafe AI: You're on the waitlist for Jev!` ← **申请确认** |
-| `em5082.typesafe.ai` | 2 | `Welcome to TypeSafe — confirm your email` |
-| `em5082.typesafe.ai` / `pm-bounces.typesafe.ai` | 20 | `Your TypeSafe sign-in code` / `…verification code` |
-| `dm.openxlab.org.cn` | 54 | `【OpenXLab】注册激活` ← 邻居项目 |
-
-### 🔴 核心事实：要区分的这两封，发件人**完全相同**
-
-`Your account is ready`（获批）和 `You're on the waitlist`（申请确认）
-信封发件人**都是** `envelope.updates.typesafe.ai`。
+2026-09-20 实测时，`Your account is ready`（获批）与 `You're on the waitlist`
+（申请确认）两封邮件的**信封发件人完全相同**（都是
+`envelope.updates.typesafe.ai`）。
 
 **只按发件人过滤 ⇒ 会把"你在等待名单上"当成"你已获批"**，
-进而对未获批的账号去跑注册段，拿到 `403 Access restricted` 还以为是白名单问题。
+进而对未获批的账号去跑注册段、拿到 `403 Access restricted` 还以为是白名单问题。
 所以 **subject 是必需的判别位，不是锦上添花**。
 
+> ⚠️ 2026-09-21 邀请制取消后，**这两封邮件都不再产生**
+> （申请与审批两个环节都没了，见 §2 的删除记录）。
+> 上面这段保留是因为它解释**为什么本项目的规则设计始终保留 subject 这一道** ——
+> 站点以后若再引入"同一发件人、不同语义"的邮件，同样的坑会立刻复现。
+>
 > 这也是 OpenXLab 那条规则（`sender_contains="openxlab"`）**不能直接照搬**的原因：
-> 它一类邮件一个域（`dm.openxlab.org.cn`），我们两类邮件共用一个域。
+> 它一类邮件一个域，我们当时两类邮件共用一个域。
+
+### 现在的信封发件人分布（2026-09-21 实测，只剩**事务流**）
+
+| 信封发件人 | 主题 | 归类 |
+|---|---|---|
+| `em5082.typesafe.ai` | `Welcome to TypeSafe — confirm your email` | ★ 主路径唯一凭据（魔法链接） |
+| `em5082.typesafe.ai` / `pm-bounces.typesafe.ai` | `Your TypeSafe sign-in code` / `…verification code` | 兼容分支（6 位码） |
+| `dm.openxlab.org.cn` | `【OpenXLab】注册激活` | 邻居项目，不是我们的 |
+
+> 判据：窗口内若再出现 `envelope.updates.typesafe.ai` 的信，
+> `--mode scan` 会把它列进"漏网主题"（这正是 `diagnose()` 存在的意义），
+> 届时再按实际文案补规则。**不要凭印象把已删规则加回来。**
 
 ### ⚠️ 注意：`sender` 是**信封**发件人，不是人类可读的 From
 
@@ -53,25 +61,28 @@ bounces+<acct>-<shard>-oai-ecc230d8aa7f4bf2=example-mail.test@em5082.typesafe.ai
 
 | 规则名 | 阶段 | `sender_contains` | `subject_contains` | 说明 |
 |---|---|---|---|---|
-| `waitlist_confirm` | 2-confirm | `envelope.updates.typesafe.ai` | `on the waitlist` | 申请确认。正文 "We'll be in touch when it's your turn." —— **不是**获批 |
-| `account_ready` | 3-approved | `envelope.updates.typesafe.ai` | `account is ready` | 🔴 **唯一**能解锁注册段的信号 |
-| `welcome_confirm` | 4-login | `typesafe.ai` | `confirm your email` | Stytch 注册确认信，魔法链接 7 天有效 |
-| `signin_link` | 4-login | `typesafe.ai` | `sign in to typesafe` | 登录魔法链接（`/login` 的 ACTION_2 触发） |
-| `signin_code` | 4-login | `typesafe.ai` | `sign-in code` | 6 位验证码，10 分钟、一次性 |
-| `verify_code` | 4-login | `typesafe.ai` | `verification code` | 验证码的另一种文案，取码时两者都要收 |
+| `welcome_confirm` | 1-signup | `typesafe.ai` | `confirm your email` | ★ **主路径的唯一凭据来源**（2026-09-21 起）。魔法链接 7 天有效 |
+| `signin_link` | 2-login | `typesafe.ai` | `sign in to typesafe` | 登录魔法链接（`/login` 的 ACTION_LINK 触发） |
+| `signin_code` | 2-login | `typesafe.ai` | `sign-in code` | 6 位验证码，10 分钟、一次性 |
+| `verify_code` | 2-login | `typesafe.ai` | `verification code` | 验证码的另一种文案，取码时两者都要收 |
 
-规则里同时写了 `subject_excludes` 做**负对照**，防止一条规则吃掉另一条：
+**已删除的两条（2026-09-21，不是清理而是功能性的）**：
 
-```python
-MailRule(name="account_ready",  subject_contains="account is ready",
-         subject_excludes=("waitlist",))
-MailRule(name="waitlist_confirm", subject_contains="on the waitlist",
-         subject_excludes=("account is ready",))
-```
+| ~~规则名~~ | ~~阶段~~ | ~~说明~~ |
+|---|---|---|
+| ~~`waitlist_confirm`~~ | ~~2-confirm~~ | 申请确认。邀请制取消后不再产生 |
+| ~~`account_ready`~~ | ~~3-approved~~ | 曾是**唯一**能解锁注册段的信号；"获批"事件已不存在 |
+
+连同它们的发件人常量 `SENDER_UPDATES = "envelope.updates.typesafe.ai"` 一起删除。
+🔴 **留着它们的危害是"让人以为链路还有等待段"** —— 排查会被引向
+"为什么没收到获批邮件"，而那个问题已经没有答案了。
+护栏：`tools/tests/test_mailrules.py` 有两条**负向断言**，规则名与常量都不许回归。
 
 ## 3. 两个已踩的坑
 
-### 3.1 主题里是**弯引号** U+2019
+### 3.1 主题里可能有**弯引号** U+2019
+
+实例（来自已删除的营销流文案，但**坑与邀请制无关、长期有效**）：
 
 ```
 TypeSafe AI: You’re on the waitlist for Jev!
@@ -80,12 +91,16 @@ TypeSafe AI: You’re on the waitlist for Jev!
 
 按 `you're`（直引号）匹配**永远不中**。所以规则只用无标点片段
 （`on the waitlist`），并在匹配前做一次 `NFKC` 归一化兜底。
-自测里有负对照钉住这一点：
+自测里有负对照钉住这一点（`test_mailrules` 第 ② 组）：
 
 ```
 ✓ [负对照] 直引号 you're 匹配不到弯引号 You’re
 ✓ 无标点片段 on the waitlist 能中
 ```
+
+> ⚠️ 这两条断言的**样本主题**取自已删除的营销流邮件。保留它们不是恋旧 ——
+> 站点文案里出现 U+2019 是**实测过的行为**，而 `subject_ok` 是公用工具函数。
+> 断言的对象是"归一化逻辑"，不是那封邮件。
 
 ### 3.2 别用正则，用子串
 
@@ -95,9 +110,10 @@ TypeSafe AI: You’re on the waitlist for Jev!
 ## 4. 用法
 
 ```python
-from src.mailrules import RULES, CODE_RULES, LINK_RULES, get, any_of, classify, diagnose, sender_ok
+from src.mailrules import (RULES, CODE_RULES, LINK_RULES, get, any_of,
+                           classify, diagnose, sender_ok)
 
-rule = get("account_ready")
+rule = get("welcome_confirm")
 if rule.matches(mail): ...          # 规则对象本身可直接当谓词
 
 # 并集：取 6 位码时两条规则都要收。
@@ -105,18 +121,19 @@ if rule.matches(mail): ...          # 规则对象本身可直接当谓词
 #    收名字会让"哪些规则算码"出现两份定义，加规则时改一边漏一边。
 MATCH_CODE = any_of(*CODE_RULES)
 
-classify(mail)      # -> "account_ready" / "unknown"
+classify(mail)      # -> "welcome_confirm" / "signin_code" / "unknown"
 sender_ok(mail)     # 只按发件人：用来把"不是我们的"与"是我们的但主题不认识"分开
 ```
 
 `stages.py` 里已统一改为读规则表，不再散落 subject 子串：
 
 ```python
-MATCH_WAITLIST_CONFIRM = get_rule("waitlist_confirm")
-MATCH_ACCOUNT_READY    = get_rule("account_ready")
-MATCH_CODE             = any_of(*CODE_RULES)     # ← 分组只有这一处定义
-MATCH_LINK             = any_of(*LINK_RULES)
+MATCH_CODE = any_of(*CODE_RULES)     # ← 分组只有这一处定义
+MATCH_LINK = any_of(*LINK_RULES)     # ← 主路径用它（welcome_confirm / signin_link）
 ```
+
+> 2026-09-21 起 `stages` 里不再有 `MATCH_WAITLIST_CONFIRM` / `MATCH_ACCOUNT_READY`
+> —— 它们随申请/审批两段一起删除。主路径只需 `MATCH_LINK`。
 
 ## 5. 漏网主题必须显式报出来
 
@@ -125,16 +142,23 @@ MATCH_LINK             = any_of(*LINK_RULES)
 
 ```
 $ python tools/run_e2e.py --mode scan
-  · waitlist_confirm      9 封   [2-confirm]
-  ★ account_ready        15 封   [3-approved]
-  · welcome_confirm       2 封   [4-login]
-  · signin_code           9 封   [4-login]
-  · signin_link           0 封   [4-login]
-  · verify_code          11 封   [4-login]
+窗口 100 封，时间跨度 37.4 分钟（服务端保留最近 100 行，超出即删）
+发件人过滤：sender 含 typesafe.ai（规则表逐条见 src/mailrules.py）
+
+  ★ welcome_confirm      2 封   [1-signup]
+  · signin_link          0 封   [2-login]
+  · signin_code          9 封   [2-login]
+  · verify_code         11 封   [2-login]
 
   邻居项目/无关邮件（发件人不含 typesafe.ai）：54 封
+
   ✓ 没有漏网主题：窗口内所有 TypeSafe 邮件都被规则覆盖
 ```
+
+> ⚠️ 上面是**格式示例**，不是某一次真实运行的输出（数字会随窗口内容变）。
+> 行序 = `mailrules.RULES` 的顺序；`★` 固定落在 `welcome_confirm` 上
+> （`cmd_scan` 里写死这一个名字）—— 2026-09-21 起它是**主路径的唯一入口凭据**，
+> 该标记此前落在已删除的 `account_ready` 上。
 
 **判据**：`--mode scan` 报出漏网主题 ⇒ 站点改了文案，去更新规则表；
 报 `✓ 没有漏网主题` 却仍然拿不到码 ⇒ 问题在别处（配额、窗口、发信失败）。

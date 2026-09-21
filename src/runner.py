@@ -1,28 +1,36 @@
-"""端到端编排：申请 → 确认邮件 → 注册 → 创建 API Key → 入库。
+"""端到端编排：注册 → 登录 → 创建 API Key → 入库。
 
 阶段与可自动化程度（实测结论，不是推断）：
 
-    1. apply       建临时邮箱 + 提交 Framer waitlist 表单          ✅ 全自动
-    2. confirm     收 "You're on the waitlist" 确认邮件            ✅ 全自动
-    3. approved    收 "Your account is ready"（邀请获批）           ❌ **人工/批量审批**
-    4. login       /login 发码 → 收码 → POST /api/auth/callback     ✅ 全自动（但需 3 已过）
-    5. onboarding  /setup/tos → set-name → console-survey          ✅ 全自动（但需 3 已过）
-    6. api_key     POST /api/api-keys                              ✅ 全自动（但需 3 已过）
-    7. store       写入 JSONL 台账                                  ✅ 全自动
+    1. signup      建临时邮箱 + POST /login 发确认邮件              ✅ 全自动
+    2. login       收邮件 → 魔法链接换 token → POST /api/auth/callback  ✅ 全自动
+    3. onboarding  /setup/tos → /setup/set-name（站点门禁驱动）      ✅ 全自动
+    4. api_key     POST /api/api-keys                              ✅ 全自动
+    5. store       写入 JSONL 台账                                  ✅ 全自动
 
-第 3 阶段是本链路的**唯一外部阻断点**：TypeSafe 是邀请制，未被邀请的邮箱在第 4 阶段
-拿到 `403 {"error":"Access restricted"}`（前端文案 "TypeSafe is currently invite-only"）。
-这个门槛在服务端，客户端无法绕过。因此：
+2026-09-21：链路**没有外部阻断点了**
+────────────────────────────────────
+旧链路在第 3 阶段有个硬门槛：TypeSafe 是邀请制，未获批的邮箱会拿到
+`403 Access restricted`，只能等人工/批量审批 ⇒ 跑批必须拆成
+"投申请（apply）"和"对已获批邮箱跑后续（resume）"两个模式，再加一个
+`watch`（监听获批邮件自动续跑）。
 
-- `--mode apply`    只跑到第 2 阶段，用来批量投递申请
-- `--mode resume`   对**已获批**的邮箱跑 4→7
-- 默认全链路        跑到第 3 阶段停住，如实报告 `invite_only`
+取消邀请制后 `/login` 提交邮箱**直接**发确认邮件、回调直接 200
+⇒ 全链路**无人值守可跑**：
+
+    旧：apply → confirm → approved(❌人工) → login → onboarding → api_key
+    新：signup+login → onboarding → api_key
+
+⇒ 随之删除三样东西（都是"为等待而存在"的机制）：
+  · `--mode apply`（申请段本身没了）
+  · `watch()`（不再需要"等获批邮件"；它读全表共享窗口，是纯负债）
+  · `claim()`（两进程人工接力，**2026-09-20 已实测失效**：`--send` 与 `--token`
+    各建会话、无传递 ⇒ 必报 `401 Code expired`）
 
 并发的边界（`--concurrency`）
 ──────────────────────────
-申请段与注册段**每个账号只读自己的收件箱索引端点**，彼此独立，可以并发。
-`watch` 读的是**全表共享窗口**（Worker retention 只有 100 行），并发读只会互相挤，
-必须保持串行 —— 见 `watch()` 的说明。
+每个账号只读**自己的**收件箱索引端点（`/api/inbox?email=`），彼此独立，可以并发。
+默认仍是 1（串行）—— 站点侧对"短时间大量发信"的容忍度未知，小批试跑更稳。
 
 ⚠️ 并发的前置条件是"**不共享可变状态**"：本模块以前把会话 client 挂在
 `self.client` 上（串行看不出问题，并发会**串号** —— A 账号的 api_key 建在 B 的会话上）。
@@ -35,13 +43,12 @@
     result/success.jsonl    成功数据：**只记拿到 key 的**，是交付物
 
 成功那份在 `stage_create_key()` 里写 —— 那是**唯一**产出 key 的地方，
-挂在那里就自动覆盖了全部四条路径（`run_batch` / `resume` / `watch` / `claim`）。
+挂在那里就自动覆盖了全部调用路径（`run_batch` / `resume`）。
 """
 
 from __future__ import annotations
 
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable
 
@@ -50,10 +57,14 @@ from .ledger import Ledger
 # 🔴 `AccountRecord` 刻意定义在 `stages`（不在本模块）：依赖必须单向
 #    runner → stages，反过来就成环了。这里导入是为了让 `from src.runner import
 #    AccountRecord` 继续可用（生产与自测都这么引）。
-from .stages import (CONFIRM_TIMEOUT, MATCH_ACCOUNT_READY, AccountRecord,
-                     StageMixin)
+from .stages import MAIL_TIMEOUT, AccountRecord, StageMixin
 from .tempemail import TempMailClient, TempMailError
-from .typesafe import MODE_CODE, MODE_LINK, TypeSafeClient, TypeSafeError
+# ⚠️ 本模块只留 `MODE_CODE` —— 它是 `Pipeline.__init__` 的默认值。
+# `MODE_LINK` 与 `TypeSafeClient` / `TypeSafeError` 曾经因为 `claim()` 的
+# `send_first` 分支而出现在这里；`claim()` 删除后它们在本模块**零引用**，
+# 已一并移除（死符号扫描会报，且它们正是"runner 也发请求"这个错误印象的来源 ——
+# 出网动作**全部**在 stages）。
+from .typesafe import MODE_CODE
 
 # 与 `stages.py` 的分工见该文件头部。**本模块不写任何出网动作**（出网全在
 # stages），只负责：建实例、并发扇出、写台账、以及 `claim` 里"先发码"那一步
@@ -151,20 +162,16 @@ class Pipeline(StageMixin):
         return rec
 
     # ── 全链路 ────────────────────────────────────────────────────────
-    def run_one(self, *, email: str = "", mode: str = "full",
-                approval_timeout: float = 0.0,
-                confirm_timeout: float = CONFIRM_TIMEOUT,
+    def run_one(self, *, email: str = "", mail_timeout: float = MAIL_TIMEOUT,
                 name: str = "1") -> AccountRecord:
+        """跑一个账号：注册 → 登录 → onboarding → 建 key。
+
+        `email` 为空时由 `stage_login` 现场建一个临时邮箱（这是默认用法，
+        取代了旧链路里 `stage_apply` 的建邮箱职责）。
+        """
         rec = AccountRecord(key=email, email=email)
         try:
-            if mode in ("full", "apply"):
-                if not self.stage_apply(rec, confirm_timeout=confirm_timeout):
-                    return rec
-                if mode == "apply":
-                    return rec
-            if not self.stage_wait_approval(rec, timeout=approval_timeout):
-                return rec
-            cl = self.stage_login(rec)
+            cl = self.stage_login(rec, mail_timeout=mail_timeout)
             if cl is None:
                 return rec
             self.stage_create_key(rec, cl, name=name)
@@ -176,149 +183,76 @@ class Pipeline(StageMixin):
             rec.error = f"{type(exc).__name__}: {exc}"
         return rec
 
-    def run_batch(self, *, count: int = 1, mode: str = "full",
-                  approval_timeout: float = 0.0,
-                  confirm_timeout: float = CONFIRM_TIMEOUT,
-                  name: str = "1",
-                  concurrency: int = 1) -> list[AccountRecord]:
+    def run_batch(self, *, count: int = 1, name: str = "1",
+                  concurrency: int = 1,
+                  mail_timeout: float = MAIL_TIMEOUT) -> list[AccountRecord]:
+        """建 `count` 个新邮箱，各跑一遍全链路。
+
+        旧签名里有 `mode` / `approval_timeout` / `confirm_timeout` 三个参数
+        （分别用于"只投申请"与"等审批"），随邀请制取消一并删除。
+        """
         def job(pipe: "Pipeline", i: int) -> AccountRecord:
             pipe.log(f"[{i + 1}/{count}] 开始")
-            rec = pipe.run_one(mode=mode, approval_timeout=approval_timeout,
-                               confirm_timeout=confirm_timeout, name=name)
+            rec = pipe.run_one(mail_timeout=mail_timeout, name=name)
             pipe.ledger.append(rec.to_dict())
             pipe.log(f"[{i + 1}/{count}] status={rec.status} {rec.error}")
             return rec
 
         return self._fan_out([(i, job) for i in range(count)], concurrency=concurrency)
 
-    # ── 人工接力：用外部提供的验证码/魔法链接 token 直接领号 ──────────
-    def claim(self, email: str, token: str, *, kind: str = "otp",
-              name: str = "1", send_first: bool = False) -> AccountRecord:
-        """对单个**已获批**邮箱完成 4→7。
-
-        send_first=True 时先触发一次发码（发到该邮箱），调用方拿到码后再用
-        token 调一次（不带 send_first）。这样把"发码"和"提交"解耦，
-        便于人工在两个动作之间去邮箱里取码。
-
-        🔴 **这个"两进程"用法实测失效（2026-09-20）**：`--send` 与 `--token`
-        是两个独立进程，各自 `TypeSafeClient()`，**中间没有任何会话传递** ⇒
-        实测**码到 2 分钟内提交仍报 `401 Code expired`**。
-        而 runbook §4.2 对该错误码的处置是"重新发码" ⇒ **把人推回死循环**。
-
-        ⇒ **邮箱在 Worker 覆盖域内时用 `resume()`**（同一进程内发码+收码+提交，
-        会话连续，实测正常）。`claim` 只留给"真人邮箱、Worker 读不到"这一种场景，
-        且那条路当前是坏的 —— 根因候选与验证方法见 `docs/runbook.md` §1.5。
-        """
-        rec = AccountRecord(key=email, email=email)
-        if send_first:
-            try:
-                r = TypeSafeClient().send_login_email(
-                    email, mode=MODE_CODE if kind == "otp" else MODE_LINK)
-            except TypeSafeError as exc:
-                self._fail(rec, "send_code", f"发码失败: {exc}")
-                self.ledger.append(rec.to_dict())
-                return rec
-            if not r.ok:
-                self._fail(rec, "send_code", f"发码 HTTP {r.status}")
-                self.ledger.append(rec.to_dict())
-                return rec
-            rec.stages["send_code"] = "ok"
-            self.log(f"  [send-code] 已向 {email} 发出"
-                     f"{'6 位验证码' if kind == 'otp' else '魔法链接'}（10 分钟有效）")
-            if not token:
-                rec.status = "code_sent"
-                self.ledger.append(rec.to_dict())
-                return rec
-        if not token:
-            self._fail(rec, "login", "缺少 token（验证码或魔法链接 token）")
-            self.ledger.append(rec.to_dict())
-            return rec
-        cl = self.stage_login_with_token(rec, token, kind=kind)
-        if cl is not None:
-            self.stage_create_key(rec, cl, name=name)
-        self.ledger.append(rec.to_dict())
-        return rec
-
     def resume(self, emails: list[str], *, name: str = "1",
-               concurrency: int = 1) -> list[AccountRecord]:
-        """对已获批的邮箱跑 4→7，全程零申请请求。"""
+               concurrency: int = 1,
+               mail_timeout: float = MAIL_TIMEOUT,
+               skip_keyed: bool = True) -> list[AccountRecord]:
+        """对**已知邮箱**跑全链路（不新建邮箱）。
+
+        与 `run_batch` 的唯一区别是邮箱来源：这里用调用方给的地址，
+        所以同一个地址可以**反复重跑** —— 站点发信存在丢包，
+        而魔法链接 7 天有效，重跑往往比改请求更有效。
+
+        🔴 `skip_keyed=True`（默认）跳过台账里**已有 api_key** 的地址。
+        这不是优化，是数据完整性：重跑会给同一账号**造出第二把 key**，
+        两把在服务端都有效，但 `Ledger.load()` 按邮箱去重、**末行胜出**
+        ⇒ 交付物里少一把（不报错，只是行数不对）。
+        这条保护原先长在 `watch()` 里，`watch()` 删除后移到这里 ——
+        它是 `resume` 唯一的"会重复调用"入口，所以必须由它兜住。
+        要**故意**重跑（例如换 key 名）时显式传 `skip_keyed=False`。
+        """
+        have_key = ({r["email"] for r in self.ledger.load() if r.get("api_key")}
+                    if skip_keyed else set())
+        todo: list[str] = []
+        for e in emails:
+            if e in have_key:
+                self.log(f"[resume] 跳过 {e}（台账里已有 api_key，"
+                         f"重跑会造第二把 key；确需重跑请传 skip_keyed=False）")
+                continue
+            todo.append(e)
 
         def job(pipe: "Pipeline", email: str) -> AccountRecord:
             rec = AccountRecord(key=email, email=email)
             pipe.log(f"[resume] {email}")
-            cl = pipe.stage_login(rec)
+            cl = pipe.stage_login(rec, mail_timeout=mail_timeout)
             if cl is not None:
                 pipe.stage_create_key(rec, cl, name=name)
             pipe.ledger.append(rec.to_dict())
             pipe.log(f"[resume] status={rec.status} {rec.error}")
             return rec
 
-        return self._fan_out([(e, job) for e in emails], concurrency=concurrency)
+        return self._fan_out([(e, job) for e in todo], concurrency=concurrency)
 
-    # ── 监听：获批即自动续跑 ──────────────────────────────────────────
-    def watch(self, *, timeout: float = 600.0, interval: float = 15.0,
-              name: str = "1", known: list[str] | None = None) -> list[AccountRecord]:
-        """轮询邮箱池，一旦出现"获批"邮件就立刻对该地址跑 4→7。
-
-        **不依赖台账里的地址**：直接扫 Worker 窗口内**所有**邮件，
-        这样即使申请是在别处（网页 UI）提交的，也能接上。
-
-        🔴 **本方法是刻意串行的，不要给它加并发。**
-        它读的是**全表共享窗口**（`scan_all` → `/admin/all`，retention 只有 100 行，
-        且被同机邻居项目刷屏）。并发读不会更快，只会互相抢同一批行，
-        还会放大 D1 读配额消耗。要提速就缩短 `interval`，不是加线程。
-        """
-        deadline = time.time() + timeout
-        known_recs = self.ledger.load()
-        watched = set(known or [])
-        watched |= {r["email"] for r in known_recs if r.get("email")}
-        # 🔴 已经有 key 的地址直接跳过。`watch` 读的是**全表窗口**，旧批次的
-        # 获批邮件会在窗口里停留很久（窗口只受 100 行条数限制），重复处理
-        # 会给同一账号**造出第二把 key** —— 两把在服务端都有效，但
-        # `Ledger.load()` 按邮箱去重、末行胜出，交付物里就会少一把。
-        have_key = {r["email"] for r in known_recs if r.get("api_key")}
-        done: set[str] = set()
-        results: list[AccountRecord] = []
-        self.log(f"[watch] 监听 {timeout:.0f}s，间隔 {interval:.0f}s，"
-                 f"已知候选 {len(watched)} 个地址")
-
-        round_no = 0
-        while time.time() < deadline:
-            round_no += 1
-            try:
-                all_msgs = self.mail.scan_all()
-            except TempMailError as exc:
-                self.log(f"[watch] #{round_no} 读邮箱失败：{exc}")
-                time.sleep(interval)
-                continue
-
-            ready = [m for m in all_msgs if MATCH_ACCOUNT_READY(m)]
-            if ready:
-                self.log(f"[watch] #{round_no} 命中 {len(ready)} 封获批邮件")
-            for m in ready:
-                addr = m.recipient
-                if addr in done:
-                    continue
-                if addr in have_key:
-                    self.log(f"[watch] 跳过 {addr}（台账里已有 api_key，不重复建）")
-                    done.add(addr)
-                    continue
-                done.add(addr)
-                self.log(f"[watch] ★ 获批：{addr} —— 立刻续跑 4→7")
-                rec = AccountRecord(key=addr, email=addr)
-                rec.waitlist["ready_subject"] = m.subject
-                rec.waitlist["ready_at"] = m.received_at
-                rec.status = "approved"
-                rec.stages["approved"] = "ok"
-                cl = self.stage_login(rec)
-                if cl is not None:
-                    self.stage_create_key(rec, cl, name=name)
-                self.ledger.append(rec.to_dict())
-                results.append(rec)
-                self.log(f"[watch] {addr} -> status={rec.status} {rec.error}")
-
-            if not ready:
-                self.log(f"[watch] #{round_no} 窗口 {len(all_msgs)} 封，暂无获批邮件"
-                         f"（剩 {max(0, deadline - time.time()):.0f}s）")
-            time.sleep(interval)
-        return results
+    # ⚠️ `claim()` 与 `watch()` 已删除（2026-09-21，随邀请制取消）
+    # ────────────────────────────────────────────────────────────────
+    # 两个方法都是"为等待而存在"的机制，链路全自动之后它们只剩负债：
+    #
+    #   claim()  两进程人工接力（--send 发码 / --token 提交）。**2026-09-20 已实测失效**：
+    #            两个进程各自建 TypeSafeClient、中间没有任何会话传递 ⇒ 码到 2 分钟内
+    #            提交仍报 401 Code expired，而 runbook 对该码的处置是"重新发码"
+    #            ⇒ 把人推回死循环。它当时只对"真人邮箱、Worker 读不到"一种场景有意义。
+    #
+    #   watch()  轮询**全表共享窗口**找"获批邮件"并自动续跑。取消邀请制后
+    #            "获批"这个事件不再存在；而它读的是 /admin/all 全表（retention 100 行、
+    #            被同机邻居项目刷屏），是纯粹的配额负债。
+    #
+    # 连带删除：`stages.stage_login_with_token()` —— 它是 `claim()` 的 `--token`
+    # 分支唯一的落点，`claim()` 一走它就无入口了（细节与回滚路径见 `stages.py`
+    # 里那段说明）。需要"人工粘凭据"时改用 `resume`：魔法链接 7 天有效。

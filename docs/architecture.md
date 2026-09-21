@@ -22,36 +22,41 @@ Jev-Register-Tool/
 │   ├── mailrules.py           收件规则表 + OTP 抽取（纯叶子，零内部依赖）
 │   ├── ledger.py              JSONL 台账：并集合并 / 幂等 / 等级语义
 │   ├── tempemail.py           CF Temp Email Worker 客户端
-│   ├── framer_waitlist.py     Framer 表单申请（含 PoW 复刻）
 │   ├── parsing.py             页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 魔法链接）
 │   │                          **纯函数、零第三方依赖** ⇒ 可脱离 `requests` 单测
 │   ├── typesafe.py            Server Action / Stytch / onboarding / 建 Key（只发 HTTP）
 │   ├── stages.py              ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord`
-│   │                          出网动作**全在这里**：apply / login / onboarding / 建 Key
-│   └── runner.py              ★ `Pipeline`：批量 / 并发 / 监听 / 人工接力 / 台账写入
+│   │                          出网动作**全在这里**：login / onboarding / 建 Key
+│   └── runner.py              ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入
 │                              继承 `stages.StageMixin`；`stages` **不**反向依赖它
 │
 ├── tools/                     入口脚本（含命令行逻辑）
 │   ├── _bootstrap.py          按标记文件定位仓库根，统一 sys.path
-│   ├── run_e2e.py             ★ 主入口：apply / watch / resume / claim / scan
+│   ├── run_e2e.py             ★ 主入口：full / resume / scan（+ --doctor）
+│   ├── relogin_pending.py     对没拿到 key 的地址**重新发一封**确认邮件，
+│   │                          并把历史链接一起用（魔法链接 7 天有效）
 │   ├── resume_pending.py      ★ 补跑台账里还没拿到 key 的账号（幂等）。进度计数
 │   │                          **只信它** —— 走 `Ledger.load()` 合并视图，
 │   │                          不是"末行胜出"（那会让重跑失败把计数压低）
 │   ├── normalize_ledger.py    修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-│   ├── selftest.py            自测**入口**（112 行）：只做聚合与调度 + 登记完整性元检查
-│   ├── tests/                 自测本体（6 个文件 1425 行，按被测对象分）
+│   ├── selftest.py            自测**入口**（119 行）：只做聚合与调度 + 登记完整性元检查
+│   ├── tests/                 自测本体（6 个文件 1511 行，按被测对象分）
 │   │   ├── __init__.py        仅为让 `tests` 可当包导入（**不是** pytest 测试包）
 │   │   ├── support.py         共享夹具：`check()` 计数 + 离线替身 + 模块别名转手
-│   │   ├── test_parsing.py    解析层：PoW / 紧凑 JSON / Server Action / JS 字面量
+│   │   ├── test_parsing.py    解析层：紧凑 JSON / Server Action / JS 字面量
 │   │   ├── test_ledger.py     台账：并集合并 / 状态词汇 / 身份字段归一化
 │   │   ├── test_mailrules.py  收件规则 + OTP 抽取
-│   │   └── test_orchestration.py  编排层：错误码分流 / 申请 / 登录 / 监听 / 并发
+│   │   └── test_orchestration.py  编排层：错误码分流 / 登录 / 门禁 / 并发 / 重跑去重
 │   ├── verify_keys.py         ★ 验收：真打一次推理接口 + 导出可用凭据
 │   └── probes/                一次性诊断探针（不参与主流程）
 │       ├── audit_keys_against_site.py  站点侧对账：`GET /api/api-keys` vs 交付物
-│       ├── probe_confirm.py          单看"确认邮件"那一步的每跳原始响应
-│       ├── probe_confirm_flow.py     干净实验：先确认再回调，用状态码判假设
+│       ├── probe_gate_chain.py       ★ 逐跳走 onboarding 门禁，打完整链路 + 试建 key
+│       ├── probe_confirm.py          单看"魔法链接"那一步的每跳原始响应
+│       ├── probe_login_shape.py      /login 页渲染形态（只 GET，不发信）
+│       ├── probe_new_login_flow.py   发信 → 收信：凭据到底是链接还是码
+│       ├── probe_full_new_flow.py    一次跑完（自建邮箱，不依赖台账）
 │       ├── probe_onboarding.py       探 /setup/* 的 Server Action 形态（--post 才发请求）
+│       ├── probe_onboarding_state.py /probe_onboarding_state2.py  门禁页形态快照
 │       ├── probe_worker_health.py    Worker /health + D1 连通性（只读）
 │       ├── probe_email_routing.py    查各域名在 Worker 上的收信路由（只读）
 │       └── verify_bodycandidates.mjs Node 回归台：把 Worker bundle 驱动到落库那一步
@@ -88,8 +93,8 @@ Jev-Register-Tool/
 
 **`exports/` 与 `result/` 的边界**：台账要留**全部**尝试（含失败的，便于复盘），
 交付物只该有成功的。写入口刻意选在 `stage_create_key()` —— 那是**唯一**产出 key
-的地方，挂在那里就自动覆盖全部四条路径（`run_batch` / `resume` / `watch` / `claim`），
-不需要在四个调用点各写一遍（那种写法迟早漏一处）。
+的地方，挂在那里就自动覆盖全部两条路径（`run_batch` / `resume`），
+不需要在两个调用点各写一遍（那种写法迟早漏一处）。
 🔴 `result/` 必须**显式**写进 `.gitignore`：`*.txt` 没有任何通配规则覆盖，
 `*.json` / `*.jsonl` 挡不住 `result/keys.txt` 里的明文 Key。
 
@@ -97,22 +102,21 @@ Jev-Register-Tool/
 
 | 模块 | 行数 | 职责 | 内部依赖 |
 |---|---:|---|---|
-| `config.py` | 121 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` 启动校验 | 无 |
-| `mailrules.py` | 289 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
-| `ledger.py` | 232 | 台账读写、并集合并、等级语义 | 无 |
+| `config.py` | 117 | 常量集中地 + `.env` 加载 + `validate()` / `validate_cf()` 启动校验 | 无 |
+| `mailrules.py` | 288 | 收件规则表 + `extract_otp()`（锚定/降级） | **无**（纯 stdlib） |
+| `ledger.py` | 244 | 台账读写、并集合并、等级语义 | 无 |
 | `parsing.py` | 150 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
-| `tempemail.py` | 188 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
-| `framer_waitlist.py` | 97 | 申请表单 + PoW | `config` |
-| `typesafe.py` | 442 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
-| `stages.py` | 417 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` `framer_waitlist` |
-| `runner.py` | 324 | ★ `Pipeline`：批量 / 并发 / 监听 / 台账写入 | `config` `ledger` `stages` `tempemail` `typesafe` |
-| `run_e2e.py` | 288 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `tempemail` `mailrules` |
-| `selftest.py` | 112 | 自测**入口**：按顺序调用 `tests/` 下 23 个 `test_*` + 登记完整性元检查 | `tests.*` |
-| `tests/support.py` | 237 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
-| `tests/test_parsing.py` | 143 | 解析层 4 组（PoW / 紧凑 JSON / Server Action / JS 字面量） | `support` |
+| `tempemail.py` | 183 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
+| `typesafe.py` | 551 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
+| `stages.py` | 418 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` |
+| `runner.py` | 258 | ★ `Pipeline`：批量 / 并发 / 补跑 / 台账写入 | `config` `ledger` `stages` `tempemail` |
+| `run_e2e.py` | 211 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `stages` |
+| `selftest.py` | 119 | 自测**入口**：按顺序调用 `tests/` 下 22 个 `test_*` + 登记完整性元检查 | `tests.*` |
+| `tests/support.py` | 255 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
+| `tests/test_parsing.py` | 129 | 解析层 3 组（紧凑 JSON / Server Action / JS 字面量） | `support` |
 | `tests/test_ledger.py` | 224 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化 + 交付物自证） | `support` |
-| `tests/test_mailrules.py` | 118 | 收件规则 + OTP 抽取 | `support` |
-| `tests/test_orchestration.py` | 698 | 编排层 14 组（错误码分流 / 申请 / 登录 / 监听 / setup 降级 / 并发…） | `support` |
+| `tests/test_mailrules.py` | 105 | 收件规则 + OTP 抽取 | `support` |
+| `tests/test_orchestration.py` | 793 | 编排层 14 组（错误码分流 / 登录 / 门禁 / setup 降级 / 并发…） | `support` |
 | `verify_keys.py` | 192 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
@@ -125,6 +129,10 @@ Jev-Register-Tool/
 > ⚠️ 上一版这张表没有写明度量方式，于是同一个文件在不同文档里出现
 > **差 1 的两组数字**（`wc -l` vs `行数 = src.count("\n") + 1`）——
 > 又一个"没写清楚就没法复算"的例子。**以本命令的输出为准。**
+>
+> 🔴 `src/__init__.py`（40 行）与 `tests/__init__.py`（5 行）刻意**不进表**：
+> 它们是包声明与模块清单，没有"职责"可言，放进来只会稀释这张表的信号。
+> 复算总行数时要把它们算上（`wc -l` 会算），所以**总行数与表内之和本来就不等**。
 
 ## 3. 依赖分层（AST 实测）
 
@@ -138,50 +146,49 @@ Jev-Register-Tool/
                       │           src/runner.py（`Pipeline`）           │
                       │                  │ 继承 `StageMixin`            │
 第 1.5 层 阶段        │           src/stages.py（**出网动作全在这里**） │
-                      └─┬──────┬──────┬──────┬──────┬──────────────────┘
-                        │      │      │      │      │
-第 1 层   叶子      mailrules ledger tempemail framer  typesafe
-                        │      │      │   waitlist     │
-                        │      │      │      │         ▼
-第 0.5 层              │      │      │      │      parsing       ← 纯函数、
-                        │      │      │      │         │            零第三方依赖
-第 0 层   配置        └──────┴──────┴──────┴─────────┴── src/config.py
+                      └─┬──────┬──────┬──────┬─────────────────────────┘
+                        │      │      │      │
+第 1 层   叶子      mailrules ledger tempemail typesafe
+                        │      │      │         │
+                        │      │      │         ▼
+第 0.5 层              │      │      │      parsing       ← 纯函数、
+                        │      │      │         │            零第三方依赖
+第 0 层   配置        └──────┴──────┴─────────┴── src/config.py
 ```
 
 **被依赖次数**（越大越底层，改动越要谨慎）：
 
 | 模块 | 被依赖 | 说明 |
 |---|---:|---|
-| `config` | 15 | 常量集中地。改它要跑全量自测 |
+| `config` | 16 | 常量集中地。改它要跑全量自测 |
+| `parsing` | 12 | 解析层。**纯函数、不依赖 `requests`** ⇒ 可以脱离网络单测 |
+| `typesafe` | 11 | 登录链路（阶段层与 4 个探针都直引） |
+| `tempemail` | 10 | 收信唯一入口 |
 | `ledger` | 7 | 台账唯一写入口 |
-| `parsing` | 6 | 解析层。**纯函数、不依赖 `requests`** ⇒ 可以脱离网络单测 |
-| `tempemail` | 6 | 收信唯一入口 |
-| `typesafe` | 5 | 登录链路 |
+| `runner` | 6 | CLI + 自测 + 探针（原 `pipeline` 的调度半边） |
+| `stages` | 5 | 阶段层；被 `runner` + CLI + 探针引用 |
 | `mailrules` | 5 | 规则表 + OTP 抽取；**纯叶子**，可离线测 |
-| `runner` | 4 | CLI + 自测 + 探针（原 `pipeline` 的调度半边） |
 | `tests/support.py` | 4 | 自测共享夹具（4 个 `test_*` 模块都从这里取） |
-| `stages` | 3 | 阶段层；被 `runner` + 探针引用 |
-| `framer_waitlist` | 3 | 申请 |
 
 > 复算命令见文末附录（`from src import X` 那种写法必须单独计 —— 旧版脚本就漏在这里）。
 > ⚠️ 该表是**脚本输出**，加/删任何 `.py` 文件后**必须重跑**，否则立刻过期。
-> 本次（`pipeline` 拆 `runner` + `stages`、自测拆 `tools/tests/` 后）实测：
-> `config 15 / ledger 7 / parsing 6 / tempemail 6 / typesafe 5 / mailrules 5 /
-> runner 4 / support 4 / stages 3 / framer_waitlist 3`。
-> 其中 `typesafe 7 → 4` 是解析层拆分带来的**预期内下降**（三个探针原本从
-> `src.typesafe` 导入 `_parse_js_object` 等私有名，现在改从 `src.parsing` 导入）；
-> 这次 `typesafe 4 → 5` 是因为 `runner` 与 `stages` **各自**导入它，属正常。
-> `pipeline 6` 拆成了 `runner 4 + stages 3`（有重叠，因为 `stages` 也被探针直引）。
-
-> 上表是**修正后**的数字。历史：旧版表格（config=4 / typesafe=3 / framer=2 /
-> mailrules=2）是错的 —— 附录脚本用 `startswith('src.')` 判断，而
+>
+> 🔴 **2026-09-21 修的一处口径不一致**：附录脚本只收
+> `src/ + tools/ + tools/probes/`，**不含 `tools/tests/`**，而这张表里一直有
+> `support`（它只被 `tools/tests/` 里的模块 import）。也就是说
+> **复算命令复算不出表里的数字** —— 表里的 `support` 项在脚本输出里根本不会出现。
+> 现在两边都含 `tools/tests/`，命令与表**逐项对齐**（实测
+> `config 16 / parsing 12 / typesafe 11 / tempemail 10 / ledger 7 / runner 6 /
+> stages 5 / mailrules 5 / support 4`）。
+>
+> 历史沿革（数字都是当时实测的）：旧版表格（`config=4 / typesafe=3 / framer=2 /
+> mailrules=2`）是错的 —— 附录脚本用 `startswith('src.')` 判断，而
 > `from src import config` 的 `module` 恰好是 `"src"`（**不带点**），
-> 所以 `tools/*` 的顶层导入**全被漏计**。2026-09-20 晚新增 3 个探针后复算到
+> 所以 `tools/*` 的顶层导入**全被漏计**。2026-09-20 晚修正后复算到
 > `config 11 / typesafe 7 / pipeline 4`；解析层拆分后是
 > `config 15 / ledger 7 / parsing 6 / tempemail 6 / pipeline 6 / mailrules 5 /
-> typesafe 4 / framer 3`（当时 `pipeline` **尚未**拆分）；批次 C 把 `pipeline`
-> 拆成 `runner` + `stages` 之后，才是上表这一组。
-> ⇒ **加/删文件后必须重跑附录脚本**，否则这张表立刻过期。
+> typesafe 4 / framer 3`；批次 C 把 `pipeline` 拆成 `runner` + `stages`。
+> `framer_waitlist` 这一项随邀请制取消**整模块删除**（2026-09-21）。
 
 **依赖方向是单向的**：`tools → runner → stages → 叶子 → config`。
 没有任何叶子反向依赖编排层，也没有循环 —— `stages` **不** import `runner`
@@ -201,31 +208,34 @@ Jev-Register-Tool/
 
 ## 4. 数据流
 
+> 🔴 **2026-09-21：邀请制取消，链路从 7 段缩到 4 段。**
+> 删掉的三段（~~建邮箱 + 投 Framer 申请~~ / ~~等 waitlist 确认回执~~ /
+> ~~等获批邮件~~）都是"为等待而存在"的，站点侧现在**一步到位**：
+> 发一封 `Welcome to TypeSafe — confirm your email`，里面的**魔法链接就是登录凭据**。
+> 判据是两条站点侧实测：`POST /login` 直接回 `x-action-redirect: /login?sent=true`
+> （不再有 `?waitlist=` 参数），且收到的邮件主题就是上面那句。
+
 ```
-                ┌─ 阶段 1-2 申请 + 确认 ────────────────────────────────┐
+                ┌─ 阶段 1 注册 + 登录（同一步，无外部阻断点）─────────────┐
                 │                                                        │
- 建临时邮箱 ──▶ Framer 表单(PoW) ──201──▶ 等 waitlist_confirm 邮件        │
-   tempemail      framer_waitlist              tempemail + mailrules     │
+ 建临时邮箱 ──▶ POST /login ──▶ 收 "confirm your email" ──▶ 魔法链接交换  │
+   tempemail     typesafe           tempemail + mailrules      typesafe  │
+   (stage_login 在 email 为空时自建)      .extract_magic_link              │
+                │                       ──▶ POST /api/auth/callback      │
+                │                            200 ⇒ 会话建立（cookie 落在 client 上）
                 └────────────────────────────────────────────────────────┘
                                         │
-                ┌─ 阶段 3 获批（外部，批量定时 ~25 分钟）────────────────┐
-                │   account_ready 邮件落地 ──▶ 解锁下游                  │
-                │   ★ 只能等；窗口仅 ~37 分钟 ⇒ 必须 --mode watch 边到边取 │
-                └────────────────────────────────────────────────────────┘
-                                        │
-                ┌─ 阶段 4-7 注册 → onboarding → 建 Key → 入库 ──────────┐
+                ┌─ 阶段 2-4 onboarding → 建 Key → 入库 ─────────────────┐
                 │                                                        │
-  /login 抓 $ACTION_* ──▶ 发码 ──▶ 收码 ──▶ /api/auth/callback          │
-     typesafe          typesafe  mailrules     typesafe                  │
-                                 .extract_otp                            │
-                                        │                                │
-                    /api/me ──▶ /setup/tos → set-name → console-survey   │
-                                        │                                │
-                          POST /api/api-keys ──▶ apikey_xxx              │
-                                        │                                │
-                                  ledger.append()  ──▶ exports/ledger.jsonl
-                                        │            （全部尝试，含失败的）
-                                        └── success_ledger.append() ──▶ result/success.jsonl
+                │  GET /hook（不跟随重定向）──▶ 门禁链（**引导**，非门槛）│
+                │    tos ─▶ set-name ─▶ console-survey（我们提交不了）    │
+                │     ▲ 站点自己都不稳定：相邻两次 GET 可给出不同答案     │
+                │                                                        │
+                │  POST /api/api-keys ──▶ apikey_xxx   ← ★ 真判据在这里  │
+                │                                        │                │
+                │        ledger.append()  ──▶ exports/ledger.jsonl        │
+                │                           （全部尝试，含失败的）        │
+                │        success_ledger.append() ──▶ result/success.jsonl │
                 └────────────────────────────────────────────────────────┘
                                         │
                 ┌─ 验收（独立于链路）────────────────────────────────────┐
@@ -234,8 +244,18 @@ Jev-Register-Tool/
                 └────────────────────────────────────────────────────────┘
 ```
 
+🔴 **"这个账号成不成"的判据只有一条：`POST /api/api-keys` 有没有回 key。**
+`/hook` 的重定向链是**引导**（2026-09-21 实测：门禁停在 `console-survey` 时，
+建 key 照样 200 + 明文 key），而且它**本身非确定性**（同一次运行里相邻两次
+`GET /hook` 会给出不同答案，实测见 `tools/probes/probe_gate_chain.py`）。
+判据历史上换过三次（`/api/me` 字段 → `/hook` 归零 → 建 key 结果），
+每次怎么错的都留在 `typesafe.complete_onboarding()` 的文档里。
+
 **取码走 `mailrules.extract_otp()`**（锚定优先、宽松降级），
 而不是在 `stages` 里就地写正则 —— 与服务端 D1 规则 id=20 同构，见 §5。
+⚠️ 取码路径是**兼容分支**：主路径拿到的是魔法链接（`link` 模式，也是 CLI 默认）。
+站点对同一次发信请求**可能回链接而不是码**（实测 4 次里 1 次），所以码模式下
+等不到码时必须回捞一次链接 —— 见 `test_code_mode_falls_back_to_magic_link`。
 
 ## 5. 关键耦合点（改一处要连带看哪里）
 
@@ -248,11 +268,10 @@ Jev-Register-Tool/
 | **`$ACTION_<n>` 的索引集合** | 同上 | 🔴 **不许写死**。`/login` 用 2/3/4，`/setup/*` 用 1。写死枚举 + 要求 `:2` 同时存在 ⇒ 新形态一条都抓不到 |
 | **`$ACTION_<n>:0` 必须紧凑 JSON** | `parsing.compact_ref` | 加空格 ⇒ Next.js 直接 500。自测有负对照钉住 |
 | **`/api/auth/callback` 请求体键集** | `typesafe.auth_callback` | 🔴 站点是 **strict** schema：多一个未知键 ⇒ **全员**登录 `400 Bad request`（含已获批账号），而文案毫无指向性。2026-09-21 实测 —— 删掉站点已废弃的 `waitlistEmail` 才恢复（邮箱改由 token/session 在服务端推导）。键集由 `test_auth_callback_payload_shape` 逐键钉住 |
-| **Framer PoW 常量** | `config.POW_*` | 站点调难度 ⇒ 申请被拒。常量取自 JS，不是试出来的 |
 | **`/setup/*` action id** | `typesafe.FALLBACK_SETUP_ACTIONS` | 🔴 仅降级用，**会随部署失效**。2026-09-20 实测该表里的 id 已全部作废（POST 回 `404 Server action not found.`）。首选永远是运行时抓隐藏域。**2026-09-21 起**：走降级必打告警，失败时 `error` 指向真因（不再只回 `HTTP 404`）—— 见 §6 与 `test_post_setup_degrade_is_observable` |
-| **`/setup/*` 的渲染依赖会话状态** | `typesafe.fetch_setup_actions` | 🔴 同一会话里 POST 之后，`/setup/console-survey` **不再渲染** `$ACTION_*`（页面 39490 → 40507 字节），且**轮询 62s 不恢复**；**换一个新会话立刻恢复**。⇒ onboarding 的最后一跳只能由**下一次登录**补上（`resume_pending.py` 默认 `--rounds 3`；`--rounds 1` 实测漏 76%）。另一半（POST 报错后回读 `/api/me` 判成功）由 `test_onboarding_merged_submit_is_not_a_failure` 钉住 |
-| **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 `stages` 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住（扫描面 `src/*.py` + `tools/**/*.py`） |
-| **台账身份字段** | `ledger.EARNED_FIELDS` | 决定"哪些字段不许被空值覆盖"（`api_key` 等） |
+| **onboarding 门禁链** | `typesafe.onboarding_gate` / `KNOWN_ONBOARDING_GATES` | 🔴 站点**随时增删步骤**，而且**自己都不稳定**：实测相邻两次 `GET /hook` 给出不同答案（`set-name` 与 200 交替）。⇒ ① 遇到不认识的步骤**只记录不判失败**（`console-survey` 就是这种：它的页面没有 `$ACTION_*` 隐藏域，我们提交不了）；② 同一跳重复出现就停，别空转；③ 判据一律不放在这里。改站点后跑 `tools/probes/probe_gate_chain.py` 看完整链路 |
+| **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 `stages` 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住（扫描面 `src/*.py` + `tools/**/*.py`）。⚠️ 还要覆盖**历史词汇**（`applied` / `confirmed` / `approved` / `code_sent`）—— 它们不再被写入，但历史台账里有，删掉会让那些行 `rank()` 落 0 分，任何一次重跑都能把凭据覆盖成空 |
+| **台账身份字段** | `ledger.EARNED_FIELDS` / `DICT_FIELDS` | 决定"哪些字段不许被空值覆盖"（`api_key` 等）与"哪些是累积型字典"。`DICT_FIELDS` 里的 `waitlist` 是**历史键名**（现名 `signup`），必须留着兜住老台账 |
 | **推理端点** | `verify_keys.API_URL` | 站点换端点 ⇒ 验收误判为"key 不可用" |
 
 **已刻意解耦的地方**：
@@ -273,16 +292,16 @@ Jev-Register-Tool/
 | ~~`ledger.RANK` 词汇与编排层不一致~~ | **2026-09-20 已修**（曾导致重跑失败清空 `api_key`） | 已加 AST 词汇覆盖测试，不会复发。⚠️ 该测试的扫描面用 `rglob`：自测拆进 `tools/tests/` 后，`tools/*.py` 这个 glob 匹配不到子目录（见 §2 注） |
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
-| ~~无并发~~ | **已加** `--concurrency`（申请段/注册段） | `watch` 刻意保持串行 |
-| ~~`pipeline.py` 零测试~~ | **已补** 188 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
+| ~~无并发~~ | **已加** `--concurrency`（注册段） | `watch` 已删除（见下），不再有"刻意串行"的通路 |
+| ~~`pipeline.py` 零测试~~ | **已补** 186 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
 | ~~`typesafe.py` 混了 HTTP 客户端 + HTML/JS 解析~~ | **2026-09-20 已拆**：解析层独立成 `src/parsing.py`，`typesafe.py` 413 → **359** 行，只留 HTTP | — |
-| ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py`（417 行，阶段 + `AccountRecord`）+ `src/runner.py`（324 行，调度）。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | 若再膨胀，先拆 `runner.watch`（66 行） |
-| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` 112 行 + `tools/tests/` 6 个文件 1425 行（四个 `test_*.py` + `support.py` 夹具 + `__init__.py`）。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
-| ~~`FALLBACK_SETUP_ACTIONS` 是**假护栏**~~ | **2026-09-21 已修**：`post_setup()` 的降级通路以前 `except TypeSafeError: acts = {}` **静默**退化到一张已知全部作废的 action id 表（文档三处写明），于是"站点改版"最终只表现为 `onboarding 失败: HTTP 404`。现在降级必打可辨识告警、失败时 `error` 点出真因 + 给下一步 | 兜底表本身仍会随部署失效（这是它的性质）。重录 HAR 拿到新 id 后，要同步 `typesafe.py` 的注释与 runbook §4.6 |
-| ~~`auth_callback` 请求体多传 `waitlistEmail`（站点已收紧 schema）~~ | **2026-09-21 已修**：站点把 `/api/auth/callback` 的 schema 收紧成 **strict**，多一个未知键直接 400。当时**所有**账号登录全灭（含 122 个已获批、早已拿到 key 的），而错误文案只有一句 `HTTP 400: Bad request` —— 排查会被引向"验证码错/白名单"，方向完全相反。已删该键（邮箱改由 token/session 在服务端推导），并让 `_fail_auth` 特判 Zod 的 `Unrecognized key`、把真因与处置直接写进 `error` | 这类"站点收紧请求体"**没有通用护栏** —— 只能靠我们自己维护的键集测试（`test_auth_callback_payload_shape`）。下次见到 `400 Bad request`，先跑 `tools/probes/audit_keys_against_site.py` 分清"回调坏了"还是"未获批"（runbook §4.8） |
-| ~~`complete_onboarding` 把"POST 报错"直接当成失败~~ | **2026-09-21 已修**：站点把三步合成同一张表单、而 `/api/me` **读有滞后** ⇒ 多发的那次 survey POST 必然 404，于是**账号明明已完全 onboard 却被记成 `partial`**（实跑 25 个里误报 **19 个**）。现在 POST 报错后**回读 `/api/me`**：缺口关了就是成功，并往 `log` 留痕 | 另一半是站点侧行为（**最后一跳在同一会话里做不到**，换会话才行），只能靠下一轮补 —— 见 runbook §4.9。这类问题没有通用护栏，判据只能写进文档 |
-| `--mode watch` 与 `resume` 有重复 | 都做"跑 4→7" | 已抽 `stage_login` + `stage_create_key`，重复的只是循环壳 |
-| `--mode claim` 两进程设计**已知失效** | 标了废弃但**功能没修** | 根因候选与验证法见 `runbook.md` §1.5；未实测前不许记为"已修" |
+| ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py` + `src/runner.py`。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | `typesafe.py` 现在 551 行（**变大了**，见下），若再膨胀优先拆它的 onboarding 段 |
+| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` + `tools/tests/` 6 个文件。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
+| ~~`FALLBACK_SETUP_ACTIONS` 是**假护栏**~~ | **2026-09-21 已修**：`post_setup()` 的降级通路以前 `except TypeSafeError: acts = {}` **静默**退化到一张已知全部作废的 action id 表，于是"站点改版"最终只表现为 `onboarding 失败: HTTP 404`。现在降级必打可辨识告警、失败时 `error` 点出真因 + 给下一步 | 兜底表本身仍会随部署失效（这是它的性质）。重录 HAR 拿到新 id 后，要同步 `typesafe.py` 的注释与 runbook §4.6 |
+| ~~`auth_callback` 请求体多传 `waitlistEmail`（站点已收紧 schema）~~ | **2026-09-21 已修**：站点把该接口的 schema 收紧成 **strict**，多一个未知键直接 400。当时**所有**账号登录全灭（含 122 个早已拿到 key 的），而错误文案只有一句 `HTTP 400: Bad request`。已删该键，并让 `_fail_auth` 特判 Zod 的 `Unrecognized key`、把真因与处置直接写进 `error` | 这类"站点收紧请求体"**没有通用护栏** —— 只能靠我们自己维护的键集测试（`test_auth_callback_payload_shape`）。下次见到 `400 Bad request`，先跑 `tools/probes/audit_keys_against_site.py` 分清"回调坏了"还是"未获批"（runbook §4.8） |
+| ~~`complete_onboarding` 用 `/api/me` 字段判缺口~~ | **2026-09-21 换过两次判据**，每次的错法都记在 `typesafe.complete_onboarding()` 的表里：① `/api/me` 的 `console_survey_completed_at` 有滞后且语义会变 ⇒ 账号已完全 onboard 却被记 `partial`（实跑 25 个误报 **19 个**）；② 改成 `/hook` 归零 ⇒ **站点自己非确定性**（相邻两次 GET 答案不同）⇒ 空转 + 报空错误 | 现在判据是**建 key 的结果**，门禁只作诊断。护栏 `test_onboarding_gate_is_guidance_not_a_gate`（含"门禁卡住但 key 建得出 ⇒ 必须记 keyed"的正向断言） |
+| ~~`--mode watch`~~ / ~~`--mode claim`~~ / ~~`--mode apply`~~ | **2026-09-21 已删除**（不是"修好"，是**删除**）：三个模式都是邀请制的产物。`watch` 轮询全表共享窗口找"获批邮件"（该事件已不存在）；`claim` 的两进程设计**实测已失效**（`--send` 与 `--token` 各建会话、cookie 不传递 ⇒ 必报 `401 Code expired`）；`apply` 投的 Framer 表单本身不存在了。连带删除 `stages.stage_login_with_token()`（`claim` 的唯一落点）与 `tempemail.first_mail_matching()`（`stage_wait_approval` 的唯一调用者） | 需要"人工粘凭据"改用 `resume`：魔法链接 7 天有效。原文件在 `.workbuddy-ai/backup/refactor-20260921-180438/` |
+| `typesafe.py` 从 442 → **551 行**（变大） | 如实记录：新增了 `onboarding_gate()` / `_onboarding_result()` / 门禁序列诊断，并把"判据换过三次"的复盘写进 docstring | 模块行数**不是**指标。本轮 `complete_onboarding` 的重复块归零、错误文案从"空字符串"变成可定位，这些才是收益。若真要瘦身，把 onboarding 段整体挪成 `src/onboarding.py` |
 
 ## 附录：复算依赖图
 
@@ -293,8 +312,12 @@ import ast
 from pathlib import Path
 from collections import Counter
 
+# 🔴 四类文件都要收：src / tools / tools/tests / tools/probes。
+#    漏掉 tools/tests 会让 §3 表里的 `support` 项**根本不出现在输出里**
+#    （2026-09-21 实测发现：表里有 support、命令却算不出它）。
 cnt = Counter()
 for p in sorted(list(Path('src').glob('*.py')) + list(Path('tools').glob('*.py'))
+                + list(Path('tools/tests').glob('*.py'))
                 + list(Path('tools/probes').glob('*.py'))):
     for n in ast.walk(ast.parse(p.read_text(encoding='utf-8'))):
         if isinstance(n, ast.ImportFrom):
@@ -329,7 +352,7 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 188 项」，本文 §6 写「已补 188 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 186 项」，本文 §6 写「已补 186 项自测」。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。
 grep -rn "自测 [0-9]* 项\|[0-9]* 项自测\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
 ```

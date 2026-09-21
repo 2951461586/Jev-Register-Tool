@@ -38,8 +38,8 @@ Jev-Register-Tool/
 │   │                          **只信它** —— 走 `Ledger.load()` 合并视图，
 │   │                          不是"末行胜出"（那会让重跑失败把计数压低）
 │   ├── normalize_ledger.py    修被 CR / 尾部空白污染的 key、email（**不折叠行**）
-│   ├── selftest.py            自测**入口**（108 行）：只做聚合与调度 + 登记完整性元检查
-│   ├── tests/                 自测本体（6 个文件 1270 行，按被测对象分）
+│   ├── selftest.py            自测**入口**（110 行）：只做聚合与调度 + 登记完整性元检查
+│   ├── tests/                 自测本体（6 个文件 1333 行，按被测对象分）
 │   │   ├── __init__.py        仅为让 `tests` 可当包导入（**不是** pytest 测试包）
 │   │   ├── support.py         共享夹具：`check()` 计数 + 离线替身 + 模块别名转手
 │   │   ├── test_parsing.py    解析层：PoW / 紧凑 JSON / Server Action / JS 字面量
@@ -102,16 +102,16 @@ Jev-Register-Tool/
 | `parsing.py` | 150 | 页面/邮件文本 → 结构（`$ACTION_*` / JS 字面量 / 可见文案 / 魔法链接） | `config`（**不依赖 `requests`**） |
 | `tempemail.py` | 188 | Worker 收信（索引端点、5xx 重试、计数） | `config` |
 | `framer_waitlist.py` | 97 | 申请表单 + PoW | `config` |
-| `typesafe.py` | 392 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
-| `stages.py` | 405 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` `framer_waitlist` |
+| `typesafe.py` | 408 | 登录链路（Server Action → Stytch → 回调 → onboarding → 建 Key） | `config` + `parsing` |
+| `stages.py` | 417 | ★ 单账号阶段实现（`StageMixin`）+ `AccountRecord` | `mailrules` `parsing` `typesafe` `framer_waitlist` |
 | `runner.py` | 324 | ★ `Pipeline`：批量 / 并发 / 监听 / 台账写入 | `config` `ledger` `stages` `tempemail` `typesafe` |
 | `run_e2e.py` | 288 | CLI（每模式一个函数，主流程只分派） | `config` `ledger` `runner` `tempemail` `mailrules` |
-| `selftest.py` | 108 | 自测**入口**：按顺序调用 `tests/` 下 21 个 `test_*` + 登记完整性元检查 | `tests.*` |
+| `selftest.py` | 110 | 自测**入口**：按顺序调用 `tests/` 下 22 个 `test_*` + 登记完整性元检查 | `tests.*` |
 | `tests/support.py` | 237 | 共享夹具：`check()` 计数 + 离线替身 + 模块别名转手 | `src.*` 全部 |
 | `tests/test_parsing.py` | 143 | 解析层 4 组（PoW / 紧凑 JSON / Server Action / JS 字面量） | `support` |
 | `tests/test_ledger.py` | 205 | 台账 3 组（并集合并 / 状态词汇 / 身份归一化） | `support` |
 | `tests/test_mailrules.py` | 118 | 收件规则 + OTP 抽取 | `support` |
-| `tests/test_orchestration.py` | 562 | 编排层 12 组（错误码分流 / 申请 / 登录 / 监听 / setup 降级 / 并发…） | `support` |
+| `tests/test_orchestration.py` | 625 | 编排层 13 组（错误码分流 / 申请 / 登录 / 监听 / setup 降级 / 并发…） | `support` |
 | `verify_keys.py` | 165 | 验收 + 导出 | `config` `ledger` |
 | `_bootstrap.py` | 37 | sys.path 定位 | 无 |
 
@@ -246,6 +246,7 @@ Jev-Register-Tool/
 | **Server Action 渲染形态** | `parsing.actions_from_html` | 🔴 页面结构变 ⇒ **`/setup/*` 会静默退化到陈旧 fallback ⇒ 404**（2026-09-20 实翻车，见下）。`/login` 有 `fetch_actions` 显式校验索引 2/3，所以它抛错 |
 | **`$ACTION_<n>` 的索引集合** | 同上 | 🔴 **不许写死**。`/login` 用 2/3/4，`/setup/*` 用 1。写死枚举 + 要求 `:2` 同时存在 ⇒ 新形态一条都抓不到 |
 | **`$ACTION_<n>:0` 必须紧凑 JSON** | `parsing.compact_ref` | 加空格 ⇒ Next.js 直接 500。自测有负对照钉住 |
+| **`/api/auth/callback` 请求体键集** | `typesafe.auth_callback` | 🔴 站点是 **strict** schema：多一个未知键 ⇒ **全员**登录 `400 Bad request`（含已获批账号），而文案毫无指向性。2026-09-21 实测 —— 删掉站点已废弃的 `waitlistEmail` 才恢复（邮箱改由 token/session 在服务端推导）。键集由 `test_auth_callback_payload_shape` 逐键钉住 |
 | **Framer PoW 常量** | `config.POW_*` | 站点调难度 ⇒ 申请被拒。常量取自 JS，不是试出来的 |
 | **`/setup/*` action id** | `typesafe.FALLBACK_SETUP_ACTIONS` | 🔴 仅降级用，**会随部署失效**。2026-09-20 实测该表里的 id 已全部作废（POST 回 `404 Server action not found.`）。首选永远是运行时抓隐藏域。**2026-09-21 起**：走降级必打告警，失败时 `error` 指向真因（不再只回 `HTTP 404`）—— 见 §6 与 `test_post_setup_degrade_is_observable` |
 | **台账状态等级** | `ledger.RANK` | 决定升级/降级语义。**必须覆盖 `stages` 写的每个 status**，由 `test_status_vocabulary` 用 AST 钉住（扫描面 `src/*.py` + `tools/**/*.py`） |
@@ -271,11 +272,12 @@ Jev-Register-Tool/
 | ~~`config.py` 有收件规则的第二份真源~~ | **已修**：删掉 5 个零引用常量 | — |
 | ~~`QuotaLedger` 整类无调用点~~ | **已修**：删除 67 行 | — |
 | ~~无并发~~ | **已加** `--concurrency`（申请段/注册段） | `watch` 刻意保持串行 |
-| ~~`pipeline.py` 零测试~~ | **已补** 172 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
+| ~~`pipeline.py` 零测试~~ | **已补** 179 项自测（审计当时 96 项） | 继续加边界用例。测试本体现已在 `tools/tests/` |
 | ~~`typesafe.py` 混了 HTTP 客户端 + HTML/JS 解析~~ | **2026-09-20 已拆**：解析层独立成 `src/parsing.py`，`typesafe.py` 413 → **359** 行，只留 HTTP | — |
-| ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py`（405 行，阶段 + `AccountRecord`）+ `src/runner.py`（324 行，调度）。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | 若再膨胀，先拆 `runner.watch`（66 行） |
-| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` 108 行 + `tools/tests/` 6 个文件 1270 行（四个 `test_*.py` + `support.py` 夹具 + `__init__.py`）。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
+| ~~`pipeline.py` 684 行，阶段方法 + 并发脚手架挤在一个类~~ | **2026-09-20 已拆**：`src/stages.py`（417 行，阶段 + `AccountRecord`）+ `src/runner.py`（324 行，调度）。⚠️ 用的是 `StageMixin` 而不是报告原建议的自由函数 —— 阶段方法要读 `self.mail` / `self.login_mode` / `self.success_ledger` / `self.log`，转自由函数得先引入 ctx 对象，属另一档改动 | 若再膨胀，先拆 `runner.watch`（66 行） |
+| ~~`selftest.py` 1155 行，单文件承载全部测试~~ | **2026-09-20 已拆**：入口 `selftest.py` 110 行 + `tools/tests/` 6 个文件 1333 行（四个 `test_*.py` + `support.py` 夹具 + `__init__.py`）。⚠️ **刻意不叫 `conftest.py`、不引 pytest** | 加新测试就落到对应 `test_*.py`，**并在 `selftest.py` 的 `main()` 里登记** —— 漏登记会被 `_registry_gap()` 当场拦下（2026-09-21 加） |
 | ~~`FALLBACK_SETUP_ACTIONS` 是**假护栏**~~ | **2026-09-21 已修**：`post_setup()` 的降级通路以前 `except TypeSafeError: acts = {}` **静默**退化到一张已知全部作废的 action id 表（文档三处写明），于是"站点改版"最终只表现为 `onboarding 失败: HTTP 404`。现在降级必打可辨识告警、失败时 `error` 点出真因 + 给下一步 | 兜底表本身仍会随部署失效（这是它的性质）。重录 HAR 拿到新 id 后，要同步 `typesafe.py` 的注释与 runbook §4.6 |
+| ~~`auth_callback` 请求体多传 `waitlistEmail`（站点已收紧 schema）~~ | **2026-09-21 已修**：站点把 `/api/auth/callback` 的 schema 收紧成 **strict**，多一个未知键直接 400。当时**所有**账号登录全灭（含 122 个已获批、早已拿到 key 的），而错误文案只有一句 `HTTP 400: Bad request` —— 排查会被引向"验证码错/白名单"，方向完全相反。已删该键（邮箱改由 token/session 在服务端推导），并让 `_fail_auth` 特判 Zod 的 `Unrecognized key`、把真因与处置直接写进 `error` | 这类"站点收紧请求体"**没有通用护栏** —— 只能靠我们自己维护的键集测试（`test_auth_callback_payload_shape`）。下次见到 `400 Bad request`，先跑 `tools/probes/audit_keys_against_site.py` 分清"回调坏了"还是"未获批"（runbook §4.8） |
 | `--mode watch` 与 `resume` 有重复 | 都做"跑 4→7" | 已抽 `stage_login` + `stage_create_key`，重复的只是循环壳 |
 | `--mode claim` 两进程设计**已知失效** | 标了废弃但**功能没修** | 根因候选与验证法见 `runbook.md` §1.5；未实测前不许记为"已修" |
 
@@ -324,7 +326,7 @@ wc -l src/*.py tools/*.py tools/tests/*.py | sort -rn
 要同步 `README.md` / `docs/runbook.md` / `docs/mail-filters.md` 里写的项数：
 
 ```bash
-# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 172 项」，本文 §6 写「已补 172 项自测」。
+# ⚠️ 模式必须覆盖**两种语序**：README 写「自测 179 项」，本文 §6 写「已补 179 项自测」。
 #    旧版只匹配前一种 ⇒ 本文自己的数字从来没被这条命令核对过（2026-09-21 发现并补上）。
 grep -rn "自测 [0-9]* 项\|[0-9]* 项自测\|全套 [0-9]* 项\|合计 \*\*[0-9]* 项" README.md docs/
 ```

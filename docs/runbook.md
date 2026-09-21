@@ -213,7 +213,7 @@ $PY tools/verify_keys.py
 ## 3. 自测
 
 ```bash
-$PY tools/selftest.py      # 172 项，含负对照，**全程离线**（不碰网络）
+$PY tools/selftest.py      # 179 项，含负对照，**全程离线**（不碰网络）
 ```
 
 覆盖（**顺序与 `selftest.py` 的打印顺序一致**，项数直接来自实测）：
@@ -241,9 +241,10 @@ $PY tools/selftest.py      # 172 项，含负对照，**全程离线**（不碰�
 | `test_orchestration` | 编排：并发不串号 | 9 | 每个 key 建在**自己**的会话上 |
 | `test_orchestration` | 编排：并发 worker 崩溃不静默丢弃 | 7 | 提交数 == 返回数 == 落账数；含"串行路径不吞异常"负对照 |
 | `test_orchestration` | 编排：setup 降级通路可观测 | 10 | 降级必须打**可辨识告警**；失败时 `error` 指向真因 + 给下一步，不许只回 `HTTP 404` |
+| `test_orchestration` | 登录：`/api/auth/callback` 请求体键集 | 7 | 站点是 **strict** schema ⇒ 多一个键 = 全员登录失败，只回一句 `400 Bad request`（2026-09-21 实测，见 §4.8） |
 | `selftest` | 用例登记完整性（AST 元检查） | 1 | 新增 `test_*` 忘记登记 ⇒ **永不执行**，而"通过 N / 失败 0"看起来正常 |
 
-> 合计 **172 项**（21 段 + 1 项入口元检查）。
+> 合计 **179 项**（22 段 + 1 项入口元检查）。
 >
 > ⚠️ **这个数字是副本，真源是 `tools/selftest.py` 的输出。** 核对方法：
 >
@@ -281,6 +282,7 @@ $PY tools/selftest.py      # 172 项，含负对照，**全程离线**（不碰�
 | `401 Code expired` | OTP 错/过期（凭据校验在**前**，不看邮箱） | 重新发码，10 分钟内提交 |
 | `401 Authentication failed` | 魔法链接 token **已被用过**（一次性） | 换一封邮件里的链接 |
 | `403 Access restricted` | 凭据有效，但**不在白名单** | 等获批 |
+| `400 Bad request` + `Unrecognized key` | 请求体多/少了键（站点改了 schema） | 见 §4.8 |
 
 **校验顺序**：token 先、白名单后。无效 token 时**根本不看邮箱**——
 所以只有"凭据正确时拿到的 403"才算白名单证据。
@@ -404,6 +406,41 @@ $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路
 
 **看到日志突然截断，先怀疑进程被杀，再怀疑业务。**
 
+### 4.8 `400 Bad request` —— 站点收紧了回调 schema（2026-09-21 实测）
+
+**症状**：`认证回调 HTTP 400: Bad request`，**所有**账号都这样 —— 包括早已拿到
+key 的已获批账号；重试不恢复。台账里最后一次成功建 key 停在 **2026-09-20 15:17**。
+
+**根因**：站点把 `/api/auth/callback` 的请求体 schema 收紧成 **strict** ——
+多一个未知键直接拒。响应体是 Zod 的 `flatten()` 格式，其实把话说得很明白：
+
+```json
+{"error":"Bad request",
+ "details":{"formErrors":["Unrecognized key: \"waitlistEmail\""],"fieldErrors":{}}}
+```
+
+我们当时还在传 `waitlistEmail`。邮箱现在由 token/session 在**服务端**推导
+（200 响应体里自带 `"email"`），客户端既不需要、也不允许再传。
+去掉该键后实测 **HTTP 200**，会话 cookie 正常下发、`redirectTo: "/hook"`。
+
+**判据 —— 先分清是"回调坏了"还是"未获批"**（这一步不能跳）：
+
+```bash
+$PY tools/probes/audit_keys_against_site.py --limit 2
+```
+
+它只做"登录 + 列 key"，**不建新 key**（不会给已交付账号造出第二把）：
+
+- 已获批账号**也**报 400 ⇒ 回调通路坏了（本节）
+- 只有未获批账号报 400/403 ⇒ 才是白名单问题（§4.1）
+
+**处置**：改 `src/typesafe.py::auth_callback` 的请求体键集。
+护栏 `自测 [auth_callback 请求体形态]` 逐键钉住，多键/少键都会**离线**先报红。
+
+> ⚠️ **`400 Bad request` 这句文案本身毫无指向性** —— 只看到它就往"验证码错/白名单"
+> 上想，会白跑一整轮。`stages._fail_auth` 现在特判 Zod 的 `Unrecognized key`，
+> 直接报出是哪个键、该改哪个文件。
+
 ## 5. 别做这些事
 
 - ❌ 别用 `/admin/all` 拉列表再自己筛——烧 D1 读配额，且会被别人的邮件挤出窗口
@@ -421,3 +458,5 @@ $PY tools/probes/probe_onboarding.py <email> --post   # 真提交，两条通路
   它是**最后手段**不是可用通路 —— 走它必定打告警（2026-09-21 起），
   看到告警就去查页面实际渲染形态，别指望它自己能成功
 - ❌ 别看到 `confirm` 超时就直接重投申请（先回查收件箱，迟到 ≠ 未发）
+- ❌ 别往 `/api/auth/callback` 的请求体里**加键**：站点是 strict schema，
+  多一个键 = 全体账号登录失败，且只回一句 `400 Bad request`（见 §4.8）

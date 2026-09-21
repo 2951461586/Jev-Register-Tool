@@ -489,6 +489,41 @@ $PY tools/resume_pending.py            # 默认 --rounds 3，第 2 轮就会补�
 > 若单跑一个账号，第二次 `--mode resume` 即可（已验证 3 个账号：
 > `login ok → onboarding ok → api_key ok`，直接拿到 key）。
 
+### 4.10 发码请求"成功"但邮件**完全不到**（站点发信故障，2026-09-21 实测）
+
+**症状**：`--mode resume` 报 `未收到验证码邮件` / `未收到魔法链接邮件`，
+或 `发码 HTTP 500: Internal Server Error`；重试仍不恢复。
+
+**判据 —— 拿一个"已获批且有 key"的账号发码做对照**（这一步不能跳）：
+
+```bash
+$PY tools/run_e2e.py --mode claim --email <已获批账号> --send
+# 等 ~200s 后查它的收件箱
+```
+
+- **已获批账号也收不到** ⇒ **站点发信故障**。此时**任何**"未获批"的结论都不成立
+  —— 判据（登录）本身被阻断了。等站点恢复再判断。
+- **已获批账号收得到、待审批账号收不到** ⇒ 才可能是白名单问题。
+
+> 这是"通路坏了"与"业务门槛"的分水岭，和 §4.8 那次用
+> `probes/audit_keys_against_site.py` 做的判定同一个思路。
+
+**辅助证据（一起看）**：
+
+1. **D1 直查**（`tools/probes/probe_worker_health.py` 第 2 节）：看 `newest` 距现在多久。
+   若 `newest` 很近 ⇒ 收信链路正常，问题在**发信**侧。
+2. **看那封"唯一到的邮件"的正文**：若主题是
+   `Welcome to TypeSafe — confirm your email`、正文 `finish creating your account`，
+   说明站点认为该邮箱**还没有账号**（未获批的**弱**信号 —— 站点不稳定时不足以定论）。
+3. **看本批申请确认邮件是否都到了**（`You're on the waitlist for Jev!`）。
+   都到了 ⇒ **申请段正常**，问题只在登录段。
+
+⚠️ **别用 `/login` 页形态判获批**：站点有 A/B 实验，`/login` 会返回两种页面
+（`len=41953 acts=['2','3']` vs `len=43507 acts=['2','3','4']`），
+**在已获批和待审批账号里都出现** ⇒ 与账号状态无关。
+
+**处置**：等站点发信恢复后重跑 `tools/resume_pending.py`。故障期间重试只是浪费请求。
+
 ## 5. 别做这些事
 
 - ❌ 别用 `/admin/all` 拉列表再自己筛——烧 D1 读配额，且会被别人的邮件挤出窗口
@@ -508,5 +543,7 @@ $PY tools/resume_pending.py            # 默认 --rounds 3，第 2 轮就会补�
 - ❌ 别看到 `confirm` 超时就直接重投申请（先回查收件箱，迟到 ≠ 未发）
 - ❌ 别往 `/api/auth/callback` 的请求体里**加键**：站点是 strict schema，
   多一个键 = 全体账号登录失败，且只回一句 `400 Bad request`（见 §4.8）
+- ❌ 别在站点发信故障期间用"没收到邮件"推断"未获批"：先拿**已获批账号**发码做对照，
+  它也收不到就说明判据本身被阻断了（见 §4.10）
 - ❌ 别把 `resume_pending.py` 的 `--rounds` 调到 1：onboarding 的**最后一跳
   在同一会话里做不到**，第 2 轮换会话才补得上（实测 76% 会停在 partial，见 §4.9）

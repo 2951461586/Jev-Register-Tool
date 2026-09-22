@@ -14,21 +14,13 @@ TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onb
 > 因此 `--mode apply / watch / claim` 三个模式已**整体删除**（详见
 > `docs/architecture.md` §6）。
 
-**实测战果**：台账合并视图 453 个地址，其中 **388 个拿到 API Key**。
+跑批的**成功率与速率随当批站点丢包率波动**，因此本文件**刻意不写死任何批次数字**
+（每批都会变，写死了自己就会变假）。⚠️ 报速率时必须同时报**当批丢包率** ——
+否则两批数字根本不可比。方法论、逐批复算命令与性能优化依据见
+`docs/optimization-2026-09-21.md`。
 
-**最近一轮（2026-09-21 晚，优化后）100 个账号 / 并发 4 / 超时 60s**：
-`95 keyed / 5 failed`（95%）—— 墙钟 **527s**、速率 **11.4 个/分**、真实限流 **0 处**。
-**全量 453 把 key 真打推理接口 453/453 通过**（`HTTP 200 / model=jev-1.13.0`）。
-本批触发**批内重发 9 次、救回 7 个账号** —— 无重发则只有 88%。
-
-> 对比优化前（并发 2 / 超时 300s）：50 个账号 `43 keyed / 7 failed`（86%）、
-> 墙钟 1552s、速率 1.93 个/分 ⇒ 同规模**提速 8.6 倍、成功率 +12 个百分点**。
-> ⚠️ 报速率必须同时报**当批丢包率**：本批丢包 9%（上批 0%），重发等待拖长了尾部。
-> 依据与复算命令见 `docs/optimization-2026-09-21.md`。
-
-> ✅ **2026-09-21 接入 Remail**（`--mail-backend remail`，第二个邮箱后端）：
-> 实测 1 单 `outlook.com` 走完全链路拿到 key，验收 `HTTP 200 / model=jev-1.13.0`。
-> 过程中踩到两个**只在这个后端上出现**的坑（都已修 + 已加护栏）：
+> **Remail 后端**（`--mail-backend remail`，第二个邮箱后端）：
+> 有两个**只在这个后端上出现**的坑（都已修 + 已加护栏）：
 >
 > 1. 它的 `bodyPreview` 是**截断预览**（实测 248 字符，**完全不含链接**）⇒
 >    必须再取全文（4012 字符）才能拿到魔法链接，否则报"魔法链接邮件里没找到链接"
@@ -77,7 +69,7 @@ TypeSafe（Jev / System One）**注册 → 确认邮件（魔法链接）→ onb
 ## 快速开始
 
 ```bash
-PY="F:/epsoft/workbuddy-work/.workbuddy-ai/binaries/python/envs/default/Scripts/python.exe"
+PY=python                              # 按本机解释器调整；下同
 
 cp .env.example .env                   # 按注释填（必填项见上表）
 $PY tools/run_e2e.py --doctor          # 环境体检（缺哪项会直接报出来）
@@ -195,7 +187,7 @@ tools/                     入口脚本
 
 docs/
   architecture.md          目录 / 模块 / 耦合 / 数据流（依赖图由 AST 算出）
-  mail-filters.md          收件过滤规则 + 取码锚定（格式对齐 OpenXLab 项目）
+  mail-filters.md          收件过滤规则 + 取码锚定
   runbook.md               怎么跑 + 故障处置
   audit-2026-09-20.md      一轮审计（时间点快照：37/96 项，**数字刻意不改**）
   audit-2026-09-20-round2.md  二轮审计 + 批次 A/B/C 修复状态（§0.5 / §0.6 / §0.7）
@@ -228,8 +220,7 @@ result/                    ★ 交付物（**只放成功的**）：见下方口
 
 ## 收件规则（摘要）
 
-格式对齐同机 OpenXLab 项目的 `sender_contains="openxlab"` 做法：
-**信封发件人子串第一道，主题子串第二道。**
+**信封发件人子串第一道，主题子串第二道**：
 
 | 规则名 | `sender_contains` | `subject_contains` |
 |---|---|---|

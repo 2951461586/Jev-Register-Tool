@@ -12,9 +12,16 @@
 ⚠️ 只读脚本：不写任何文件、不碰网络、不建账号。
 
 ⚠️ **应在「跑批后、resume 之前」运行。** 台账是**累计合并视图**，`resume` 会把
-   失败账号升级成 `keyed` 并**覆盖其 `timings`** ⇒ 之后「total≥阈值的账号数」
+   失败账号升级成 `keyed` 并**覆盖其 `timings`** ⇒ 之后「走重发路径的账号数」
    会与跑批日志的重发次数对不上（交叉验证会报警，但那是数据时序问题，不是判据坏了）。
-   脚本会在报警时列出三种可能及判别方法。
+   脚本会在报警时列出四种可能及判别方法。
+
+🔴 **交叉验证的判据字段是 `mail_wait`，不是 `total`。** 重发的**直接触发条件**是
+   「等确认邮件超时」⇒ 只有 `mail_wait >= MAIL_TIMEOUT` 才算走了重发路径。
+   而 `total = mail_wait + login + create_key` ⇒ `total >= MAIL_TIMEOUT` 是
+   **充分不必要**条件：`login` 自己慢到阈值就能把 `total` 顶过线，账号**没走重发**。
+   用 `total` 会**多算** ⇒ 报**假阳性**不一致（实测 2026-09-22 第 5 批：`total≥60`
+   13 个 vs `mail_wait≥60` 12 个，日志重发 12 次 ⇒ 只有 `mail_wait` 对得上）。
 
 用法：
     python tools/_analyze_batch.py --log exports/run_cf100_a1a2_<TS>.log \
@@ -212,15 +219,34 @@ def main() -> int:
         #    用更小的数会把"正常但偏慢"的账号一起剔掉（本批实测：<30 剔 14 个，
         #    而真正走重发的只有 11 个 ⇒ 干净均值被**人为压低**到 7.29s，
         #    正确值是 8.48s）。这正是"分母本身是错的"那一类缺陷。
-        clean = [x for x in tot if x < MAIL_TIMEOUT]
+        # 🔴 判据字段是 **`mail_wait`**，不是 `total` —— 见模块 docstring。
+        #    重发的直接触发条件是「等确认邮件超时」⇒ `mail_wait >= MAIL_TIMEOUT`。
+        #    用 `total` 会**多算**：`login` 自己慢到阈值就能把 total 顶过线，
+        #    而账号根本没走重发（实测第 5 批多算 1 个，报出假阳性不一致）。
+        def _resent(rows: list[dict]) -> set:
+            """走「丢包 → 批内重发」路径的账号集合（判据字段 = `mail_wait`）。"""
+            out = set()
+            for r in rows:
+                mw = (r.get("timings") or {}).get("mail_wait")
+                if isinstance(mw, (int, float)) and mw >= MAIL_TIMEOUT:
+                    out.add(r.get("email"))
+            return out
+
         # 🔴 交叉验证的左侧必须是**全批**（keyed + failed），不能只数 keyed。
         #    右侧 `resend` 数的是**全批**日志里的「批内重发第」⇒ 两边口径必须一致。
         #    实测（2026-09-22 第 3 批，failed=2）：只数 keyed 得 **5**，全批得 **7**，
         #    日志也是 7 ⇒ 只数 keyed 会**误报**不一致。
         #    ⚠️ 上一批 failed=0 时 keyed == 全批，这个口径错误被**完全掩盖**了 ——
         #    典型的「判据只在特定数据下成立」。本批有失败账号才把它暴露出来。
-        #    （`clean` 仍只针对 keyed：失败账号不该进速率统计，它压根没取到 key。）
-        slow = [x for x in (tot + tot_fail) if x >= MAIL_TIMEOUT]
+        resent = _resent(keyed) | _resent(failed)
+        slow = len(resent)                                     # 左侧：走重发路径的账号数
+        # 参考值（**不是**重发判据）：`total` 超阈值的"慢账号"数。
+        # 两口径不相等是**预期**的；把差异显式打出来，免得下一个人又拿 total 当判据。
+        slow_total = sum(1 for x in (tot + tot_fail) if x >= MAIL_TIMEOUT)
+        # `clean` 只针对 keyed：失败账号不该进速率统计，它压根没取到 key。
+        clean = [float(r["timings"]["total"]) for r in keyed
+                 if r.get("email") not in resent
+                 and isinstance((r.get("timings") or {}).get("total"), (int, float))]
         print(f"  ★ 单号平均耗时（keyed 全部，n={len(tot)}）："
               f"均值 **{st.mean(tot):.2f}s**  中位 {st.median(tot):.2f}s  "
               f"P90 {_q(tot, .90):.2f}s  最快 {min(tot):.2f}  最慢 {max(tot):.2f}")
@@ -232,21 +258,29 @@ def main() -> int:
         #    两边是**独立来源**（一边是实测耗时，一边是日志文案），对得上才说明
         #    阈值没拍错、日志解析也没坏。对不上就**别信上面的干净值**。
         #    （实测把阈值改回 30 会立刻报不一致：14 ≠ 11。）
-        if len(slow) != resend:
-            print(f"  ⚠ 交叉验证**不一致**：total≥{MAIL_TIMEOUT:.0f}s 的账号 {len(slow)} 个 "
+        if slow != resend:
+            print(f"  ⚠ 交叉验证**不一致**：`mail_wait≥{MAIL_TIMEOUT:.0f}s` 的账号 {slow} 个 "
                   f"≠ 日志重发次数 {resend} ⇒ 上面的干净值不可信")
-            # 🔴 三种可能，**处置完全不同**，必须按顺序排除 —— 只印一句
-            #    "阈值或日志解析可疑" 会把排查引向错误方向（实测踩到：真因是③）。
-            print("     三种可能，按顺序排除：")
-            print("       ① 阈值拍错了 —— 看 `slow =` 那行有没有用字面数字")
+            # 🔴 四种可能，**处置完全不同**，必须按顺序排除 —— 只印一句
+            #    "阈值或日志解析可疑" 会把排查引向错误方向（实测踩到：真因是③，后又踩到④）。
+            print("     四种可能，按顺序排除：")
+            print("       ① 阈值拍错了 —— 看 `MAIL_TIMEOUT` 是不是从 `src.stages` import 的")
             print("       ② 日志解析坏了 —— 数一遍日志里「批内重发第」实际出现几次")
             print(f"       ③ **台账被后续 resume 覆盖** —— 失败账号被救回 ⇒ status 升级为")
-            print(f"          keyed 且 timings 被新值覆盖 ⇒ total≥阈值的账号变少。")
+            print(f"          keyed 且 timings 被新值覆盖 ⇒ mail_wait≥阈值的账号变少。")
             print(f"          ⇒ 判别：failed={len(tot_fail)}（0 个）却记得有失败账号 ⇒ 就是③。")
             print(f"          ⇒ 处置：**在 resume 之前重跑分析**（跑批后立即分析即无此问题）。")
+            print(f"       ④ **判据字段选错了** —— 拿 `total` 当重发判据会**多算**")
+            print(f"          （`login` 自己慢也能顶过阈值）⇒ 报**假阳性**不一致。")
+            print(f"          ⇒ 判别：`total≥{MAIL_TIMEOUT:.0f}s` 的账号数({slow_total}) > "
+                  f"`mail_wait≥{MAIL_TIMEOUT:.0f}s` 的账号数({slow}) ⇒ 就是④。")
         else:
-            print(f"  ✓ 交叉验证：total≥{MAIL_TIMEOUT:.0f}s 的账号 {len(slow)} 个 "
+            print(f"  ✓ 交叉验证：`mail_wait≥{MAIL_TIMEOUT:.0f}s` 的账号 {slow} 个 "
                   f"== 日志重发次数 {resend}（实测耗时与日志文案互证）")
+            if slow_total != slow:
+                print(f"     ℹ `total≥{MAIL_TIMEOUT:.0f}s` 的账号 {slow_total} 个，其中 "
+                      f"**{slow_total - slow}** 个是「`login` 慢但没走重发」—— "
+                      f"两口径不等是**预期**的（重发判据只认 `mail_wait`）")
         # 吞吐：两种口径都给，且标明是"折算"还是"实测"
         print(f"  ★ 折算吞吐（并发 {a.concurrency} ÷ 单号均值）="
               f"**{a.concurrency / st.mean(tot) * 60:.1f} 账号/分钟**")

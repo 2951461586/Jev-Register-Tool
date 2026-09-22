@@ -1380,6 +1380,14 @@ def test_analyze_batch_threshold_wiring() -> None:
     而 `exports/` 被 `.gitignore` **整体忽略** ⇒ 文件根本不进仓库 ⇒
     **别人 clone 之后这条自测必然红**（`is_file()` 为假）。
     凡是被自测依赖的文件，必须是被 git 跟踪的。
+
+    🔴 **追加（2026-09-22 第 5 批）：判据字段必须是 `mail_wait`，不是 `total`。**
+    重发的直接触发条件是「等确认邮件超时」，只有 `mail_wait >= MAIL_TIMEOUT` 才算
+    走了重发路径；而 `total = mail_wait + login + create_key` ⇒ `total` 超阈值是
+    **充分不必要**条件（`login` 自己慢就能顶过线）。实测 `total≥60` 13 个 vs
+    `mail_wait≥60` 12 个、日志重发 12 ⇒ 用 `total` 报**假阳性**不一致。
+    这是同一条判据的**第二种失效方向**（第 3 批是假阴性：只数 keyed 导致 5≠7，
+    且 `failed=0` 时被完全掩盖）。
     """
     print("\n[工具：批次分析的剔除阈值必须来自源码常量]")
     root = Path(__file__).resolve().parents[2]
@@ -1416,7 +1424,7 @@ def test_analyze_batch_threshold_wiring() -> None:
 
     # ③ 交叉验证必须存在：一边是**实测耗时**，一边是**日志文案**，
     #    两个独立来源对得上才说明阈值没拍错、日志解析也没坏。
-    check("★ 有交叉验证：total≥阈值 的账号数 == 日志重发次数",
+    check("★ 有交叉验证：`mail_wait≥阈值` 的账号数 == 日志重发次数",
           "交叉验证" in src and "批内重发第" in src, "缺互证")
 
     # ④ 🔴 交叉验证的**两侧口径必须一致**：右侧数的是**全批**日志里的重发次数，
@@ -1425,15 +1433,47 @@ def test_analyze_batch_threshold_wiring() -> None:
     #    日志也是 7 ⇒ 只数 keyed 会**误报**不一致。
     #    ⚠️ 上一批 failed=0 时 keyed == 全批，这个口径错误被**完全掩盖**
     #    —— 典型的「判据只在特定数据下成立」，靠换一批数据才暴露。
-    slow_line = next((l for l in src.splitlines() if l.strip().startswith("slow =")), "")
-    check("★★ 交叉验证左侧含 `tot_fail`（否则有失败账号时会误报）",
-          "tot_fail" in slow_line, slow_line.strip() or "找不到 `slow =` 那一行")
-    # 负对照：证明上一条**锁的是 `slow` 那一行**，不是拿整个源码做包含判断
-    # （后者恒真：源码别处本来就有 `tot_fail`）。
-    check("[负对照] 判据锁定的是 `slow` 行而非全文（全文包含是恒真的）",
-          "tot_fail" in src
-          and "tot_fail" not in "slow = [x for x in tot if x >= MAIL_TIMEOUT]",
+    slow_line = next((l for l in src.splitlines() if l.strip().startswith("resent =")), "")
+    check("★★ 交叉验证左侧覆盖全批（`_resent(keyed)` ∪ `_resent(failed)`）",
+          "_resent(keyed)" in slow_line and "_resent(failed)" in slow_line,
+          slow_line.strip() or "找不到 `resent =` 那一行")
+    # 负对照：证明上一条**锁的是 `resent =` 那一行**，不是拿整个源码做包含判断
+    # （后者恒真：源码别处本来就有 `_resent(failed)`）。
+    check("[负对照] 判据锁定的是 `resent =` 行而非全文（全文包含是恒真的）",
+          "_resent(failed)" in src
+          and "_resent(failed)" not in "resent = _resent(keyed)",
           "判据若退化成全文包含 ⇒ 恒真 ⇒ 拦不住回归")
+
+    # ⑤ 🔴 **判据字段必须是 `mail_wait`，不是 `total`。**
+    #    重发的**直接触发条件**是「等确认邮件超时」⇒ 只有 `mail_wait >= MAIL_TIMEOUT`
+    #    才算走了重发路径。而 `total = mail_wait + login + create_key` ⇒
+    #    `total >= MAIL_TIMEOUT` 是**充分不必要**条件：`login` 自己慢到阈值就能把
+    #    `total` 顶过线，账号**根本没走重发**。
+    #    实测（2026-09-22 第 5 批）：`total≥60` **13** 个 vs `mail_wait≥60` **12** 个，
+    #    多出来那个 `mail_wait=54.60 / login=60.73 / total=62.07`；日志重发 = **12**
+    #    ⇒ 用 `total` 会报**假阳性**不一致（与第 3 批的假阴性方向相反）。
+    #    ⚠️ 前几批两口径恰好相等（第 4 批都是 9）⇒ 缺陷被掩盖，
+    #    又一条「判据只在特定数据下成立，换一批才暴露」。
+    # ⚠️ 取函数体必须用 **AST 精确切**，不能按"从 `def` 往后 N 行"切 ——
+    #    行数窗口会越界吃进后面的注释，而紧跟其后的 `slow_total` 注释里
+    #    正好含 `total` ⇒ 判据被**无关文本**判红（本次实测踩到，报假失败）。
+    #    这与本项目「判据要锁在那一行上，不能退化成整个源码做包含判断」同源。
+    rbody = ""
+    for _node in ast.walk(ast.parse(src)):
+        if isinstance(_node, ast.FunctionDef) and _node.name == "_resent":
+            rbody = ast.get_source_segment(src, _node) or ""
+            break
+
+    def _resent_ok(b: str) -> bool:
+        return "mail_wait" in b and ">= MAIL_TIMEOUT" in b and "total" not in b
+
+    check("★★ 重发判据 = `mail_wait >= MAIL_TIMEOUT`（不是 `total`）",
+          bool(rbody) and _resent_ok(rbody), rbody[:200] or "找不到 `def _resent`")
+    # 负对照：证明 ⑤ **真能抓到**旧写法（否则是恒真假绿）。
+    # 旧写法把重发判据建立在 `total` 上 ⇒ `_resent_ok` 必须判它不合格。
+    _old_slow = "slow = [x for x in (tot + tot_fail) if x >= MAIL_TIMEOUT]"
+    check("[负对照] ⑤ 判定旧写法（判据字段用 `total`）为不合格 —— 证明检查有牙",
+          _resent_ok(_old_slow) is False, f"旧写法不该通过：{_old_slow}")
 
     # 负对照：证明 ② 的正则**真能抓到**裸阈值（否则它可能是恒真的空正则）。
     # 这是本项目的一贯要求 —— 判据必须自证"它在真匹配"。
